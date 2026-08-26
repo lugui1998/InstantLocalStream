@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Instant Local Stream
+Comment=Portable low-latency local screen streaming host
+Exec=InstantLocalStream
+Terminal=true
+Categories=Network;AudioVideo;
+Icon=InstantLocalStream

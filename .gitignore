@@ -1,0 +1,53 @@
+# Rust build output
+/target/
+
+# Generated release and packaging output
+/dist/
+/artifacts/
+/release/
+/portable/
+/build/
+*.AppImage
+InstantLocalStream-*.exe
+
+# Runtime extraction and local application state
+/.instant-local-stream/
+/.runtime/
+/.tmp/
+*.pid
+*.log
+*.trace
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config.local.toml
+*.local.toml
+
+# Bundled or downloaded development tools
+/tools/
+/vendor-bin/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Coverage and test reports
+/coverage/
+/test-results/
+*.profraw
+*.profdata
