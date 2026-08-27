@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
+import DroppedFramesChart from '@/components/DroppedFramesChart.vue'
 import StreamVideo from '@/components/StreamVideo.vue'
 import { useViewer } from '@/composables/useViewer'
 
@@ -12,10 +13,17 @@ const {
   bitrateBps,
   lossRate,
   framesDropped,
+  droppedFrameSamples,
   freezeCount,
   jitterBufferDelayMs,
   catchUpDelayMs,
   playoutDelayMs,
+  captureToDisplayDelayMs,
+  captureToReceiveDelayMs,
+  receiveToDisplayDelayMs,
+  frameProcessingDelayMs,
+  frameDelayMode,
+  frameTimingUncertaintyMs,
   encoderDelayMs,
   decodeTimeMs,
   group,
@@ -31,20 +39,40 @@ const {
 } = useViewer()
 
 function formatDelay() {
+  if (captureToDisplayDelayMs.value !== null) {
+    const recoveries = status.value.encoder_backlog_restarts
+      ? ` / encoder recoveries ${status.value.encoder_backlog_restarts}`
+      : ''
+    const network = captureToReceiveDelayMs.value === null
+      ? ''
+      : ` / to receiver ${Math.round(captureToReceiveDelayMs.value)} ms`
+    const receiver = receiveToDisplayDelayMs.value === null
+      ? ''
+      : ` / receiver ${Math.round(receiveToDisplayDelayMs.value)} ms`
+    const processing = receiver || frameProcessingDelayMs.value === null
+      ? ''
+      : ` / processing ${Math.round(frameProcessingDelayMs.value)} ms`
+    const prefix = frameDelayMode.value === 'host-correlated' ? '' : '~'
+    const uncertainty = frameDelayMode.value === 'host-correlated'
+      && frameTimingUncertaintyMs.value !== null
+      ? ` ±${Math.max(1, Math.round(frameTimingUncertaintyMs.value))} ms`
+      : ' ms'
+    return `${prefix}${Math.round(captureToDisplayDelayMs.value)}${uncertainty} capture→display${network}${receiver}${processing}${recoveries}`
+  }
   const encoder = encoderDelayMs.value ?? status.value.encoder_delay_ms ?? null
   const browserPlayout = playoutDelayMs.value
     ?? (jitterBufferDelayMs.value === null
       ? null
       : jitterBufferDelayMs.value + (decodeTimeMs.value ?? 0))
   if (encoder !== null) {
-    // Encoder age is measured from a raw source frame entering the host bus to
-    // its encoded access unit. Add browser playout/decode and a conservative
-    // one-way control-path estimate when available; this is much closer to
-    // capture-to-display delay than jitter-buffer delay alone.
-    const transport = rttMs.value === null ? 0 : rttMs.value / 2
-    const total = encoder + (browserPlayout ?? 0) + transport
-    const playout = browserPlayout === null ? '' : ` / client ${Math.round(browserPlayout)} ms`
-    return `${Math.round(total)} ms est. end-to-end / encode ${Math.round(encoder)} ms${playout}`
+    // The sender-timeline fallback already includes transport when available;
+    // adding half RTT would count the network path twice.
+    const total = encoder + (browserPlayout ?? 0)
+    const playout = browserPlayout === null ? '' : ` / receiver path ${Math.round(browserPlayout)} ms`
+    const recoveries = status.value.encoder_backlog_restarts
+      ? ` / encoder recoveries ${status.value.encoder_backlog_restarts}`
+      : ''
+    return `~${Math.round(total)} ms estimate / host ${Math.round(encoder)} ms${playout}${recoveries}`
   }
   if (playoutDelayMs.value !== null) {
     const rtt = rttMs.value === null ? '' : ` / RTT ${Math.round(rttMs.value)} ms`
@@ -58,6 +86,13 @@ function formatDelay() {
   if (rttMs.value === null) return 'Measuring…'
   const jitter = jitterMs.value === null ? '' : ` / jitter ${Math.round(jitterMs.value)} ms`
   return `${Math.round(rttMs.value / 2)} ms control est. / RTT ${Math.round(rttMs.value)} ms${jitter}`
+}
+
+function delayLabel() {
+  if (captureToDisplayDelayMs.value === null) return 'Estimated delay'
+  return frameDelayMode.value === 'host-correlated'
+    ? 'Capture → display'
+    : 'Frame delay estimate'
 }
 
 function formatNetwork() {
@@ -82,19 +117,19 @@ onMounted(start)
 
 <template>
   <main>
-    <StreamVideo :stream="videoStream" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
+    <StreamVideo :stream="videoStream" :audio-enabled="status.audio_enabled === true" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
 
     <section class="data-grid" aria-label="Stream details">
       <div class="data-cell">
-        <div class="meta-label">Stream</div>
+        <div class="meta-label">Assigned target</div>
         <div class="meta-value">{{ quality }}</div>
       </div>
       <div class="data-cell">
-        <div class="meta-label">Estimated delay</div>
+        <div class="meta-label">{{ delayLabel() }}</div>
         <div class="meta-value">{{ formatDelay() }}</div>
       </div>
       <div class="data-cell">
-        <div class="meta-label">Network</div>
+        <div class="meta-label">Measured receive</div>
         <div class="meta-value">{{ formatNetwork() }}</div>
       </div>
       <div class="data-cell">
@@ -127,12 +162,14 @@ onMounted(start)
       </div>
     </section>
 
+    <DroppedFramesChart :samples="droppedFrameSamples" />
+
     <section v-if="status.groups?.length" class="group-profiles" aria-label="Available transcode groups">
-      <div class="meta-label">Available transcode groups</div>
+      <div class="meta-label">Available transcode targets</div>
       <div class="group-profile-list">
         <div v-for="profile in status.groups" :key="profile.id" class="group-profile">
           <span>{{ profile.id.replace('-', ' ') }}</span>
-          <span>{{ profile.quality }} · {{ profile.fps }} FPS · {{ formatBitrate(profile.bitrate_bps) }} · {{ profile.codec ?? '—' }}</span>
+          <span>{{ profile.quality }} · {{ profile.fps }} FPS · {{ formatBitrate(profile.bitrate_bps) }} target · {{ profile.codec ?? '—' }}</span>
           <span>{{ profile.state }}</span>
         </div>
       </div>

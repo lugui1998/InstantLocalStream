@@ -29,6 +29,12 @@ video { display: block; width: 100%; max-height: min(75vh, 760px); height: auto;
 .meta-label { color: var(--muted); font: 600 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
 .meta-value { margin-top: 9px; color: var(--text); font: 13px/1.35 var(--mono); overflow-wrap: anywhere; word-break: break-word; }
 .meta-value.error { color: var(--danger); }
+.dropped-frames-chart { margin-top: 18px; padding: 15px 18px 10px; border: 1px solid var(--line); }
+.chart-header { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+.chart-subtitle, .chart-unit { margin-top: 7px; color: var(--muted); font: 11px/1.35 var(--mono); }
+.chart-unit { margin: 0; white-space: nowrap; }
+.chart-host { height: 150px; margin-top: 12px; }
+.chart-host .uplot { font-family: var(--mono); }
 .group-profiles { margin-top: 18px; padding: 15px 18px 17px; border: 1px solid var(--line); }
 .group-profile-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin-top: 12px; }
 .group-profile { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--line); color: var(--text); font: 12px/1.35 var(--mono); }
@@ -39,4 +45,5 @@ video { display: block; width: 100%; max-height: min(75vh, 760px); height: auto;
   .data-grid { grid-template-columns: 1fr; }
   .data-cell:not(:nth-child(5n + 1)) { border-left: 0; }
   .data-cell + .data-cell { border-top: 1px solid var(--line); }
+  .chart-header { align-items: start; flex-direction: column; gap: 5px; }
 }

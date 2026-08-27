@@ -1,6 +1,6 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { io, type Socket } from 'socket.io-client'
-import type { GroupAssignment, PingAcknowledgement, SessionReady, StreamStatus, ViewerBootstrap, ViewerStats, ViewerVideoCapability, WebRtcAnswer } from '@/types'
+import type { AuthoritativeStreamSettings, FrameTimingAcknowledgement, GroupAssignment, PingAcknowledgement, PlaybackMetricPoint, RenderedFrameTiming, SessionReady, StreamStatus, ViewerBootstrap, ViewerStats, ViewerVideoCapability, WebRtcAnswer } from '@/types'
 
 const retryDelays = [1_000, 2_000, 5_000, 10_000, 20_000, 30_000]
 const bootstrapProbeTimeoutMs = 5_000
@@ -9,12 +9,6 @@ const bootstrapAssignmentTimeoutMs = 1_500
 const decodeStartupTimeoutMs = 3_000
 const codecFallbackTimeoutMs = 3_000
 const playbackMetricWindowMs = 15_000
-
-interface PlaybackMetricSample {
-  capturedAt: number
-  dropped: number
-  freezes: number
-}
 
 export interface BootstrapProgress {
   title: string
@@ -117,6 +111,12 @@ export function useViewer() {
   const jitterBufferDelayMs = ref<number | null>(null)
   const catchUpDelayMs = ref<number | null>(null)
   const playoutDelayMs = ref<number | null>(null)
+  const captureToDisplayDelayMs = ref<number | null>(null)
+  const captureToReceiveDelayMs = ref<number | null>(null)
+  const receiveToDisplayDelayMs = ref<number | null>(null)
+  const frameProcessingDelayMs = ref<number | null>(null)
+  const frameDelayMode = ref<'host-correlated' | 'browser-estimated' | null>(null)
+  const frameTimingUncertaintyMs = ref<number | null>(null)
   const encoderDelayMs = ref<number | null>(null)
   const decodeTimeMs = ref<number | null>(null)
   const group = ref<GroupAssignment | null>(null)
@@ -146,7 +146,8 @@ export function useViewer() {
   let lastPlayoutDelayAt = 0
   let lastDroppedFramesTotal: number | null = null
   let lastFreezeCountTotal: number | null = null
-  const playbackSamples: PlaybackMetricSample[] = []
+  const playbackSamples: PlaybackMetricPoint[] = []
+  const droppedFrameSamples = ref<PlaybackMetricPoint[]>([])
   let initialSessionReady = false
   let initialWebRtcStarted = false
   let bootstrapComplete = false
@@ -158,6 +159,15 @@ export function useViewer() {
   let awaitingCodecFallback = false
   let videoFrameRendered = false
   let startupNoMediaChecks = 0
+  let lastFrameTimingRequestAt = 0
+  let lastHostFrameTimingAt = 0
+  let hostFrameTimingExpiryTimer: number | null = null
+  let authoritativeSettingsRevision = -1
+  // These values describe the m-lines in the current offer, not merely the
+  // newest host status.  A host change that alters either value requires a
+  // clean offer; an existing peer cannot grow an audio m-line in place.
+  let negotiatedAudioEnabled: boolean | null = null
+  let negotiatedMediaSessionRevision: number | null = null
 
   const viewers = computed(() => typeof status.value.viewers === 'number'
     ? `${status.value.viewers} / ${status.value.max_viewers ?? '—'}`
@@ -186,19 +196,56 @@ export function useViewer() {
     if (droppedTotal === null && freezeTotal === null) return
     playbackSamples.push({ capturedAt: now, dropped: droppedDelta, freezes: freezeDelta })
     while (playbackSamples[0] && now - playbackSamples[0].capturedAt > playbackMetricWindowMs) playbackSamples.shift()
+    droppedFrameSamples.value = playbackSamples.map(sample => ({ ...sample }))
     if (droppedTotal !== null) framesDropped.value = playbackSamples.reduce((total, sample) => total + sample.dropped, 0)
     if (freezeTotal !== null) freezeCount.value = playbackSamples.reduce((total, sample) => total + sample.freezes, 0)
   }
 
   function mergeStatus(next: StreamStatus) {
+    if (typeof next.settings_revision === 'number') {
+      if (next.settings_revision < authoritativeSettingsRevision) return false
+      authoritativeSettingsRevision = Math.max(authoritativeSettingsRevision, next.settings_revision)
+    }
     status.value = { ...status.value, ...next }
-    if (next.group !== undefined) group.value = next.group
+    if (next.group !== undefined) {
+      group.value = next.group
+    } else if (group.value && next.groups) {
+      const authoritative = next.groups.find(candidate => candidate.id === group.value?.id)
+      if (authoritative) group.value = { ...group.value, ...authoritative }
+    }
     updateAssignedCodec(next.codec ?? next.group?.codec)
     if (next.stream_enabled === false) connection.value = 'Waiting for stream'
     if (next.status === 'error' && next.media_error) connection.value = `Media error: ${next.media_error}`
+    reconcileHostMediaTopology()
+    return true
+  }
+
+  function applyAuthoritativeSettings(update: AuthoritativeStreamSettings) {
+    if (!Number.isFinite(update.revision) || update.revision < authoritativeSettingsRevision) return
+    mergeStatus({ ...update.status, settings_revision: update.revision })
+  }
+
+  function reconcileHostMediaTopology() {
+    if (!peer || negotiatedAudioEnabled === null) return
+    const hostAudioEnabled = status.value.audio_enabled === true
+    const audioTopologyChanged = hostAudioEnabled !== negotiatedAudioEnabled
+    const hostSessionRevision = status.value.media_session_revision
+    const sessionRestartRequired = status.value.stream_enabled === true
+      && typeof hostSessionRevision === 'number'
+      && negotiatedMediaSessionRevision !== null
+      && hostSessionRevision !== negotiatedMediaSessionRevision
+    if (audioTopologyChanged || sessionRestartRequired) {
+      restartWebRtcSession(audioTopologyChanged
+        ? 'Audio configuration restarting'
+        : 'Host stream restarting')
+    }
   }
 
   function applyGroupAssignment(assignment: GroupAssignment) {
+    if (typeof assignment.settings_revision === 'number') {
+      if (assignment.settings_revision < authoritativeSettingsRevision) return
+      authoritativeSettingsRevision = Math.max(authoritativeSettingsRevision, assignment.settings_revision)
+    }
     group.value = assignment
     const fallbackAssigned = updateAssignedCodec(assignment.codec)
     if (awaitingCodecFallback) return
@@ -347,12 +394,19 @@ export function useViewer() {
     })
     socket.on('status.snapshot', mergeStatus)
     socket.on('status.changed', mergeStatus)
+    socket.on('stream.settings', applyAuthoritativeSettings)
     socket.on('group.bootstrap', applyGroupAssignment)
     socket.on('group.assignment', applyGroupAssignment)
   }
 
   function requestStatus() {
     socket?.emit('status.request', (snapshot: StreamStatus) => mergeStatus(snapshot))
+  }
+
+  function updateServerClockOffset(sampledOffsetMs: number) {
+    serverClockOffsetMs = serverClockOffsetMs === null
+      ? sampledOffsetMs
+        : serverClockOffsetMs * 0.8 + sampledOffsetMs * 0.2
   }
 
   function ping() {
@@ -365,9 +419,7 @@ export function useViewer() {
       if (typeof ack.serverTime === 'number') {
         const midpointEpochMs = sentEpochMs + roundTripMs / 2
         const sampledOffsetMs = ack.serverTime - midpointEpochMs
-        serverClockOffsetMs = serverClockOffsetMs === null
-          ? sampledOffsetMs
-            : serverClockOffsetMs * 0.8 + sampledOffsetMs * 0.2
+        updateServerClockOffset(sampledOffsetMs)
       }
       if (typeof ack.encoderDelayMs === 'number' && ack.encoderDelayMs >= 0) {
         encoderDelayMs.value = ack.encoderDelayMs
@@ -536,6 +588,11 @@ export function useViewer() {
     }
     if (peer !== current || stopping || videoFrameRendered) return
     if (bytesReceived === 0) {
+      if (!['connected', 'completed'].includes(current.iceConnectionState)) {
+        connection.value = 'Connecting media path'
+        decodeStartupTimer = window.setTimeout(() => void checkStartupDecodeFailure(current), decodeStartupTimeoutMs)
+        return
+      }
       startupNoMediaChecks += 1
       if (startupNoMediaChecks >= 2) {
         reportCodecFailure(current, 'no_rtp_video_received_after_negotiation')
@@ -572,21 +629,145 @@ export function useViewer() {
     }, codecFallbackTimeoutMs)
   }
 
-  function noteVideoFrameRendered() {
+  function smoothDelay(current: number | null, sample: number) {
+    return current === null ? sample : current * 0.8 + sample * 0.2
+  }
+
+  function applyRenderedFrameTiming(
+    timing: RenderedFrameTiming,
+    captureTimePerformanceMs: number,
+    mode: 'host-correlated' | 'browser-estimated',
+    frameEncoderDelayMs?: number,
+  ) {
+    const rawCaptureToDisplay = timing.expectedDisplayTimeMs - captureTimePerformanceMs
+    let captureToDisplay = rawCaptureToDisplay
+    let captureToReceive: number | null = null
+    let receiveToDisplay: number | null = null
+    if (timing.receiveTimeMs !== undefined) {
+      const rawCaptureToReceive = timing.receiveTimeMs - captureTimePerformanceMs
+      receiveToDisplay = timing.expectedDisplayTimeMs - timing.receiveTimeMs
+      if (mode === 'host-correlated') {
+        const hostEncode = frameEncoderDelayMs
+          ?? encoderDelayMs.value
+          ?? status.value.encoder_delay_ms
+          ?? 0
+        captureToReceive = Math.max(rawCaptureToReceive, hostEncode)
+        captureToDisplay = captureToReceive + receiveToDisplay
+      } else {
+        captureToReceive = rawCaptureToReceive
+      }
+    }
+    if (captureToDisplay < 0 || captureToDisplay > 60_000) return false
+    captureToDisplayDelayMs.value = smoothDelay(captureToDisplayDelayMs.value, captureToDisplay)
+    frameDelayMode.value = mode
+    if (captureToReceive !== null && receiveToDisplay !== null) {
+      if (captureToReceive >= 0 && captureToReceive <= 60_000) {
+        captureToReceiveDelayMs.value = smoothDelay(captureToReceiveDelayMs.value, captureToReceive)
+      }
+      if (receiveToDisplay >= 0 && receiveToDisplay <= 60_000) {
+        receiveToDisplayDelayMs.value = smoothDelay(receiveToDisplayDelayMs.value, receiveToDisplay)
+      }
+    }
+    if (timing.processingDurationMs !== undefined
+      && timing.processingDurationMs >= 0
+      && timing.processingDurationMs <= 60_000) {
+      frameProcessingDelayMs.value = smoothDelay(frameProcessingDelayMs.value, timing.processingDurationMs)
+    }
+    return true
+  }
+
+  function requestHostFrameTiming(timing: RenderedFrameTiming) {
+    if (timing.rtpTimestamp === undefined || !socket) return
+    const requestedAt = performance.now()
+    if (requestedAt - lastFrameTimingRequestAt < 500) return
+    lastFrameTimingRequestAt = requestedAt
+    const requestedAtEpochMs = Date.now()
+    const currentPeer = peer
+    socket.timeout(1_500).emit(
+      'viewer.frameTiming',
+      { rtpTimestamp: timing.rtpTimestamp },
+      (error: Error | null, acknowledgement: FrameTimingAcknowledgement) => {
+        if (error
+          || peer !== currentPeer
+          || acknowledgement?.rtpTimestamp !== timing.rtpTimestamp
+          || typeof acknowledgement.captureTimeUnixMs !== 'number') {
+          expireHostFrameTimingIfStale()
+          return
+        }
+        const roundTripMs = Math.max(0, performance.now() - requestedAt)
+        frameTimingUncertaintyMs.value = smoothDelay(
+          frameTimingUncertaintyMs.value,
+          roundTripMs / 2,
+        )
+        const sampledOffsetMs = acknowledgement.serverTime - (requestedAtEpochMs + roundTripMs / 2)
+        updateServerClockOffset(sampledOffsetMs)
+        if (serverClockOffsetMs === null) return
+        const captureTimePerformanceMs = acknowledgement.captureTimeUnixMs
+          - serverClockOffsetMs
+          - performance.timeOrigin
+        const accepted = applyRenderedFrameTiming(
+          timing,
+          captureTimePerformanceMs,
+          'host-correlated',
+          typeof acknowledgement.encoderDelayMs === 'number'
+            ? acknowledgement.encoderDelayMs
+            : undefined,
+        )
+        if (accepted) {
+          lastHostFrameTimingAt = performance.now()
+          scheduleHostFrameTimingExpiry()
+        }
+      },
+    )
+  }
+
+  function expireHostFrameTimingIfStale() {
+    if (frameDelayMode.value !== 'host-correlated'
+      || lastHostFrameTimingAt === 0
+      || performance.now() - lastHostFrameTimingAt <= 3_000) return
+    frameDelayMode.value = null
+    captureToDisplayDelayMs.value = null
+    captureToReceiveDelayMs.value = null
+    receiveToDisplayDelayMs.value = null
+    frameProcessingDelayMs.value = null
+    frameTimingUncertaintyMs.value = null
+    if (hostFrameTimingExpiryTimer !== null) window.clearTimeout(hostFrameTimingExpiryTimer)
+    hostFrameTimingExpiryTimer = null
+  }
+
+  function scheduleHostFrameTimingExpiry() {
+    if (hostFrameTimingExpiryTimer !== null) window.clearTimeout(hostFrameTimingExpiryTimer)
+    hostFrameTimingExpiryTimer = window.setTimeout(() => {
+      hostFrameTimingExpiryTimer = null
+      expireHostFrameTimingIfStale()
+    }, 3_100)
+  }
+
+  function noteVideoFrameRendered(timing?: RenderedFrameTiming) {
     videoFrameRendered = true
     if (decodeStartupTimer !== null) window.clearTimeout(decodeStartupTimer)
     decodeStartupTimer = null
+    if (!timing) return
+    expireHostFrameTimingIfStale()
+    if (timing.captureTimeMs !== undefined && frameDelayMode.value !== 'host-correlated') {
+      applyRenderedFrameTiming(timing, timing.captureTimeMs, 'browser-estimated')
+    }
+    requestHostFrameTiming(timing)
   }
 
   function clearPeer() {
     if (statsTimer !== null) window.clearInterval(statsTimer)
     if (disconnectedTimer !== null) window.clearTimeout(disconnectedTimer)
     if (decodeStartupTimer !== null) window.clearTimeout(decodeStartupTimer)
+    if (hostFrameTimingExpiryTimer !== null) window.clearTimeout(hostFrameTimingExpiryTimer)
     statsTimer = null
     disconnectedTimer = null
     decodeStartupTimer = null
+    hostFrameTimingExpiryTimer = null
     const current = peer
     peer = null
+    negotiatedAudioEnabled = null
+    negotiatedMediaSessionRevision = null
     current?.close()
     videoStream.value = null
     negotiatedCodec.value = null
@@ -601,11 +782,20 @@ export function useViewer() {
     lastDroppedFramesTotal = null
     lastFreezeCountTotal = null
     playbackSamples.length = 0
+    droppedFrameSamples.value = []
     framesDropped.value = null
     freezeCount.value = null
     jitterBufferDelayMs.value = null
     catchUpDelayMs.value = null
     playoutDelayMs.value = null
+    captureToDisplayDelayMs.value = null
+    captureToReceiveDelayMs.value = null
+    receiveToDisplayDelayMs.value = null
+    frameProcessingDelayMs.value = null
+    frameDelayMode.value = null
+    frameTimingUncertaintyMs.value = null
+    lastFrameTimingRequestAt = 0
+    lastHostFrameTimingAt = 0
   }
 
   function scheduleReconnect(reason: string, immediate = false) {
@@ -624,17 +814,17 @@ export function useViewer() {
     scheduleReconnect('WebRTC reconnecting')
   }
 
-  function restartWebRtcSession() {
+  function restartWebRtcSession(reason = 'Group assignment restarting') {
     reconnectAttempt = 0
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
     reconnectTimer = null
     clearPeer()
-    connection.value = 'Group assignment restarting'
+    connection.value = reason
     if (negotiating) {
       restartRequested = true
       return
     }
-    scheduleReconnect('Group assignment restarting', true)
+    scheduleReconnect(reason, true)
   }
 
   async function startWebRtc() {
@@ -644,6 +834,12 @@ export function useViewer() {
     connection.value = 'Negotiating'
     const current = new RTCPeerConnection({ iceServers: [] })
     peer = current
+    const offerAudioEnabled = status.value.audio_enabled === true
+    const offerMediaSessionRevision = status.value.media_session_revision
+    negotiatedAudioEnabled = offerAudioEnabled
+    negotiatedMediaSessionRevision = typeof offerMediaSessionRevision === 'number'
+      ? offerMediaSessionRevision
+      : null
     videoFrameRendered = false
     try {
       const videoTransceiver = current.addTransceiver('video', { direction: 'recvonly' })
@@ -655,7 +851,7 @@ export function useViewer() {
           // The hint is optional and browser-dependent.
         }
       }
-      if (status.value.audio_enabled) current.addTransceiver('audio', { direction: 'recvonly' })
+      if (offerAudioEnabled) current.addTransceiver('audio', { direction: 'recvonly' })
       const stream = new MediaStream()
       current.addEventListener('track', ({ track }) => {
         if (peer !== current || stream.getTracks().some(({ id }) => id === track.id)) return
@@ -714,7 +910,7 @@ export function useViewer() {
 
   function unmute() {
     const element = document.querySelector<HTMLVideoElement>('video')
-    if (element) {
+    if (element && status.value.audio_enabled && videoStream.value?.getAudioTracks().length) {
       element.muted = false
       void element.play()
     }
@@ -765,5 +961,5 @@ export function useViewer() {
   }
 
   onBeforeUnmount(stop)
-  return { videoStream, status, connection, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, unmute, seekToLiveEdge, noteVideoFrameRendered, ping }
+  return { videoStream, status, connection, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, unmute, seekToLiveEdge, noteVideoFrameRendered, ping }
 }

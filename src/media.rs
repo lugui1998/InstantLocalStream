@@ -42,7 +42,11 @@ const VP9_PAYLOAD_TYPE: u8 = 98;
 // Keeping this fixed makes the static sample writer match the answer SDP.
 const H264_PAYLOAD_TYPE: u8 = 108;
 const MAX_ENCODED_FRAME_AGE: Duration = Duration::from_millis(250);
+const ENCODER_BACKLOG_RESTART_AGE: Duration = Duration::from_millis(750);
+const ENCODER_BACKLOG_RESTART_FRAMES: u32 = 8;
 const ENCODER_TIMING_QUEUE_LIMIT: usize = 120;
+const FRAME_TIMING_RETENTION: Duration = Duration::from_secs(65);
+const FRAME_TIMING_ENTRY_LIMIT: usize = 16_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
@@ -163,16 +167,34 @@ impl VideoCodec {
 
 #[derive(Clone)]
 pub struct MediaTrack {
+    connection_id: Uuid,
     track: Arc<TrackLocalStaticSample>,
     ssrc: u32,
     payload_type: u8,
     preserve_nal_order: bool,
     queue: Arc<SubscriberQueue>,
+    frame_capture_times: Arc<Mutex<HashMap<Uuid, VecDeque<FrameCaptureMapping>>>>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameCaptureMapping {
+    rtp_timestamp: u32,
+    capture_time_unix_nanos: u64,
+    encoder_delay_ms: u64,
+    recorded_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCaptureTiming {
+    pub capture_time_unix_nanos: u64,
+    pub encoder_delay_ms: u64,
 }
 
 struct QueuedSample {
     data: Bytes,
     duration: Duration,
+    capture_time_unix_nanos: Option<u64>,
+    encoder_delay_ms: Option<u64>,
 }
 
 struct SubscriberQueue {
@@ -183,42 +205,72 @@ struct SubscriberQueue {
 
 #[derive(Clone)]
 struct EncoderTiming {
-    submitted_frames: Arc<Mutex<VecDeque<Instant>>>,
+    submitted_frames: Arc<Mutex<VecDeque<SubmittedFrameTiming>>>,
     encoder_delay_ms: Arc<AtomicU64>,
     stale_encoded_frames: Arc<AtomicU64>,
 }
 
+#[derive(Clone, Copy)]
+struct SubmittedFrameTiming {
+    captured_at: Instant,
+    capture_time_unix_nanos: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EncodedFrameTiming {
+    stale: bool,
+    age: Option<Duration>,
+    capture_time_unix_nanos: Option<u64>,
+    encoder_delay_ms: Option<u64>,
+}
+
 impl EncoderTiming {
-    fn record_input(&self, captured_at: Instant) {
+    fn record_input(&self, captured_at: Instant, captured_at_unix_nanos: u64) {
         if let Ok(mut frames) = self.submitted_frames.lock() {
             while frames.len() >= ENCODER_TIMING_QUEUE_LIMIT {
                 frames.pop_front();
             }
-            frames.push_back(captured_at);
+            frames.push_back(SubmittedFrameTiming {
+                captured_at,
+                capture_time_unix_nanos: captured_at_unix_nanos,
+            });
         }
     }
 
-    /// Returns true when an encoded access unit is stale enough to discard
-    /// immediately instead of pacing old video out to viewers.
-    fn encoded_frame_is_stale(&self) -> bool {
-        let captured_at = self
+    fn discard_input(&self, captured_at_unix_nanos: u64) {
+        if let Ok(mut frames) = self.submitted_frames.lock()
+            && let Some(index) = frames
+                .iter()
+                .rposition(|frame| frame.capture_time_unix_nanos == captured_at_unix_nanos)
+        {
+            frames.remove(index);
+        }
+    }
+
+    /// Associates an encoded access unit with its source capture timestamp and
+    /// reports whether it is already too old to send.
+    fn encoded_frame_timing(&self) -> EncodedFrameTiming {
+        let submitted = self
             .submitted_frames
             .lock()
             .ok()
             .and_then(|mut frames| frames.pop_front());
-        let Some(captured_at) = captured_at else {
-            return false;
+        let Some(submitted) = submitted else {
+            return EncodedFrameTiming::default();
         };
-        let age = captured_at.elapsed();
-        self.encoder_delay_ms.store(
-            age.as_millis().min(u64::MAX as u128) as u64,
-            Ordering::Release,
-        );
+        let age = submitted.captured_at.elapsed();
+        let encoder_delay_ms = age.as_millis().min(u64::MAX as u128) as u64;
+        self.encoder_delay_ms
+            .store(encoder_delay_ms, Ordering::Release);
         if age > MAX_ENCODED_FRAME_AGE {
             self.stale_encoded_frames.fetch_add(1, Ordering::AcqRel);
-            return true;
         }
-        false
+        EncodedFrameTiming {
+            stale: age > MAX_ENCODED_FRAME_AGE,
+            age: Some(age),
+            capture_time_unix_nanos: Some(submitted.capture_time_unix_nanos),
+            encoder_delay_ms: Some(encoder_delay_ms),
+        }
     }
 }
 
@@ -260,6 +312,95 @@ mod tests {
             .wait_until_ready(Duration::from_millis(1))
             .unwrap_err();
         assert!(error.to_string().contains("test failure"));
+    }
+
+    #[test]
+    fn per_viewer_rtp_timestamp_resolves_the_source_capture_time() {
+        let pipeline = MediaPipeline::with_codec("vp8").unwrap();
+        let connection_id = Uuid::new_v4();
+        pipeline.frame_capture_times.lock().unwrap().insert(
+            connection_id,
+            VecDeque::from([FrameCaptureMapping {
+                rtp_timestamp: 123,
+                capture_time_unix_nanos: 456_000_000,
+                encoder_delay_ms: 17,
+                recorded_at: Instant::now(),
+            }]),
+        );
+
+        assert_eq!(
+            pipeline.frame_capture_timing(connection_id, 123),
+            Some(FrameCaptureTiming {
+                capture_time_unix_nanos: 456_000_000,
+                encoder_delay_ms: 17,
+            })
+        );
+        assert_eq!(pipeline.frame_capture_timing(connection_id, 124), None);
+    }
+
+    #[test]
+    fn encoder_timing_is_recorded_before_output_and_can_be_rolled_back() {
+        let timing = EncoderTiming {
+            submitted_frames: Arc::new(Mutex::new(VecDeque::new())),
+            encoder_delay_ms: Arc::new(AtomicU64::new(0)),
+            stale_encoded_frames: Arc::new(AtomicU64::new(0)),
+        };
+        timing.record_input(Instant::now(), 123);
+        assert_eq!(
+            timing.encoded_frame_timing().capture_time_unix_nanos,
+            Some(123)
+        );
+
+        timing.record_input(Instant::now(), 456);
+        timing.discard_input(456);
+        assert_eq!(timing.encoded_frame_timing().capture_time_unix_nanos, None);
+    }
+
+    #[test]
+    fn sustained_encoder_backlog_triggers_a_live_edge_restart() {
+        let pipeline = MediaPipeline::with_codec("vp8").unwrap();
+        let timing = EncodedFrameTiming {
+            stale: true,
+            age: Some(ENCODER_BACKLOG_RESTART_AGE),
+            capture_time_unix_nanos: Some(1),
+            encoder_delay_ms: Some(ENCODER_BACKLOG_RESTART_AGE.as_millis() as u64),
+        };
+        let mut consecutive = 0;
+        for _ in 1..ENCODER_BACKLOG_RESTART_FRAMES {
+            assert!(!pipeline.encoder_backlog_requires_restart(&timing, &mut consecutive));
+        }
+        assert!(pipeline.encoder_backlog_requires_restart(&timing, &mut consecutive));
+        assert_eq!(pipeline.encoder_backlog_restarts(), 1);
+        assert_eq!(pipeline.capture_revision.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn explicit_rtp_timestamp_supports_zero_wraparound_and_multi_packet_frames() {
+        let mut packets = vec![rtc::rtp::Packet::default(), rtc::rtp::Packet::default()];
+        packets[0].header.timestamp = 10;
+        packets[1].header.timestamp = 11;
+        webrtc::media_stream::track_local::static_sample::apply_rtp_timestamp_override(
+            &mut packets,
+            None,
+        );
+        assert_eq!(packets[0].header.timestamp, 10);
+        assert_eq!(packets[1].header.timestamp, 11);
+
+        webrtc::media_stream::track_local::static_sample::apply_rtp_timestamp_override(
+            &mut packets,
+            Some(0),
+        );
+        assert!(packets.iter().all(|packet| packet.header.timestamp == 0));
+
+        webrtc::media_stream::track_local::static_sample::apply_rtp_timestamp_override(
+            &mut packets,
+            Some(u32::MAX),
+        );
+        assert!(
+            packets
+                .iter()
+                .all(|packet| packet.header.timestamp == u32::MAX)
+        );
     }
 
     #[test]
@@ -321,6 +462,7 @@ mod tests {
 
 pub struct MediaPipeline {
     subscribers: Arc<Mutex<HashMap<Uuid, MediaTrack>>>,
+    frame_capture_times: Arc<Mutex<HashMap<Uuid, VecDeque<FrameCaptureMapping>>>>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     ended: Arc<AtomicBool>,
@@ -329,6 +471,7 @@ pub struct MediaPipeline {
     capture_revision: Arc<std::sync::atomic::AtomicU64>,
     encoder_delay_ms: Arc<AtomicU64>,
     stale_encoded_frames: Arc<AtomicU64>,
+    encoder_backlog_restarts: Arc<AtomicU64>,
     readiness: Arc<(Mutex<EncoderReadiness>, Condvar)>,
     codec: VideoCodec,
 }
@@ -344,6 +487,7 @@ impl MediaPipeline {
     pub fn with_codec(codec: &str) -> Result<Self> {
         Ok(Self {
             subscribers: Arc::new(Mutex::new(HashMap::new())),
+            frame_capture_times: Arc::new(Mutex::new(HashMap::new())),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(false)),
             ended: Arc::new(AtomicBool::new(false)),
@@ -352,6 +496,7 @@ impl MediaPipeline {
             capture_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             encoder_delay_ms: Arc::new(AtomicU64::new(0)),
             stale_encoded_frames: Arc::new(AtomicU64::new(0)),
+            encoder_backlog_restarts: Arc::new(AtomicU64::new(0)),
             readiness: Arc::new((Mutex::new(EncoderReadiness::Pending), Condvar::new())),
             codec: VideoCodec::parse(codec)?,
         })
@@ -380,6 +525,7 @@ impl MediaPipeline {
             }],
         ))?;
         let media_track = MediaTrack {
+            connection_id,
             track: Arc::new(track),
             ssrc,
             payload_type: self.codec.payload_type(),
@@ -389,6 +535,7 @@ impl MediaPipeline {
                 notify: Notify::new(),
                 closed: AtomicBool::new(false),
             }),
+            frame_capture_times: Arc::clone(&self.frame_capture_times),
         };
         let writer_track = media_track.clone();
         tokio::spawn(async move {
@@ -398,6 +545,9 @@ impl MediaPipeline {
             .lock()
             .map_err(|_| anyhow::anyhow!("media subscriber lock poisoned"))?
             .insert(connection_id, media_track.clone());
+        if let Ok(mut timings) = self.frame_capture_times.lock() {
+            timings.insert(connection_id, VecDeque::with_capacity(120));
+        }
         Ok(media_track)
     }
 
@@ -407,6 +557,30 @@ impl MediaPipeline {
         {
             track.close();
         }
+        if let Ok(mut timings) = self.frame_capture_times.lock() {
+            timings.remove(&connection_id);
+        }
+    }
+
+    pub fn frame_capture_timing(
+        &self,
+        connection_id: Uuid,
+        rtp_timestamp: u32,
+    ) -> Option<FrameCaptureTiming> {
+        self.frame_capture_times
+            .lock()
+            .ok()
+            .and_then(|timings| timings.get(&connection_id).cloned())
+            .and_then(|timings| {
+                timings
+                    .iter()
+                    .rev()
+                    .find(|timing| timing.rtp_timestamp == rtp_timestamp)
+                    .map(|timing| FrameCaptureTiming {
+                        capture_time_unix_nanos: timing.capture_time_unix_nanos,
+                        encoder_delay_ms: timing.encoder_delay_ms,
+                    })
+            })
     }
     pub fn codec_name(&self) -> &'static str {
         self.codec.name()
@@ -477,6 +651,10 @@ impl MediaPipeline {
 
     pub fn stale_encoded_frames(&self) -> u64 {
         self.stale_encoded_frames.load(Ordering::Acquire)
+    }
+
+    pub fn encoder_backlog_restarts(&self) -> u64 {
+        self.encoder_backlog_restarts.load(Ordering::Acquire)
     }
 
     pub fn wait_until_ready(&self, timeout: Duration) -> Result<()> {
@@ -694,8 +872,11 @@ impl MediaPipeline {
                             source_pixel_format.ffmpeg_name(),
                         );
                     }
-                    stdin.write_all(&frame.data)?;
-                    writer_timing.record_input(frame.captured_at);
+                    writer_timing.record_input(Instant::now(), frame.captured_at_unix_nanos);
+                    if let Err(error) = stdin.write_all(&frame.data) {
+                        writer_timing.discard_input(frame.captured_at_unix_nanos);
+                        return Err(error.into());
+                    }
                     next_input_at = now + input_interval;
                 }
                 Ok(())
@@ -872,21 +1053,30 @@ impl MediaPipeline {
         )
         .max(Duration::from_millis(1));
         let mut pacer = FramePacer::new(frame_duration);
+        let mut backlog_frames = 0_u32;
         while !self.stop.load(Ordering::Acquire) {
             let (frame, _) = match reader.parse_next_frame() {
                 Ok(frame) => frame,
                 Err(_error) if self.stop.load(Ordering::Acquire) => break,
                 Err(error) => return Err(anyhow::anyhow!("FFmpeg IVF stream ended: {error}")),
             };
-            let stale = timing.encoded_frame_is_stale();
+            let frame_timing = timing.encoded_frame_timing();
             self.mark_ready();
-            if !self.active.load(Ordering::Acquire) || stale {
+            if self.encoder_backlog_requires_restart(&frame_timing, &mut backlog_frames) {
+                return Ok(());
+            }
+            if !self.active.load(Ordering::Acquire) || frame_timing.stale {
                 // Never pace stale output: drain buffered encoder frames as
                 // fast as possible until a current source frame emerges.
                 pacer.reset_to_now();
                 continue;
             }
-            self.write_frame(frame.freeze(), frame_duration)?;
+            self.write_frame(
+                frame.freeze(),
+                frame_duration,
+                frame_timing.capture_time_unix_nanos,
+                frame_timing.encoder_delay_ms,
+            )?;
             pacer.wait_after_frame();
         }
         Ok(())
@@ -902,6 +1092,7 @@ impl MediaPipeline {
         let frame_duration = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
         let mut pacer = FramePacer::new(frame_duration);
         let mut timed_samples = 0_u64;
+        let mut backlog_frames = 0_u32;
         while !self.stop.load(Ordering::Acquire) {
             let sample = match reader.next_sample() {
                 Ok(sample) => sample,
@@ -914,7 +1105,7 @@ impl MediaPipeline {
             match h264_nal_kind(&sample.data) {
                 H264NalKind::ParameterOrPrefix => {
                     if self.active.load(Ordering::Acquire) {
-                        self.write_frame(sample.data, Duration::ZERO)?;
+                        self.write_frame(sample.data, Duration::ZERO, None, None)?;
                     }
                     continue;
                 }
@@ -936,18 +1127,32 @@ impl MediaPipeline {
                     "H.264 encoder is producing access units"
                 );
             }
-            let stale = timing.encoded_frame_is_stale();
-            if !self.active.load(Ordering::Acquire) || stale {
+            let frame_timing = timing.encoded_frame_timing();
+            if self.encoder_backlog_requires_restart(&frame_timing, &mut backlog_frames) {
+                return Ok(());
+            }
+            if !self.active.load(Ordering::Acquire) || frame_timing.stale {
                 pacer.reset_to_now();
                 continue;
             }
-            self.write_frame(sample.data, frame_duration)?;
+            self.write_frame(
+                sample.data,
+                frame_duration,
+                frame_timing.capture_time_unix_nanos,
+                frame_timing.encoder_delay_ms,
+            )?;
             pacer.wait_after_frame();
         }
         Ok(())
     }
 
-    fn write_frame(&self, data: Bytes, duration: Duration) -> Result<()> {
+    fn write_frame(
+        &self,
+        data: Bytes,
+        duration: Duration,
+        capture_time_unix_nanos: Option<u64>,
+        encoder_delay_ms: Option<u64>,
+    ) -> Result<()> {
         let subscribers = self
             .subscribers
             .lock()
@@ -959,9 +1164,36 @@ impl MediaPipeline {
             subscriber.enqueue(QueuedSample {
                 data: data.clone(),
                 duration,
+                capture_time_unix_nanos,
+                encoder_delay_ms,
             });
         }
         Ok(())
+    }
+
+    fn encoder_backlog_requires_restart(
+        &self,
+        timing: &EncodedFrameTiming,
+        consecutive_backlog_frames: &mut u32,
+    ) -> bool {
+        if timing
+            .age
+            .is_some_and(|age| age >= ENCODER_BACKLOG_RESTART_AGE)
+        {
+            *consecutive_backlog_frames = consecutive_backlog_frames.saturating_add(1);
+        } else {
+            *consecutive_backlog_frames = 0;
+        }
+        if *consecutive_backlog_frames < ENCODER_BACKLOG_RESTART_FRAMES {
+            return false;
+        }
+        self.encoder_backlog_restarts.fetch_add(1, Ordering::AcqRel);
+        self.capture_revision.fetch_add(1, Ordering::AcqRel);
+        tracing::warn!(
+            backlog_ms = timing.age.map(|age| age.as_millis()).unwrap_or_default(),
+            "encoder backlog remained stale; restarting this encoder at the live edge"
+        );
+        true
     }
 }
 
@@ -1083,6 +1315,7 @@ impl MediaTrack {
     }
 
     async fn run_writer(self) {
+        let mut next_rtp_timestamp = rand::random::<u32>().max(1);
         loop {
             let sample = loop {
                 if self.queue.closed.load(Ordering::Acquire) {
@@ -1095,9 +1328,33 @@ impl MediaTrack {
                 }
                 self.queue.notify.notified().await;
             };
-            if let Err(error) = self
+            let packet_timestamp = next_rtp_timestamp;
+            let timestamp_step = (sample.duration.as_secs_f64() * 90_000.0).round().max(0.0) as u32;
+            next_rtp_timestamp = next_rtp_timestamp.wrapping_add(timestamp_step);
+            if let (Some(capture_time), Some(encoder_delay_ms)) =
+                (sample.capture_time_unix_nanos, sample.encoder_delay_ms)
+                && let Ok(mut timings) = self.frame_capture_times.lock()
+                && let Some(timings) = timings.get_mut(&self.connection_id)
+            {
+                while timings
+                    .front()
+                    .is_some_and(|timing| timing.recorded_at.elapsed() > FRAME_TIMING_RETENTION)
+                    || timings.len() >= FRAME_TIMING_ENTRY_LIMIT
+                {
+                    timings.pop_front();
+                }
+                timings.push_back(FrameCaptureMapping {
+                    rtp_timestamp: packet_timestamp,
+                    capture_time_unix_nanos: capture_time,
+                    encoder_delay_ms,
+                    recorded_at: Instant::now(),
+                });
+            }
+            let writer = self
                 .track
                 .sample_writer(self.ssrc, self.payload_type)
+                .with_rtp_timestamp(packet_timestamp);
+            if let Err(error) = writer
                 .write_sample(&Sample {
                     data: sample.data,
                     duration: sample.duration,

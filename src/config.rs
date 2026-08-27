@@ -287,6 +287,9 @@ impl AppConfig {
         if self.width == 0 || self.height == 0 || self.fps == 0 || self.bitrate == 0 {
             bail!("width, height, fps, and bitrate must be greater than zero");
         }
+        if self.fps > 240 {
+            bail!("capture FPS must not exceed 240");
+        }
         match self.codec.to_ascii_lowercase().as_str() {
             "auto" | "vp8" | "vp9" | "h264" => {}
             other => bail!("unsupported initial codec '{other}', choose auto, vp8, vp9, or h264"),
@@ -598,6 +601,15 @@ mod tests {
         let mut config = AppConfig::default();
         config.codec = "h264".to_owned();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn capture_fps_is_bounded_for_timing_retention() {
+        let mut config = AppConfig::default();
+        config.fps = 240;
+        assert!(config.validate().is_ok());
+        config.fps = 241;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from 'vue'
 import type { BootstrapProgress } from '@/composables/useViewer'
+import type { RenderedFrameTiming } from '@/types'
 
-const emit = defineEmits<{ unmute: []; 'live-edge': [video: HTMLVideoElement]; 'frame-rendered': [] }>()
+const emit = defineEmits<{ unmute: []; 'live-edge': [video: HTMLVideoElement]; 'frame-rendered': [timing?: RenderedFrameTiming] }>()
 const video = ref<HTMLVideoElement | null>(null)
 
 const props = defineProps<{
   stream: MediaStream | null
+  audioEnabled: boolean
   catchUpDelayMs: number | null
   bootstrapProgress: BootstrapProgress | null
 }>()
@@ -30,10 +32,28 @@ function applyCatchUpRate() {
   }
 }
 
-function followLiveEdge() {
+function requestUnmute() {
+  const hasLiveAudio = props.stream?.getAudioTracks().some(track => track.readyState === 'live')
+  if (props.audioEnabled && hasLiveAudio) emit('unmute')
+}
+
+type WebRtcFrameMetadata = VideoFrameCallbackMetadata & {
+  captureTime?: number
+  receiveTime?: number
+  rtpTimestamp?: number
+}
+
+function followLiveEdge(_now: number, metadata: WebRtcFrameMetadata) {
   const element = video.value
   if (!element) return
-  emit('frame-rendered')
+  emit('frame-rendered', {
+    expectedDisplayTimeMs: metadata.expectedDisplayTime,
+    presentationTimeMs: metadata.presentationTime,
+    ...(typeof metadata.captureTime === 'number' ? { captureTimeMs: metadata.captureTime } : {}),
+    ...(typeof metadata.receiveTime === 'number' ? { receiveTimeMs: metadata.receiveTime } : {}),
+    ...(typeof metadata.processingDuration === 'number' ? { processingDurationMs: metadata.processingDuration * 1_000 } : {}),
+    ...(typeof metadata.rtpTimestamp === 'number' ? { rtpTimestamp: metadata.rtpTimestamp } : {}),
+  })
   const { seekable } = element
   if (seekable.length > 0) {
     const liveEdge = seekable.end(seekable.length - 1)
@@ -42,19 +62,23 @@ function followLiveEdge() {
     }
   }
   if ('requestVideoFrameCallback' in element) {
-    frameCallback = element.requestVideoFrameCallback(() => followLiveEdge())
+    frameCallback = element.requestVideoFrameCallback((now, nextMetadata) => followLiveEdge(now, nextMetadata))
   }
 }
 
 watch([video, () => props.stream], ([element, stream]) => {
   if (element) {
+    // A rebuilt peer may now carry audio.  Stay muted at attachment time so
+    // autoplay remains reliable, but do not disable native controls: once an
+    // audio track arrives the browser enables its volume UI for the viewer.
+    element.muted = true
     element.srcObject = stream
     if (frameCallback && 'cancelVideoFrameCallback' in element) {
       element.cancelVideoFrameCallback(frameCallback)
       frameCallback = 0
     }
     if (stream && 'requestVideoFrameCallback' in element) {
-      frameCallback = element.requestVideoFrameCallback(() => followLiveEdge())
+      frameCallback = element.requestVideoFrameCallback((now, metadata) => followLiveEdge(now, metadata))
     }
   }
 }, { immediate: true })
@@ -82,7 +106,7 @@ onBeforeUnmount(() => {
       muted
       playsinline
       controls
-      @click="emit('unmute')"
+      @click="requestUnmute"
       @loadeddata="emit('frame-rendered')"
       @loadedmetadata="video && emit('live-edge', video)"
     />

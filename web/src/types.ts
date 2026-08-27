@@ -8,8 +8,11 @@ export interface StreamStatus {
   quality?: string
   fps?: string | number
   bitrate_bps?: number
+  settings_revision?: number
+  media_session_revision?: number
   encoder_delay_ms?: number | null
   stale_encoded_frames?: number
+  encoder_backlog_restarts?: number
   codec?: string | null
   group?: GroupAssignment | null
   groups?: GroupAssignment[]
@@ -27,6 +30,7 @@ export interface GroupAssignment {
   state: string
   reason: string | null
   restart?: boolean
+  settings_revision?: number
   sync_mode?: string
 }
 
@@ -49,6 +53,11 @@ export interface SessionReady {
   status: StreamStatus
 }
 
+export interface AuthoritativeStreamSettings {
+  revision: number
+  status: StreamStatus
+}
+
 export interface ViewerStats {
   rttMs: number
   jitterMs: number
@@ -62,11 +71,34 @@ export interface ViewerStats {
   visibilityState?: DocumentVisibilityState
 }
 
+export interface RenderedFrameTiming {
+  expectedDisplayTimeMs: number
+  presentationTimeMs: number
+  captureTimeMs?: number
+  receiveTimeMs?: number
+  processingDurationMs?: number
+  rtpTimestamp?: number
+}
+
+export interface FrameTimingAcknowledgement {
+  rtpTimestamp: number
+  captureTimeUnixMs?: number | null
+  encoderDelayMs?: number | null
+  serverTime: number
+}
+
+export interface PlaybackMetricPoint {
+  capturedAt: number
+  dropped: number
+  freezes: number
+}
+
 export interface PingAcknowledgement {
   sentAt: number
   serverTime: number
   encoderDelayMs?: number | null
   staleEncodedFrames?: number
+  encoderBacklogRestarts?: number
   mediaStatus?: string
   mediaError?: string | null
 }

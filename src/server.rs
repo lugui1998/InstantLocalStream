@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Command;
 use std::sync::{
     Arc, Mutex as StdMutex, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,7 +34,7 @@ use socketioxide::{
     extract::{AckSender, Data, Extension, SocketRef, State as SocketState},
     socket::DisconnectReason,
 };
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -58,12 +58,6 @@ pub enum ServerCommand {
     Update(CaptureSettings),
 }
 
-#[derive(Debug, Clone)]
-pub struct ControlEvent {
-    pub event: String,
-    pub data: serde_json::Value,
-}
-
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
 struct WebAssets;
@@ -71,7 +65,8 @@ struct WebAssets;
 #[derive(Clone)]
 pub struct ServerState {
     pub config: Arc<AppConfig>,
-    pub events: broadcast::Sender<ControlEvent>,
+    settings_revision: Arc<AtomicU64>,
+    media_session_revision: Arc<AtomicU64>,
     pub audio: Option<Arc<AudioPipeline>>,
     stream_enabled: Arc<AtomicBool>,
     settings: Arc<StdMutex<CaptureSettings>>,
@@ -1574,6 +1569,12 @@ struct ControlPing {
     sent_at: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ViewerFrameTimingRequest {
+    #[serde(rename = "rtpTimestamp")]
+    rtp_timestamp: u32,
+}
+
 #[derive(Clone)]
 struct PeerHandler {
     gather_complete: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -1774,10 +1775,10 @@ pub async fn run_with_control(
         .as_ref()
         .map(|audio| Arc::clone(audio).spawn(initial_settings.clone()));
     let viewer_metrics = Arc::new(StdMutex::new(HashMap::new()));
-    let (events, _) = broadcast::channel(64);
-    let state = ServerState {
-        config: Arc::new(config.clone()),
-        events,
+        let state = ServerState {
+            config: Arc::new(config.clone()),
+            settings_revision: Arc::new(AtomicU64::new(0)),
+            media_session_revision: Arc::new(AtomicU64::new(0)),
         audio: audio.clone(),
         stream_enabled: Arc::clone(&stream_enabled),
         settings: Arc::clone(&settings_slot),
@@ -1812,6 +1813,12 @@ pub async fn run_with_control(
                         continue;
                     }
                     control_state.stream_enabled.store(true, Ordering::Release);
+                    // A new host start is a fresh media session, even when its
+                    // capture settings match the previous run.  Existing
+                    // browser peers must re-offer to receive the new graph.
+                    control_state
+                        .media_session_revision
+                        .fetch_add(1, Ordering::AcqRel);
                     control_state.groups.activate();
                     if let Some(audio) = &control_state.audio {
                         audio.activate();
@@ -1823,6 +1830,9 @@ pub async fn run_with_control(
                 }
                 ServerCommand::StopStream => {
                     control_state.stream_enabled.store(false, Ordering::Release);
+                    control_state
+                        .media_session_revision
+                        .fetch_add(1, Ordering::AcqRel);
                     control_state.groups.deactivate();
                     if let Some(audio) = &control_state.audio {
                         audio.deactivate();
@@ -1846,10 +1856,6 @@ pub async fn run_with_control(
         .max_buffer_size(128)
         .build_layer();
     socket_io.ns("/", control_connect);
-    let event_task = tokio::spawn(forward_control_events(
-        state.events.subscribe(),
-        socket_io.clone(),
-    ));
     let app = router(state.clone()).layer(socket_layer);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     crate::runtime::write(&crate::runtime::RuntimeStatus {
@@ -1873,7 +1879,6 @@ pub async fn run_with_control(
         .await;
 
     let _ = socket_io.close().await;
-    event_task.abort();
     control_task.abort();
     for adaptive_task in adaptive_tasks {
         adaptive_task.abort();
@@ -1911,6 +1916,7 @@ fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Res
         .clone();
     let raw_capture_changed = capture_format_changed(&previous, &settings);
     let encoder_profile_changed = encoder_profile_changed(&previous, &settings);
+    let audio_topology_changed = audio_enabled(&previous) != audio_enabled(&settings);
     if raw_capture_changed {
         let shared_capture = state
             .shared_capture
@@ -2008,7 +2014,19 @@ fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Res
     if let Some(audio) = &state.audio {
         audio.reconfigure(settings);
     }
+    if audio_topology_changed {
+        // WebRTC cannot add or remove an audio m-line on an already-negotiated
+        // peer.  Publish a new session generation so viewers reconnect with
+        // the authoritative audio topology.
+        state
+            .media_session_revision
+            .fetch_add(1, Ordering::AcqRel);
+    }
     Ok(())
+}
+
+fn audio_enabled(settings: &CaptureSettings) -> bool {
+    settings.audio_mode != "off"
 }
 
 fn capture_input_changed(previous: &CaptureSettings, next: &CaptureSettings) -> bool {
@@ -2066,9 +2084,7 @@ fn restart_viewer_sessions(state: &ServerState, reason: &str) {
         .unwrap_or_default();
     for (client_id, socket) in sockets {
         let assignment = state.groups.assignment_for(&client_id);
-        let payload = state
-            .groups
-            .assignment_json_for(assignment.group_id, reason, true);
+        let payload = authoritative_assignment_payload(state, assignment.group_id, reason, true);
         socket.emit("group.assignment", &payload).ok();
     }
 }
@@ -2187,7 +2203,8 @@ async fn group_adaptive_loop(state: ServerState) {
                 .ok()
                 .and_then(|sockets| sockets.get(&migration.client_id).cloned());
             if let Some(socket) = socket {
-                let payload = state.groups.assignment_json_for(
+                let payload = authoritative_assignment_payload(
+                    &state,
                     migration.assignment.group_id,
                     &migration.assignment.reason,
                     migration.assignment.restart,
@@ -2314,9 +2331,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         .map(|connected| connected.len())
         .unwrap_or_default();
     let settings = state.settings.lock().ok().map(|settings| settings.clone());
-    let audio_enabled = settings
-        .as_ref()
-        .is_some_and(|settings| settings.audio_mode != "off");
+    let audio_enabled = settings.as_ref().is_some_and(audio_enabled);
     let primary_media = state.groups.media_by_id(state.groups.primary_group_id());
     let capture_error = state
         .shared_capture
@@ -2325,6 +2340,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
     json!({
         "status": primary_media.as_ref().map(|media| media.status()).unwrap_or("stopped"),
         "stream_enabled": state.stream_enabled.load(Ordering::Acquire),
+        "media_session_revision": state.media_session_revision.load(Ordering::Acquire),
         "viewers": viewers,
         "bind": state.config.bind,
         "http_port": state.config.http_port,
@@ -2334,6 +2350,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "capture_error": capture_error,
         "encoder_delay_ms": primary_media.as_ref().and_then(|media| media.encoder_delay_ms()),
         "stale_encoded_frames": primary_media.as_ref().map(|media| media.stale_encoded_frames()).unwrap_or_default(),
+        "encoder_backlog_restarts": primary_media.as_ref().map(|media| media.encoder_backlog_restarts()).unwrap_or_default(),
         "audio_status": audio_enabled.then(|| state.audio.as_ref().map(|audio| audio.status())).flatten(),
         "audio_error": audio_enabled.then(|| state.audio.as_ref().and_then(|audio| audio.failure())).flatten(),
         "audio_enabled": audio_enabled,
@@ -2361,6 +2378,15 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
 }
 
 fn status_for_client(state: &ServerState, client_id: &str) -> serde_json::Value {
+    let revision = state.settings_revision.load(Ordering::Acquire);
+    status_for_client_revision(state, client_id, revision)
+}
+
+fn status_for_client_revision(
+    state: &ServerState,
+    client_id: &str,
+    revision: u64,
+) -> serde_json::Value {
     let mut status = status_snapshot(state);
     let group = state.groups.assignment_json(client_id);
     status["quality"] = group["quality"].clone();
@@ -2368,7 +2394,31 @@ fn status_for_client(state: &ServerState, client_id: &str) -> serde_json::Value 
     status["bitrate_bps"] = group["bitrate_bps"].clone();
     status["codec"] = group["codec"].clone();
     status["group"] = group;
+    status["settings_revision"] = serde_json::json!(revision);
     status
+}
+
+fn authoritative_assignment_payload(
+    state: &ServerState,
+    group_id: usize,
+    reason: &str,
+    restart: bool,
+) -> serde_json::Value {
+    let mut assignment = state.groups.assignment_json_for(group_id, reason, restart);
+    assignment["settings_revision"] =
+        serde_json::json!(state.settings_revision.load(Ordering::Acquire));
+    assignment
+}
+
+fn authoritative_settings_event(
+    state: &ServerState,
+    client_id: &str,
+    revision: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "revision": revision,
+        "status": status_for_client_revision(state, client_id, revision),
+    })
 }
 
 async fn session_without_token() -> Json<serde_json::Value> {
@@ -2686,6 +2736,7 @@ async fn control_connect(
     socket.on("status.request", handle_status_request);
     socket.on("viewer.bootstrap", handle_viewer_bootstrap);
     socket.on("control.ping", handle_control_ping);
+    socket.on("viewer.frameTiming", handle_viewer_frame_timing);
     socket.on("viewer.stats", handle_viewer_stats);
     socket.on("viewer.codecFailure", handle_viewer_codec_failure);
     socket.on_disconnect(handle_control_disconnect);
@@ -2699,6 +2750,12 @@ async fn control_connect(
     });
     socket.emit("session.ready", &ready).ok();
     socket.emit("status.snapshot", &snapshot).ok();
+    let authoritative = authoritative_settings_event(
+        &state,
+        &client_id,
+        state.settings_revision.load(Ordering::Acquire),
+    );
+    socket.emit("stream.settings", &authoritative).ok();
     info!(%client_id, "control socket connected");
 }
 
@@ -2713,6 +2770,12 @@ async fn handle_status_request(
     }
     let snapshot = status_for_client(&state, &identity.client_id);
     socket.emit("status.snapshot", &snapshot).ok();
+    let authoritative = authoritative_settings_event(
+        &state,
+        &identity.client_id,
+        state.settings_revision.load(Ordering::Acquire),
+    );
+    socket.emit("stream.settings", &authoritative).ok();
     ack.send(&snapshot).ok();
 }
 
@@ -2736,9 +2799,49 @@ async fn handle_control_ping(
             .map(|duration| duration.as_millis())
             .unwrap_or_default(),
         "encoderDelayMs": media.as_ref().and_then(|media| media.encoder_delay_ms()),
-        "staleEncodedFrames": media.map(|media| media.stale_encoded_frames()).unwrap_or_default(),
+        "staleEncodedFrames": media.as_ref().map(|media| media.stale_encoded_frames()).unwrap_or_default(),
+        "encoderBacklogRestarts": media.as_ref().map(|media| media.encoder_backlog_restarts()).unwrap_or_default(),
         "mediaStatus": media_status,
         "mediaError": media_error,
+    });
+    ack.send(&response).ok();
+}
+
+async fn handle_viewer_frame_timing(
+    socket: SocketRef,
+    Data(request): Data<ViewerFrameTimingRequest>,
+    Extension(identity): Extension<ClientIdentity>,
+    SocketState(state): SocketState<ServerState>,
+    ack: AckSender,
+) {
+    if !is_current_socket(&state, &identity.client_id, &socket) {
+        return;
+    }
+    let connection_id = state
+        .client_connections
+        .lock()
+        .ok()
+        .and_then(|connections| connections.get(&identity.client_id).copied());
+    let frame_timing = connection_id.and_then(|connection_id| {
+        state
+            .connection_bindings
+            .lock()
+            .ok()
+            .and_then(|bindings| bindings.get(&connection_id).cloned())
+            .and_then(|binding| {
+                binding
+                    .media
+                    .frame_capture_timing(connection_id, request.rtp_timestamp)
+            })
+    });
+    let response = json!({
+        "rtpTimestamp": request.rtp_timestamp,
+        "captureTimeUnixMs": frame_timing.map(|timing| timing.capture_time_unix_nanos as f64 / 1_000_000.0),
+        "encoderDelayMs": frame_timing.map(|timing| timing.encoder_delay_ms),
+        "serverTime": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64() * 1_000.0)
+            .unwrap_or_default(),
     });
     ack.send(&response).ok();
 }
@@ -2753,7 +2856,8 @@ async fn handle_viewer_bootstrap(
         return;
     }
     let assignment = state.groups.bootstrap(&identity.client_id, &probe);
-    let payload = state.groups.assignment_json_for(
+    let payload = authoritative_assignment_payload(
+        &state,
         assignment.group_id,
         &assignment.reason,
         assignment.restart,
@@ -2761,6 +2865,12 @@ async fn handle_viewer_bootstrap(
     socket.emit("group.bootstrap", &payload).ok();
     let snapshot = status_for_client(&state, &identity.client_id);
     socket.emit("status.snapshot", &snapshot).ok();
+    let authoritative = authoritative_settings_event(
+        &state,
+        &identity.client_id,
+        state.settings_revision.load(Ordering::Acquire),
+    );
+    socket.emit("stream.settings", &authoritative).ok();
 }
 
 async fn handle_viewer_stats(
@@ -2772,7 +2882,8 @@ async fn handle_viewer_stats(
     if is_current_socket(&state, &identity.client_id, &socket) {
         let metrics = update_viewer_metrics(&state, &identity.client_id, &stats);
         if let Some(assignment) = state.groups.observe(&identity.client_id, &metrics) {
-            let payload = state.groups.assignment_json_for(
+            let payload = authoritative_assignment_payload(
+                &state,
                 assignment.group_id,
                 &assignment.reason,
                 assignment.restart,
@@ -2804,7 +2915,8 @@ async fn handle_viewer_codec_failure(
         reason = %failure.reason,
         "viewer reported a codec decode failure"
     );
-    let payload = state.groups.assignment_json_for(
+    let payload = authoritative_assignment_payload(
+        &state,
         assignment.group_id,
         &assignment.reason,
         assignment.restart,
@@ -2829,30 +2941,27 @@ async fn handle_control_disconnect(
     }
 }
 
-async fn forward_control_events(
-    mut events: broadcast::Receiver<ControlEvent>,
-    socket_io: SocketIo,
-) {
-    loop {
-        match events.recv().await {
-            Ok(event) => {
-                if let Err(error) = socket_io.emit(&event.event, &event.data).await {
-                    warn!(event = %event.event, %error, "control event delivery failed");
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(count)) => {
-                warn!(count, "control event subscriber lagged");
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+fn broadcast_status(state: &ServerState) {
+    let revision = state.settings_revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let sockets = state
+        .client_sockets
+        .lock()
+        .map(|sockets| {
+            sockets
+                .iter()
+                .map(|(client_id, socket)| (client_id.clone(), socket.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (client_id, socket) in sockets {
+        let authoritative = authoritative_settings_event(state, &client_id, revision);
+        if let Err(error) = socket.emit("stream.settings", &authoritative) {
+            warn!(%client_id, %error, "authoritative settings delivery failed");
+        }
+        if let Err(error) = socket.emit("status.changed", &authoritative["status"]) {
+            warn!(%client_id, %error, "client status delivery failed");
         }
     }
-}
-
-fn broadcast_status(state: &ServerState) {
-    let _ = state.events.send(ControlEvent {
-        event: "status.changed".to_owned(),
-        data: status_snapshot(state),
-    });
 }
 
 fn update_viewer_metrics(
@@ -2964,7 +3073,6 @@ mod tests {
             Arc::clone(&media),
             settings.clone(),
         )]));
-        let (events, _) = broadcast::channel(4);
         let mux = UdpMux::bind(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2972,7 +3080,8 @@ mod tests {
         .unwrap();
         ServerState {
             config: Arc::new(config),
-            events,
+            settings_revision: Arc::new(AtomicU64::new(0)),
+            media_session_revision: Arc::new(AtomicU64::new(0)),
             audio: None,
             stream_enabled: Arc::new(AtomicBool::new(false)),
             settings: Arc::new(StdMutex::new(settings)),
@@ -3006,6 +3115,19 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             "ok"
         );
+    }
+
+    #[tokio::test]
+    async fn client_status_carries_the_authoritative_settings_revision() {
+        let state = test_state();
+        state.settings_revision.store(7, Ordering::Release);
+        state.media_session_revision.store(3, Ordering::Release);
+
+        let status = status_for_client(&state, "viewer");
+
+        assert_eq!(status["settings_revision"], 7);
+        assert_eq!(status["media_session_revision"], 3);
+        assert_eq!(status["group"]["bitrate_bps"], status["bitrate_bps"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -51,8 +51,10 @@ pub struct SourceFrame {
     pub width: u32,
     pub height: u32,
     pub pixel_format: SourcePixelFormat,
-    /// Monotonic instant when this complete frame entered the shared bus.
-    pub captured_at: Instant,
+    /// Wall-clock timestamp used for per-rendered-frame capture correlation.
+    /// absolute-capture-time extension so receivers can measure the rendered
+    /// frame's capture-to-display delay.
+    pub captured_at_unix_nanos: u64,
     /// Raw bytes in [`pixel_format`](Self::pixel_format).
     pub data: Arc<[u8]>,
 }
@@ -515,6 +517,33 @@ fn spawn_reader(
 }
 
 #[cfg(windows)]
+#[derive(Clone)]
+struct CapturedWindowFrame {
+    data: Arc<[u8]>,
+    captured_at_unix_nanos: u64,
+}
+
+#[cfg(windows)]
+impl CapturedWindowFrame {
+    fn new(data: Arc<[u8]>) -> Self {
+        let captured_at_unix_nanos = capture_timestamp();
+        Self {
+            data,
+            captured_at_unix_nanos,
+        }
+    }
+
+    fn publish(&self, inner: &SharedCaptureInner, format: CaptureFormat) {
+        publish_frame_at(
+            inner,
+            format,
+            Arc::clone(&self.data),
+            self.captured_at_unix_nanos,
+        );
+    }
+}
+
+#[cfg(windows)]
 fn spawn_window_reader(
     inner: Arc<SharedCaptureInner>,
     source_index: usize,
@@ -551,7 +580,7 @@ fn spawn_window_reader(
 
         if let Some(capture) = wgc_capture.as_ref() {
             let first_frame_deadline = Instant::now() + WGC_FIRST_FRAME_TIMEOUT;
-            let mut latest_data: Option<Arc<[u8]>> = None;
+            let mut latest_frame: Option<CapturedWindowFrame> = None;
             while Instant::now() < first_frame_deadline {
                 if inner.stopped.load(Ordering::Acquire)
                     || inner.generation.load(Ordering::Acquire) != generation
@@ -564,7 +593,7 @@ fn spawn_window_reader(
                     Ok(Some(frame))
                         if frame.width == format.width && frame.height == format.height =>
                     {
-                        latest_data = Some(Arc::from(frame.rgba));
+                        latest_frame = Some(CapturedWindowFrame::new(Arc::from(frame.rgba)));
                         break;
                     }
                     Ok(Some(frame)) => {
@@ -591,7 +620,7 @@ fn spawn_window_reader(
                                 source_native_id,
                             )
                         {
-                            latest_data = Some(data);
+                            latest_frame = Some(CapturedWindowFrame::new(data));
                             break;
                         }
                     }
@@ -602,7 +631,7 @@ fn spawn_window_reader(
                 }
             }
 
-            if let Some(mut latest_data) = latest_data {
+            if let Some(mut latest_frame) = latest_frame {
                 if let Ok(mut backend) = inner.backend.lock() {
                     *backend = "windows-graphics-capture";
                 }
@@ -627,7 +656,7 @@ fn spawn_window_reader(
                         Ok(Some(frame))
                             if frame.width == format.width && frame.height == format.height =>
                         {
-                            latest_data = Arc::from(frame.rgba);
+                            latest_frame = CapturedWindowFrame::new(Arc::from(frame.rgba));
                         }
                         Ok(Some(frame)) => {
                             finish_reader(
@@ -659,7 +688,7 @@ fn spawn_window_reader(
                                     source_index,
                                     source_native_id,
                                 ) {
-                                    latest_data = data;
+                                    latest_frame = CapturedWindowFrame::new(data);
                                 }
                                 last_minimized_refresh = Instant::now();
                             }
@@ -669,7 +698,7 @@ fn spawn_window_reader(
                             break;
                         }
                     }
-                    publish_frame(&inner, format, Arc::clone(&latest_data));
+                    latest_frame.publish(&inner, format);
                     let elapsed = frame_started.elapsed();
                     if elapsed < frame_duration {
                         thread::sleep(frame_duration - elapsed);
@@ -697,7 +726,7 @@ fn spawn_window_reader(
                 }
             },
         };
-        let mut latest_data: Option<Arc<[u8]>> = None;
+        let mut latest_frame: Option<CapturedWindowFrame> = None;
         loop {
             if inner.stopped.load(Ordering::Acquire)
                 || inner.generation.load(Ordering::Acquire) != generation
@@ -713,17 +742,18 @@ fn spawn_window_reader(
                 source_native_id,
             ) {
                 Ok(data) => {
-                    publish_frame(&inner, format, Arc::clone(&data));
-                    latest_data = Some(data);
+                    let frame = CapturedWindowFrame::new(data);
+                    frame.publish(&inner, format);
+                    latest_frame = Some(frame);
                 }
                 Err(error) => {
                     if window.is_minimized().unwrap_or(false)
-                        && let Some(data) = latest_data.as_ref()
+                        && let Some(frame) = latest_frame.as_ref()
                     {
                         // Some applications cannot service PrintWindow while
                         // minimized. Preserve stream cadence and the last valid
                         // content until the target can render again.
-                        publish_frame(&inner, format, Arc::clone(data));
+                        frame.publish(&inner, format);
                     } else {
                         finish_reader(
                             &inner,
@@ -797,7 +827,24 @@ fn draw_fallback_cursor(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32
     }
 }
 
+fn capture_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
+}
+
 fn publish_frame(inner: &SharedCaptureInner, format: CaptureFormat, data: Arc<[u8]>) {
+    let captured_at_unix_nanos = capture_timestamp();
+    publish_frame_at(inner, format, data, captured_at_unix_nanos);
+}
+
+fn publish_frame_at(
+    inner: &SharedCaptureInner,
+    format: CaptureFormat,
+    data: Arc<[u8]>,
+    captured_at_unix_nanos: u64,
+) {
     let Ok(mut latest) = inner.latest.lock() else {
         return;
     };
@@ -806,7 +853,7 @@ fn publish_frame(inner: &SharedCaptureInner, format: CaptureFormat, data: Arc<[u
         width: format.width,
         height: format.height,
         pixel_format: format.pixel_format,
-        captured_at: Instant::now(),
+        captured_at_unix_nanos,
         data,
     });
     inner.frame_ready.notify_all();
@@ -1034,6 +1081,39 @@ mod tests {
     fn rgba_frames_use_four_bytes_per_pixel() {
         assert_eq!(SourcePixelFormat::Rgba.frame_size(4, 2).unwrap(), 32);
         assert_eq!(SourcePixelFormat::Rgba.ffmpeg_name(), "rgba");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_window_frame_preserves_its_original_capture_timestamp() {
+        let format = CaptureFormat {
+            width: 2,
+            height: 2,
+            fps: 30,
+            pixel_format: SourcePixelFormat::Rgba,
+        };
+        let inner = SharedCaptureInner {
+            format: Mutex::new(format),
+            backend: Mutex::new("test"),
+            stopped: AtomicBool::new(false),
+            generation: AtomicU64::new(1),
+            restart_lock: Mutex::new(()),
+            child: Mutex::new(None),
+            reader: Mutex::new(None),
+            latest: Mutex::new(LatestFrame::default()),
+            frame_ready: Condvar::new(),
+        };
+        let captured = CapturedWindowFrame {
+            data: Arc::from(vec![1_u8; 16]),
+            captured_at_unix_nanos: 123,
+        };
+
+        captured.publish(&inner, format);
+        captured.publish(&inner, format);
+
+        let latest = inner.latest.lock().unwrap();
+        assert_eq!(latest.sequence, 2);
+        assert_eq!(latest.frame.as_ref().unwrap().captured_at_unix_nanos, 123);
     }
 
     #[test]

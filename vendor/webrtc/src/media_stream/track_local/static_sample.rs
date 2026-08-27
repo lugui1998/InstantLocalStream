@@ -137,6 +137,18 @@ impl TrackLocalStaticSample {
         sample: &Sample,
         extensions: &[rtp::extension::HeaderExtension],
     ) -> Result<()> {
+        self.write_sample_with_rtp_timestamp(ssrc, payload_type, sample, extensions, None)
+            .await
+    }
+
+    async fn write_sample_with_rtp_timestamp(
+        &self,
+        ssrc: SSRC,
+        payload_type: PayloadType,
+        sample: &Sample,
+        extensions: &[rtp::extension::HeaderExtension],
+        rtp_timestamp: Option<u32>,
+    ) -> Result<()> {
         // skip packets by the number of previously dropped packets
         if let Some(sequencer) = self.sequencers.get(&ssrc) {
             for _ in 0..sample.prev_dropped_packets {
@@ -150,7 +162,7 @@ impl TrackLocalStaticSample {
             return Err(Error::CodecNotFound);
         };
 
-        let packets = if let Some(packetizer) = self.packetizers.get(&ssrc) {
+        let mut packets = if let Some(packetizer) = self.packetizers.get(&ssrc) {
             let mut packetizer = packetizer.lock().await;
             let samples = (sample.duration.as_secs_f64() * clock_rate) as u32;
             if sample.prev_dropped_packets > 0 {
@@ -160,6 +172,8 @@ impl TrackLocalStaticSample {
         } else {
             vec![]
         };
+
+        apply_rtp_timestamp_override(&mut packets, rtp_timestamp);
 
         let mut write_errs = vec![];
         for mut pkt in packets {
@@ -174,6 +188,40 @@ impl TrackLocalStaticSample {
         }
 
         flatten_errs(write_errs)
+    }
+}
+
+#[doc(hidden)]
+pub fn apply_rtp_timestamp_override(packets: &mut [rtp::Packet], rtp_timestamp: Option<u32>) {
+    if let Some(rtp_timestamp) = rtp_timestamp {
+        for packet in packets {
+            packet.header.timestamp = rtp_timestamp;
+        }
+    }
+}
+
+#[cfg(test)]
+mod rtp_timestamp_override_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_timestamp_supports_zero_wraparound_and_multi_packet_frames() {
+        let mut packets = vec![rtp::Packet::default(), rtp::Packet::default()];
+        packets[0].header.timestamp = 10;
+        packets[1].header.timestamp = 11;
+        apply_rtp_timestamp_override(&mut packets, None);
+        assert_eq!(packets[0].header.timestamp, 10);
+        assert_eq!(packets[1].header.timestamp, 11);
+
+        apply_rtp_timestamp_override(&mut packets, Some(0));
+        assert!(packets.iter().all(|packet| packet.header.timestamp == 0));
+
+        apply_rtp_timestamp_override(&mut packets, Some(u32::MAX));
+        assert!(
+            packets
+                .iter()
+                .all(|packet| packet.header.timestamp == u32::MAX)
+        );
     }
 }
 
@@ -300,6 +348,7 @@ mod sample_writer {
         payload_type: PayloadType,
         track: &'track TrackLocalStaticSample,
         extensions: Vec<HeaderExtension>,
+        rtp_timestamp: Option<u32>,
     }
 
     impl<'track> SampleWriter<'track> {
@@ -313,6 +362,7 @@ mod sample_writer {
                 payload_type,
                 track,
                 extensions: vec![],
+                rtp_timestamp: None,
             }
         }
 
@@ -339,13 +389,27 @@ mod sample_writer {
             self
         }
 
+        /// Override the RTP timestamp on every packet generated for this
+        /// sample. Unlike `Sample::packet_timestamp`, this is explicit and can
+        /// represent every `u32` value, including zero and wraparound.
+        pub fn with_rtp_timestamp(mut self, timestamp: u32) -> Self {
+            self.rtp_timestamp = Some(timestamp);
+            self
+        }
+
         /// Write the sample to the track.
         ///
         /// Creates one or more RTP packets with any extensions specified for each packet and sends
         /// them.
         pub async fn write_sample(self, sample: &Sample) -> Result<()> {
             self.track
-                .write_sample(self.ssrc, self.payload_type, sample, &self.extensions)
+                .write_sample_with_rtp_timestamp(
+                    self.ssrc,
+                    self.payload_type,
+                    sample,
+                    &self.extensions,
+                    self.rtp_timestamp,
+                )
                 .await
         }
     }

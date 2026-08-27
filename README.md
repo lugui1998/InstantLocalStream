@@ -18,7 +18,7 @@ The project currently provides:
 - FFmpeg encoding.
 - Multiple simultaneous viewers through one shared UDP mux.
 - Latest-frame per-viewer media queues that drop stale frames under backpressure.
-- Viewer autoplay, live playout-buffer delay, acknowledged control RTT, and WebRTC RTT/jitter diagnostics.
+- Viewer autoplay, per-rendered-frame capture-to-display timing, live playout-buffer delay, acknowledged control RTT, and WebRTC RTT/jitter diagnostics.
 - XCap monitor and window discovery.
 - Native source cards with aspect-preserving previews, automatic refresh, background window-preview prefetch, clickable selection, and an animated test-pattern preview.
 - FFmpeg platform capture inputs (`gdigrab` on Windows and `x11grab` on X11) plus a deterministic test source. Windows application-window capture uses a stable native window identity, prefers Windows Graphics Capture, and automatically falls back to XCap/PrintWindow if WGC does not deliver its first frame. An active minimized target keeps its last valid frame and receives best-effort PrintWindow refreshes until WGC resumes; a new capture asks the user to restore an already-minimized target before starting.
@@ -30,7 +30,7 @@ VP8, VP9, and H.264 are available browser codecs. The default `auto` policy uses
 
 Audio is disabled by default. Enable system audio for a display or window audio for an application window in the native UI. The **Add default ignore list** action adds currently running matches for Discord, WhatsApp, Telegram, Teams, Zoom, Skype, and Slack; other discovered processes can be added individually.
 
-Changing audio mode, exclusions, or the selected application window reopens the native audio input without replacing the WebRTC audio tracks already negotiated by connected viewers.
+Changing audio source details, exclusions, or the selected application window reopens the native audio input without replacing connected viewers' WebRTC audio tracks. Enabling or disabling audio changes the negotiated media topology, so the host publishes a new authoritative media-session generation and viewers reconnect automatically with (or without) an Opus audio track.
 
 ## Run locally
 
@@ -126,7 +126,9 @@ FFmpeg redistribution requires a license review. The build configuration determi
 
 ## Browser diagnostics
 
-The Vue viewer reports an estimated delay from an acknowledged control event and adds WebRTC RTT, jitter, observed receive rate, optional available incoming capacity, dropped frames, freezes, jitter-buffer delay, and decode time when the browser exposes those statistics. It displays the current transcode group and uses a latest-frame policy: the server keeps only the newest queued sample, while the browser receives a zero playout-delay hint when supported.
+The Vue viewer correlates the RTP timestamp of a frame submitted to the browser compositor with the capture timestamp retained by the host. It reports capture-to-display delay for that exact rendered frame, splits capture-to-receive and receiver-to-display time when the browser exposes `receiveTime`, and shows clock-sync uncertainty. Browsers without rendered-frame metadata retain a clearly labeled estimate. The viewer also reports WebRTC RTT, jitter, observed receive rate, optional available incoming capacity, dropped frames, freezes, jitter-buffer delay, and decode time. It displays the current transcode group and uses a latest-frame policy: the server keeps only the newest queued sample, while the browser receives a zero playout-delay hint when supported.
+
+Bitrate labels distinguish configuration from observation: **Assigned target** and transcode cards show the encoder target, while **Measured receive** is the actual recent RTP receive rate and may be lower for simple content. If FFmpeg remains more than 750 ms behind for eight encoded frames, only that encoder is restarted at the live edge and the recovery count is exposed to clients.
 
 The viewer also reports active connected viewers. Refreshing a page replaces and cleans up its previous WebRTC session instead of consuming another viewer slot.
 
