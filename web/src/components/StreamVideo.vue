@@ -126,7 +126,7 @@ onBeforeUnmount(() => {
     <div v-if="!stream && bootstrapProgress" class="video-bootstrap" role="status" aria-live="polite">
       <span class="video-bootstrap-indicator" aria-hidden="true" />
       <div class="video-bootstrap-title">{{ bootstrapProgress.title }}</div>
-      <div class="video-bootstrap-detail">{{ bootstrapProgress.detail }}</div>
+      <div v-if="bootstrapProgress.detail" class="video-bootstrap-detail">{{ bootstrapProgress.detail }}</div>
     </div>
     <video
       ref="video"

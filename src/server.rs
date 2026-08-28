@@ -46,8 +46,14 @@ use webrtc::peer_connection::{
 use crate::audio::AudioPipeline;
 use crate::config::AppConfig;
 use crate::media::{CaptureSettings, MediaPipeline};
+#[cfg(windows)]
+use crate::shared_capture::WindowCaptureRestartError;
 use crate::shared_capture::{SharedCapture, SourceFrame};
 use crate::udp_mux::UdpMux;
+#[cfg(windows)]
+use crate::window_capture::{WindowResizeEvent, WindowResizeWatcher};
+
+pub type StreamFailureCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 pub enum ServerCommand {
     StartStream {
@@ -63,6 +69,103 @@ pub enum ServerCommand {
         result: std::sync::mpsc::SyncSender<Option<CapturePreviewSnapshot>>,
     },
     ResetToken(String),
+    #[cfg(windows)]
+    RefreshWindowCapture {
+        source_index: usize,
+        source_native_id: Option<u64>,
+        dimensions: (u32, u32),
+    },
+}
+
+#[cfg(windows)]
+const WINDOW_RESIZE_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const WINDOW_RESIZE_SAFETY_SETTLE_TIME: Duration = Duration::from_millis(200);
+#[cfg(windows)]
+const WINDOW_RESIZE_EVENT_QUIET_TIME: Duration = Duration::from_millis(120);
+#[cfg(windows)]
+const WINDOW_RESIZE_FRAME_GRACE: Duration = Duration::from_millis(40);
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowSourceIdentity {
+    index: usize,
+    native_id: Option<u64>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowResizeDebouncer {
+    source: Option<WindowSourceIdentity>,
+    candidate: Option<(u32, u32)>,
+    candidate_since: Option<Instant>,
+    emitted: Option<(u32, u32)>,
+}
+
+#[cfg(windows)]
+impl WindowResizeDebouncer {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe(
+        &mut self,
+        source: WindowSourceIdentity,
+        current: (u32, u32),
+        observed: (u32, u32),
+        now: Instant,
+    ) -> Option<(u32, u32)> {
+        if observed.0 < 2 || observed.1 < 2 || observed == current {
+            self.source = Some(source);
+            self.candidate = None;
+            self.candidate_since = None;
+            self.emitted = None;
+            return None;
+        }
+        if self.source != Some(source) || self.candidate != Some(observed) {
+            self.source = Some(source);
+            self.candidate = Some(observed);
+            self.candidate_since = Some(now);
+            self.emitted = None;
+            return None;
+        }
+        if now.duration_since(self.candidate_since.unwrap_or(now))
+            < WINDOW_RESIZE_SAFETY_SETTLE_TIME
+        {
+            return None;
+        }
+        if self.emitted == Some(observed) {
+            return None;
+        }
+        self.emitted = Some(observed);
+        Some(observed)
+    }
+
+    fn observe_settled(
+        &mut self,
+        source: WindowSourceIdentity,
+        current: (u32, u32),
+        observed: (u32, u32),
+    ) -> Option<(u32, u32)> {
+        if observed.0 < 2 || observed.1 < 2 || observed == current {
+            self.source = Some(source);
+            self.candidate = None;
+            self.candidate_since = None;
+            self.emitted = None;
+            return None;
+        }
+        if self.source != Some(source) || self.candidate != Some(observed) {
+            self.source = Some(source);
+            self.candidate = Some(observed);
+            self.candidate_since = None;
+            self.emitted = None;
+        }
+        if self.emitted == Some(observed) {
+            return None;
+        }
+        self.emitted = Some(observed);
+        Some(observed)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +198,7 @@ pub struct ServerState {
     client_connections: Arc<StdMutex<std::collections::HashMap<String, Uuid>>>,
     connection_bindings: Arc<StdMutex<HashMap<Uuid, ConnectionMediaBinding>>>,
     client_sockets: Arc<StdMutex<std::collections::HashMap<String, SocketRef>>>,
+    stream_failure_callback: Option<StreamFailureCallback>,
 }
 
 impl ServerState {
@@ -282,19 +386,20 @@ impl GroupFactory {
         if !self.stream_enabled.load(Ordering::Acquire) {
             anyhow::bail!("cannot start a transcode group while the stream is stopped");
         }
-        self.start_with_capture(codec, settings)
+        self.start_with_capture(codec, settings, false)
     }
 
     /// The primary group is intentionally brought up before `stream_enabled`
     /// flips so startup can fail atomically without publishing a live stream.
     fn start_primary(&self, codec: &str, settings: CaptureSettings) -> Result<Arc<MediaPipeline>> {
-        self.start_with_capture(codec, settings)
+        self.start_with_capture(codec, settings, true)
     }
 
     fn start_with_capture(
         &self,
         codec: &str,
         settings: CaptureSettings,
+        include_latest_frame: bool,
     ) -> Result<Arc<MediaPipeline>> {
         let shared_capture = self
             .capture_slot
@@ -304,9 +409,14 @@ impl GroupFactory {
         let source_dimensions = shared_capture.source_dimensions();
         let source_pixel_format = shared_capture.source_pixel_format();
         let source_fps = shared_capture.source_fps();
+        let source = if include_latest_frame {
+            shared_capture.subscribe_including_latest()
+        } else {
+            shared_capture.subscribe()
+        };
         let task = media.clone().spawn_from_shared_source(
             self.ffmpeg.clone(),
-            shared_capture.subscribe(),
+            source,
             source_dimensions,
             source_pixel_format,
             source_fps,
@@ -1782,7 +1892,7 @@ pub async fn run_with_control(
     shutdown: oneshot::Receiver<()>,
     control_rx: tokio::sync::mpsc::UnboundedReceiver<ServerCommand>,
 ) -> Result<()> {
-    run_with_control_readiness(config, shutdown, control_rx, None).await
+    run_with_control_readiness(config, shutdown, control_rx, None, None).await
 }
 
 /// Runs the host and reports readiness only once its TCP listener owns the
@@ -1793,6 +1903,7 @@ pub async fn run_with_control_readiness(
     mut shutdown: oneshot::Receiver<()>,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ServerCommand>,
     ready: Option<oneshot::Sender<()>>,
+    stream_failure_callback: Option<StreamFailureCallback>,
 ) -> Result<()> {
     let addr = config.http_addr()?;
     #[cfg(windows)]
@@ -1899,6 +2010,7 @@ pub async fn run_with_control_readiness(
         client_connections: Arc::new(StdMutex::new(std::collections::HashMap::new())),
         connection_bindings: Arc::new(StdMutex::new(HashMap::new())),
         client_sockets: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+        stream_failure_callback,
     };
     // Both controllers remain available for live Manual <-> Auto changes.
     // Each loop reads the current settings before it acts, so inactive modes
@@ -1907,9 +2019,26 @@ pub async fn run_with_control_readiness(
         tokio::spawn(adaptive_loop(state.clone())),
         tokio::spawn(group_adaptive_loop(state.clone())),
     ];
+    // Feed both UI commands and internal resize refreshes through one queue so
+    // capture replacement cannot race Stop/Start or a settings update.
+    let (serialized_control_tx, mut serialized_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let forwarded_control_tx = serialized_control_tx.clone();
+    let control_forward_task = tokio::spawn(async move {
+        while let Some(command) = control_rx.recv().await {
+            if forwarded_control_tx.send(command).is_err() {
+                break;
+            }
+        }
+    });
+    #[cfg(windows)]
+    let window_resize_task = tokio::spawn(window_resize_monitor(
+        state.clone(),
+        serialized_control_tx.clone(),
+    ));
+    drop(serialized_control_tx);
     let control_state = state.clone();
     let control_task = tokio::spawn(async move {
-        while let Some(command) = control_rx.recv().await {
+        while let Some(command) = serialized_control_rx.recv().await {
             match command {
                 ServerCommand::StartStream { settings, result } => {
                     if let Err(error) = apply_capture_settings(&control_state, settings.clone()) {
@@ -2003,6 +2132,21 @@ pub async fn run_with_control_readiness(
                 ServerCommand::ResetToken(token) => {
                     control_state.reset_token(token);
                 }
+                #[cfg(windows)]
+                ServerCommand::RefreshWindowCapture {
+                    source_index,
+                    source_native_id,
+                    dimensions,
+                } => {
+                    if let Err(error) = refresh_window_capture_dimensions(
+                        &control_state,
+                        source_index,
+                        source_native_id,
+                        dimensions,
+                    ) {
+                        warn!(%error, "could not refresh resized window capture");
+                    }
+                }
             }
         }
     });
@@ -2039,7 +2183,10 @@ pub async fn run_with_control_readiness(
         .await;
 
     let _ = socket_io.close().await;
+    control_forward_task.abort();
     control_task.abort();
+    #[cfg(windows)]
+    window_resize_task.abort();
     for adaptive_task in adaptive_tasks {
         adaptive_task.abort();
     }
@@ -2069,6 +2216,311 @@ async fn stop_stream_resources(state: &ServerState) {
     }
     for media_task in state.groups.take_tasks() {
         let _ = media_task.await;
+    }
+}
+
+#[cfg(windows)]
+async fn window_resize_monitor(
+    state: ServerState,
+    control_tx: tokio::sync::mpsc::UnboundedSender<ServerCommand>,
+) {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut event_watcher: Option<WindowResizeWatcher> = None;
+    let mut watched_source: Option<WindowSourceIdentity> = None;
+    let mut safety_interval = tokio::time::interval(WINDOW_RESIZE_SAFETY_POLL_INTERVAL);
+    safety_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut debouncer = WindowResizeDebouncer::default();
+    loop {
+        tokio::select! {
+            signal = event_rx.recv() => {
+                let Some(signal) = signal else { break };
+                let mut quiet_time = match signal {
+                    WindowResizeEvent::LocationChange => WINDOW_RESIZE_EVENT_QUIET_TIME,
+                    WindowResizeEvent::MoveSizeEnd => WINDOW_RESIZE_FRAME_GRACE,
+                };
+                // Location-change events arrive repeatedly during an
+                // interactive resize. Wait for the event stream to go quiet,
+                // while treating the native move/size-end event as the
+                // stronger completion signal.
+                loop {
+                    match tokio::time::timeout(quiet_time, event_rx.recv()).await {
+                        Ok(Some(next)) => {
+                            quiet_time = match next {
+                                WindowResizeEvent::LocationChange => {
+                                    WINDOW_RESIZE_EVENT_QUIET_TIME
+                                }
+                                WindowResizeEvent::MoveSizeEnd => WINDOW_RESIZE_FRAME_GRACE,
+                            };
+                        }
+                        Ok(None) => return,
+                        Err(_) => break,
+                    }
+                }
+                sync_window_resize_watcher(
+                    &state,
+                    &mut event_watcher,
+                    &mut watched_source,
+                    &event_tx,
+                );
+                if let Some((source, dimensions)) =
+                    observe_window_resize(&state, &mut debouncer, true)
+                {
+                    if control_tx
+                        .send(ServerCommand::RefreshWindowCapture {
+                            source_index: source.index,
+                            source_native_id: source.native_id,
+                            dimensions,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            _ = safety_interval.tick() => {
+                sync_window_resize_watcher(
+                    &state,
+                    &mut event_watcher,
+                    &mut watched_source,
+                    &event_tx,
+                );
+                if let Some((source, dimensions)) =
+                    observe_window_resize(&state, &mut debouncer, false)
+                {
+                    if control_tx
+                        .send(ServerCommand::RefreshWindowCapture {
+                            source_index: source.index,
+                            source_native_id: source.native_id,
+                            dimensions,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sync_window_resize_watcher(
+    state: &ServerState,
+    event_watcher: &mut Option<WindowResizeWatcher>,
+    watched_source: &mut Option<WindowSourceIdentity>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<WindowResizeEvent>,
+) {
+    let Some(settings) = state.settings.lock().ok().map(|settings| settings.clone()) else {
+        event_watcher.take();
+        *watched_source = None;
+        return;
+    };
+    if settings.source_kind != "window" {
+        event_watcher.take();
+        *watched_source = None;
+        return;
+    }
+    let source = WindowSourceIdentity {
+        index: settings.source_index,
+        native_id: settings.source_native_id,
+    };
+    if *watched_source != Some(source) || event_watcher.is_none() {
+        event_watcher.take();
+        *event_watcher =
+            WindowResizeWatcher::start(source.index, source.native_id, event_tx.clone());
+        *watched_source = Some(source);
+    }
+}
+
+#[cfg(windows)]
+fn observe_window_resize(
+    state: &ServerState,
+    debouncer: &mut WindowResizeDebouncer,
+    event_settled: bool,
+) -> Option<(WindowSourceIdentity, (u32, u32))> {
+    if !state.stream_enabled.load(Ordering::Acquire) {
+        debouncer.reset();
+        return None;
+    }
+    let Some(settings) = state.settings.lock().ok().map(|settings| settings.clone()) else {
+        debouncer.reset();
+        return None;
+    };
+    if settings.source_kind != "window" {
+        debouncer.reset();
+        return None;
+    }
+    if settings
+        .source_native_id
+        .is_some_and(crate::capture::native_window_is_minimized)
+    {
+        // A queued resize is intentionally ignored while minimized. Clear
+        // its emitted marker so restoring at the same size can settle and
+        // request a fresh media graph.
+        debouncer.reset();
+        return None;
+    }
+    let Some(capture) = state.shared_capture.current() else {
+        debouncer.reset();
+        return None;
+    };
+    let source = WindowSourceIdentity {
+        index: settings.source_index,
+        native_id: settings.source_native_id,
+    };
+    let dimensions = if event_settled {
+        debouncer.observe_settled(
+            source,
+            capture.source_dimensions(),
+            capture.observed_source_dimensions(),
+        )
+    } else {
+        debouncer.observe(
+            source,
+            capture.source_dimensions(),
+            capture.observed_source_dimensions(),
+            Instant::now(),
+        )
+    }?;
+    Some((source, dimensions))
+}
+
+#[cfg(windows)]
+fn refresh_window_capture_dimensions(
+    state: &ServerState,
+    source_index: usize,
+    source_native_id: Option<u64>,
+    requested_dimensions: (u32, u32),
+) -> Result<()> {
+    if !state.stream_enabled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("capture settings lock poisoned"))?
+        .clone();
+    if settings.source_kind != "window"
+        || settings.source_index != source_index
+        || settings.source_native_id != source_native_id
+    {
+        return Ok(());
+    }
+    if source_native_id.is_some_and(crate::capture::native_window_is_minimized) {
+        return Ok(());
+    }
+    let shared_capture = state
+        .shared_capture
+        .current()
+        .context("shared capture is unavailable during window resize")?;
+    let previous_dimensions = shared_capture.source_dimensions();
+    if previous_dimensions == requested_dimensions
+        || shared_capture.observed_source_dimensions() != requested_dimensions
+    {
+        return Ok(());
+    }
+
+    match shared_capture.restart_for_window_resize(&settings) {
+        Ok(()) => {}
+        Err(WindowCaptureRestartError::Preflight(error)) => {
+            return Err(
+                error.context("window resize preflight failed; kept the previous capture running")
+            );
+        }
+        Err(WindowCaptureRestartError::Restart(error)) => {
+            return restore_window_capture_after_failed_resize(
+                state,
+                &shared_capture,
+                &settings,
+                previous_dimensions,
+                error,
+                "window resize capture refresh failed",
+            );
+        }
+    }
+    let refreshed_dimensions = shared_capture.source_dimensions();
+    if refreshed_dimensions == previous_dimensions {
+        return Ok(());
+    }
+    if let Err(error) = state.groups.reconfigure_and_restart(settings.clone()) {
+        return restore_window_capture_after_failed_resize(
+            state,
+            &shared_capture,
+            &settings,
+            previous_dimensions,
+            error,
+            "window resize encoder replacement failed",
+        );
+    }
+
+    info!(
+        previous_width = previous_dimensions.0,
+        previous_height = previous_dimensions.1,
+        width = refreshed_dimensions.0,
+        height = refreshed_dimensions.1,
+        "window resize refreshed the live capture format"
+    );
+    publish_window_resize_restart(state, "window resized");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_window_capture_after_failed_resize(
+    state: &ServerState,
+    shared_capture: &SharedCapture,
+    settings: &CaptureSettings,
+    previous_dimensions: (u32, u32),
+    original_error: anyhow::Error,
+    failure_context: &str,
+) -> Result<()> {
+    if let Err(restore_error) =
+        shared_capture.restart_with_output_dimensions(settings, previous_dimensions)
+    {
+        stop_stream_after_resize_failure(state, failure_context);
+        return Err(original_error.context(format!(
+            "{failure_context}; restoring the previous capture canvas also failed: {restore_error}"
+        )));
+    }
+    if let Err(restore_error) = state.groups.reconfigure_and_restart(settings.clone()) {
+        stop_stream_after_resize_failure(state, failure_context);
+        return Err(original_error.context(format!(
+            "{failure_context}; the previous capture canvas returned, but rebuilding its encoders failed: {restore_error}"
+        )));
+    }
+    publish_window_resize_restart(state, "window resize failed; previous format restored");
+    Err(original_error.context(format!(
+        "{failure_context}; restored the previous capture format"
+    )))
+}
+
+#[cfg(windows)]
+fn publish_window_resize_restart(state: &ServerState, reason: &str) {
+    // Unlike the transient assignment event, this revision is retained in
+    // authoritative status. A viewer that reconnects after missing the event
+    // will still discover that its old media graph must be renegotiated.
+    state.media_session_revision.fetch_add(1, Ordering::AcqRel);
+    restart_viewer_sessions(state, reason);
+    broadcast_status(state);
+}
+
+#[cfg(windows)]
+fn stop_stream_after_resize_failure(state: &ServerState, reason: &str) {
+    warn!(%reason, "window resize rollback failed; stopping the media graph");
+    state.stream_enabled.store(false, Ordering::Release);
+    state.groups.deactivate();
+    if let Some(audio) = &state.audio {
+        audio.deactivate();
+    }
+    state.groups.stop();
+    if let Some(capture) = state.shared_capture.take() {
+        let _ = capture.stop();
+    }
+    state.media_session_revision.fetch_add(1, Ordering::AcqRel);
+    broadcast_status(state);
+    if let Some(callback) = &state.stream_failure_callback {
+        callback(format!(
+            "stream stopped because the resized window could not restore its previous video format: {reason}"
+        ));
     }
 }
 
@@ -3282,6 +3734,7 @@ mod tests {
             client_connections: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             connection_bindings: Arc::new(StdMutex::new(HashMap::new())),
             client_sockets: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            stream_failure_callback: None,
         }
     }
 
@@ -3699,6 +4152,165 @@ mod tests {
         assert!(capture_format_changed(&original, &different_quality));
         assert!(capture_format_changed(&original, &different_fps));
         assert!(!capture_format_changed(&original, &bitrate_only));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_resize_debounce_emits_only_the_last_settled_dimensions() {
+        let source = WindowSourceIdentity {
+            index: 3,
+            native_id: Some(42),
+        };
+        let start = Instant::now();
+        let mut debounce = WindowResizeDebouncer::default();
+
+        assert_eq!(
+            debounce.observe(source, (800, 600), (900, 600), start),
+            None
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1000, 700),
+                start + Duration::from_millis(200)
+            ),
+            None
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1000, 700),
+                start + WINDOW_RESIZE_SAFETY_SETTLE_TIME + Duration::from_millis(199)
+            ),
+            None
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1000, 700),
+                start + WINDOW_RESIZE_SAFETY_SETTLE_TIME + Duration::from_millis(200)
+            ),
+            Some((1000, 700))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_resize_event_signal_emits_the_observed_dimensions_immediately() {
+        let source = WindowSourceIdentity {
+            index: 2,
+            native_id: Some(42),
+        };
+        let mut debounce = WindowResizeDebouncer::default();
+
+        assert_eq!(
+            debounce.observe_settled(source, (800, 600), (1200, 700)),
+            Some((1200, 700))
+        );
+        assert_eq!(
+            debounce.observe_settled(source, (800, 600), (1200, 700)),
+            None
+        );
+        assert_eq!(
+            debounce.observe_settled(source, (800, 600), (1280, 720)),
+            Some((1280, 720))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_resize_debounce_resets_after_refresh_and_suppresses_failed_dimensions() {
+        let source = WindowSourceIdentity {
+            index: 1,
+            native_id: Some(7),
+        };
+        let start = Instant::now();
+        let mut debounce = WindowResizeDebouncer::default();
+        assert_eq!(
+            debounce.observe(source, (800, 600), (1200, 700), start),
+            None
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1200, 700),
+                start + WINDOW_RESIZE_SAFETY_SETTLE_TIME
+            ),
+            Some((1200, 700))
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1200, 700),
+                start + WINDOW_RESIZE_SAFETY_SETTLE_TIME + Duration::from_millis(100)
+            ),
+            None
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1200, 700),
+                start + Duration::from_secs(30)
+            ),
+            None
+        );
+        debounce.reset();
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1200, 700),
+                start + Duration::from_secs(31)
+            ),
+            None
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (800, 600),
+                (1200, 700),
+                start + Duration::from_secs(31) + WINDOW_RESIZE_SAFETY_SETTLE_TIME
+            ),
+            Some((1200, 700))
+        );
+        assert_eq!(
+            debounce.observe(
+                source,
+                (1200, 700),
+                (1200, 700),
+                start + Duration::from_secs(3)
+            ),
+            None
+        );
+        assert!(debounce.candidate.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn terminal_resize_failure_stops_stream_and_notifies_the_native_host() {
+        let mut state = test_state();
+        state.stream_enabled.store(true, Ordering::Release);
+        let (failure_tx, failure_rx) = std::sync::mpsc::channel();
+        state.stream_failure_callback = Some(Arc::new(move |message| {
+            let _ = failure_tx.send(message);
+        }));
+
+        stop_stream_after_resize_failure(&state, "encoder rollback failed");
+
+        assert!(!state.stream_enabled.load(Ordering::Acquire));
+        assert_eq!(state.media_session_revision.load(Ordering::Acquire), 1);
+        assert!(
+            failure_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .contains("encoder rollback failed")
+        );
     }
 
     #[test]

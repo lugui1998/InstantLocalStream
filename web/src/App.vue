@@ -7,7 +7,6 @@ import { useViewer } from '@/composables/useViewer'
 const {
   videoStream,
   status,
-  connection,
   rttMs,
   jitterMs,
   bitrateBps,
@@ -111,22 +110,6 @@ function delayModeHint() {
   return 'Delay measurement is still starting.'
 }
 
-function connectionTone() {
-  const value = connection.value.toLowerCase()
-  if (value === 'stream stopped') return 'stopped'
-  if (value.includes('error') || value.includes('failed') || value.includes('decode')) return 'error'
-  if (value === 'receiving') return 'ready'
-  return 'pending'
-}
-
-function connectionHeading() {
-  const tone = connectionTone()
-  if (tone === 'stopped') return 'Stream is stopped'
-  if (tone === 'ready') return 'Live stream connected'
-  if (tone === 'error') return 'Stream needs attention'
-  return 'Preparing stream'
-}
-
 function formatNetwork() {
   if (bitrateBps.value === null) return 'Measuring…'
   const bitrate = bitrateBps.value >= 1_000_000
@@ -150,14 +133,6 @@ onMounted(start)
 <template>
   <main>
     <StreamVideo :stream="videoStream" :audio-enabled="status.audio_enabled === true" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
-
-    <section class="connection-status" :class="`connection-status--${connectionTone()}`" :aria-live="connectionTone() === 'error' ? 'assertive' : 'polite'">
-      <div>
-        <div class="meta-label">Stream status</div>
-        <div class="connection-status-title">{{ connectionHeading() }}</div>
-      </div>
-      <div class="connection-status-detail">{{ connection }}</div>
-    </section>
 
     <section class="data-grid" aria-label="Live stream metrics">
       <div class="data-cell">

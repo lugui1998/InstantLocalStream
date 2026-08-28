@@ -9,9 +9,10 @@ mod imp {
     use std::{
         ffi::c_void,
         sync::{
-            Arc, Condvar, Mutex,
-            atomic::{AtomicBool, Ordering},
+            Arc, Condvar, Mutex, OnceLock,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        thread::{self, JoinHandle},
         time::{Duration, Instant},
     };
 
@@ -24,7 +25,7 @@ mod imp {
             SizeInt32,
         },
         Win32::{
-            Foundation::{HMODULE, HWND, POINT},
+            Foundation::{HMODULE, HWND, LPARAM, POINT, WPARAM},
             Graphics::{
                 Direct3D::D3D_DRIVER_TYPE_HARDWARE,
                 Direct3D11::{
@@ -41,8 +42,12 @@ mod imp {
                 Graphics::Capture::IGraphicsCaptureItemInterop,
                 RO_INIT_MULTITHREADED, RoInitialize,
             },
+            UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             UI::WindowsAndMessaging::{
-                GA_ROOT, GetAncestor, GetCursorPos, GetWindowRect, IsWindow, WindowFromPoint,
+                CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
+                GetAncestor, GetCursorPos, GetMessageW, GetWindowRect, IsWindow, MSG, OBJID_WINDOW,
+                PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WM_QUIT,
+                WindowFromPoint,
             },
         },
         core::{Error as WindowsError, IInspectable, Interface, Ref, factory},
@@ -50,11 +55,181 @@ mod imp {
 
     #[derive(Debug)]
     pub struct WindowFrame {
+        /// Dimensions reported by the compositor for this frame. Live capture
+        /// can keep publishing into a stable output canvas briefly while the
+        /// server debounces and rebuilds the media graph for a resized window.
+        pub source_width: u32,
+        pub source_height: u32,
         pub width: u32,
         pub height: u32,
         /// Packed four-channel pixels. Live WGC frames remain BGRA for FFmpeg;
         /// one-shot thumbnail helpers return sampled RGBA.
         pub pixels: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WindowResizeEvent {
+        LocationChange,
+        MoveSizeEnd,
+    }
+
+    static RESIZE_EVENT_TARGET: AtomicUsize = AtomicUsize::new(0);
+    static RESIZE_EVENT_SENDER: OnceLock<
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<WindowResizeEvent>>>,
+    > = OnceLock::new();
+
+    pub struct WindowResizeWatcher {
+        stop: Arc<AtomicBool>,
+        thread_id: u32,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl WindowResizeWatcher {
+        pub fn start(
+            index: usize,
+            native_id: Option<u64>,
+            events: tokio::sync::mpsc::UnboundedSender<WindowResizeEvent>,
+        ) -> Option<Self> {
+            let hwnd = selected_hwnd(index, native_id).ok()?;
+            let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+            let target = if root.0.is_null() { hwnd } else { root };
+            Self::start_for_window(target, events)
+        }
+
+        fn start_for_window(
+            target: HWND,
+            events: tokio::sync::mpsc::UnboundedSender<WindowResizeEvent>,
+        ) -> Option<Self> {
+            RESIZE_EVENT_TARGET.store(target.0 as usize, Ordering::Release);
+            if let Ok(mut sender) = resize_event_sender().lock() {
+                *sender = Some(events);
+            }
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                let location_hook = unsafe {
+                    SetWinEventHook(
+                        EVENT_OBJECT_LOCATIONCHANGE,
+                        EVENT_OBJECT_LOCATIONCHANGE,
+                        None,
+                        Some(window_resize_event_proc),
+                        0,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    )
+                };
+                if location_hook.is_invalid() {
+                    let _ = ready_tx.send(None);
+                    return;
+                }
+                let move_size_hook = unsafe {
+                    SetWinEventHook(
+                        EVENT_SYSTEM_MOVESIZEEND,
+                        EVENT_SYSTEM_MOVESIZEEND,
+                        None,
+                        Some(window_resize_event_proc),
+                        0,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    )
+                };
+                if move_size_hook.is_invalid() {
+                    unsafe {
+                        let _ = UnhookWinEvent(location_hook);
+                    }
+                    let _ = ready_tx.send(None);
+                    return;
+                }
+
+                let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+                let mut message = MSG::default();
+                unsafe {
+                    // Force creation of this thread's message queue before
+                    // reporting readiness so Drop can always wake GetMessageW.
+                    let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+                }
+                let _ = ready_tx.send(Some(thread_id));
+                loop {
+                    let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
+                    if result.0 <= 0 || thread_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                unsafe {
+                    let _ = UnhookWinEvent(location_hook);
+                    let _ = UnhookWinEvent(move_size_hook);
+                }
+            });
+
+            let Ok(Some(thread_id)) = ready_rx.recv() else {
+                stop.store(true, Ordering::Release);
+                let _ = thread.join();
+                clear_resize_event_target();
+                return None;
+            };
+            Some(Self {
+                stop,
+                thread_id,
+                thread: Some(thread),
+            })
+        }
+    }
+
+    impl Drop for WindowResizeWatcher {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            clear_resize_event_target();
+        }
+    }
+
+    fn resize_event_sender()
+    -> &'static Mutex<Option<tokio::sync::mpsc::UnboundedSender<WindowResizeEvent>>> {
+        RESIZE_EVENT_SENDER.get_or_init(|| Mutex::new(None))
+    }
+
+    fn clear_resize_event_target() {
+        RESIZE_EVENT_TARGET.store(0, Ordering::Release);
+        if let Ok(mut sender) = resize_event_sender().lock() {
+            *sender = None;
+        }
+    }
+
+    unsafe extern "system" fn window_resize_event_proc(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        id_object: i32,
+        id_child: i32,
+        _event_thread: u32,
+        _event_time: u32,
+    ) {
+        let target = RESIZE_EVENT_TARGET.load(Ordering::Acquire);
+        if target == 0 || hwnd.0.is_null() || hwnd.0 as usize != target {
+            return;
+        }
+        let event = if event == EVENT_OBJECT_LOCATIONCHANGE
+            && id_object == OBJID_WINDOW.0
+            && id_child == CHILDID_SELF as i32
+        {
+            WindowResizeEvent::LocationChange
+        } else if event == EVENT_SYSTEM_MOVESIZEEND {
+            WindowResizeEvent::MoveSizeEnd
+        } else {
+            return;
+        };
+        if let Ok(sender) = resize_event_sender().lock()
+            && let Some(sender) = sender.as_ref()
+        {
+            let _ = sender.send(event);
+        }
     }
 
     #[derive(Default)]
@@ -743,6 +918,8 @@ mod imp {
                 .ok_or(WindowsError::empty())?
         };
         Ok(Some(WindowFrame {
+            source_width: content_width,
+            source_height: content_height,
             width: output_width,
             height: output_height,
             pixels,
@@ -866,6 +1043,8 @@ mod imp {
         }
         frame.Close()?;
         Ok(WindowFrame {
+            source_width: width,
+            source_height: height,
             width: preview_width,
             height: preview_height,
             pixels,
@@ -934,6 +1113,8 @@ mod imp {
             };
             mailbox.close();
             mailbox.publish(WindowFrame {
+                source_width: 1,
+                source_height: 1,
                 width: 1,
                 height: 1,
                 pixels: vec![0, 0, 0, 255],
@@ -950,7 +1131,8 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    WindowCapture, capture_monitor_preview_frame, capture_preview_frame, cursor_position_for,
+    WindowCapture, WindowResizeEvent, WindowResizeWatcher, capture_monitor_preview_frame,
+    capture_preview_frame, cursor_position_for,
 };
 
 #[cfg(not(windows))]

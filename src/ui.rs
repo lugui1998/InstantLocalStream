@@ -29,6 +29,11 @@ const MAX_CACHED_PREVIEWS: usize = 64;
 const SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SOURCE_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 const LIVE_PREVIEW_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DEFAULT_WINDOW_WIDTH: f32 = 950.0;
+const SOURCE_CARD_WIDTH: f32 = 280.0;
+const SOURCE_CARD_HEIGHT: f32 = 210.0;
+const SOURCE_PREVIEW_HEIGHT: f32 = 158.0;
+const SOURCE_CAROUSEL_GAP: f32 = 8.0;
 
 #[cfg(windows)]
 static SOURCE_CHANGE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -48,7 +53,7 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 650.0])
+            .with_inner_size([DEFAULT_WINDOW_WIDTH, 650.0])
             .with_min_inner_size([760.0, 620.0]),
         ..Default::default()
     };
@@ -949,8 +954,10 @@ impl HostUi {
                     .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            for source in sources {
+                            // The panel's edge padding is approximately 8 px;
+                            // use that same explicit gap between cards.
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (source_position, source) in sources.into_iter().enumerate() {
                                 let key = PreviewKey::for_source(&source);
                                 let selected = self.source_selected
                                     && source_matches_selection(
@@ -980,11 +987,14 @@ impl HostUi {
                                         ui.with_layout(
                                             egui::Layout::top_down(egui::Align::Min),
                                             |ui| {
-                                                let card_size = egui::vec2(280.0, 210.0);
+                                                let card_size = egui::vec2(
+                                                    SOURCE_CARD_WIDTH,
+                                                    SOURCE_CARD_HEIGHT,
+                                                );
                                                 ui.set_min_size(card_size);
                                                 ui.set_max_size(card_size);
                                                 ui.add_sized(
-                                                    [280.0, 18.0],
+                                                    [SOURCE_CARD_WIDTH, 18.0],
                                                     egui::Label::new(
                                                         egui::RichText::new(&source.name)
                                                             .strong()
@@ -994,7 +1004,10 @@ impl HostUi {
                                                     .truncate(),
                                                 );
                                                 ui.add_space(6.0);
-                                                let preview_size = egui::vec2(280.0, 158.0);
+                                                let preview_size = egui::vec2(
+                                                    SOURCE_CARD_WIDTH,
+                                                    SOURCE_PREVIEW_HEIGHT,
+                                                );
                                                 ui.allocate_ui_with_layout(
                                                     preview_size,
                                                     egui::Layout::centered_and_justified(
@@ -1035,7 +1048,7 @@ impl HostUi {
                                     });
                                 let card_response = ui.interact(
                                     frame_response.response.rect,
-                                    ui.id().with(("source-card", &key)),
+                                    ui.id().with(("source-card", source_position, &key)),
                                     egui::Sense::click(),
                                 );
                                 if ui.is_rect_visible(frame_response.response.rect) {
@@ -1094,7 +1107,7 @@ impl HostUi {
                                         ));
                                     }
                                 }
-                                ui.add_space(8.0);
+                                ui.add_space(SOURCE_CAROUSEL_GAP);
                             }
                         });
                     });
@@ -2133,7 +2146,7 @@ fn bitrate_mode_label(value: &str) -> &'static str {
     if value == "automatic" {
         "Auto"
     } else {
-        "Fixed"
+        "Manual"
     }
 }
 
@@ -2222,11 +2235,11 @@ impl eframe::App for HostUi {
             ui.horizontal_wrapped(|ui| {
                 self.draw_primary_action(ui);
                 self.draw_viewer_url_controls(ui);
-                let status_label = self.status.label();
-                if !status_label.is_empty() {
-                    ui.strong(status_label);
-                }
             });
+            let status_label = self.status.label();
+            if !status_label.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(status_label).strong()).wrap());
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -2374,20 +2387,6 @@ impl eframe::App for HostUi {
                 }
                 ui.end_row();
 
-                ui.label("Bitrate mode");
-                egui::ComboBox::from_id_salt("bitrate-mode")
-                    .selected_text(bitrate_mode_label(&self.config.bitrate_mode))
-                    .show_ui(ui, |ui| {
-                        for (value, label) in [("fixed", "Fixed"), ("automatic", "Auto")] {
-                            ui.selectable_value(
-                                &mut self.config.bitrate_mode,
-                                value.to_owned(),
-                                label,
-                            );
-                        }
-                    });
-                ui.end_row();
-
                 if self.config.bitrate_mode == "automatic" {
                     ui.label("Latency preference").on_hover_text(
                         "Controls the automatic bitrate target: Low favors responsiveness and bandwidth efficiency; Quality favors image detail.",
@@ -2402,9 +2401,23 @@ impl eframe::App for HostUi {
                                     latency_preference_label(value),
                                 );
                             }
-                        });
+                    });
                     ui.end_row();
                 }
+
+                ui.label("Bitrate mode");
+                egui::ComboBox::from_id_salt("bitrate-mode")
+                    .selected_text(bitrate_mode_label(&self.config.bitrate_mode))
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [("fixed", "Manual"), ("automatic", "Auto")] {
+                            ui.selectable_value(
+                                &mut self.config.bitrate_mode,
+                                value.to_owned(),
+                                label,
+                            );
+                        }
+                    });
+                ui.end_row();
 
                 ui.label("Bitrate");
                 if self.config.bitrate_mode == "fixed" {
@@ -2432,7 +2445,7 @@ impl eframe::App for HostUi {
                 .num_columns(2)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
-                    ui.label("Maximum viewers");
+                    ui.label("Max Viewers");
                     ui.horizontal_wrapped(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.config.max_viewers)
@@ -2568,7 +2581,6 @@ impl eframe::App for HostUi {
                     });
                     ui.end_row();
                 });
-            ui.small("Changing the port restarts the viewer server and updates the share URL.");
             });
                 });
         });
@@ -2674,6 +2686,11 @@ fn worker_loop(
                             let _ = ready_events.send(UiEvent::ServerReady);
                         }
                     });
+                    let stream_failure_events = event_tx.clone();
+                    let stream_failure_callback: server::StreamFailureCallback =
+                        Arc::new(move |error| {
+                            let _ = stream_failure_events.send(UiEvent::StreamFailed(error));
+                        });
                     let result = tokio::runtime::Runtime::new()
                         .context("create Tokio runtime")
                         .and_then(|runtime| {
@@ -2682,6 +2699,7 @@ fn worker_loop(
                                 shutdown_rx,
                                 control_rx,
                                 Some(ready_tx),
+                                Some(stream_failure_callback),
                             ))
                         });
                     let _ = ready_waiter.join();
@@ -3152,6 +3170,7 @@ mod tests {
     fn settings_labels_standardize_automatic_as_auto() {
         assert_eq!(quality_mode_label("adaptive"), "Auto");
         assert_eq!(bitrate_mode_label("automatic"), "Auto");
+        assert_eq!(bitrate_mode_label("fixed"), "Manual");
         assert_eq!(codec_label("auto"), "Auto");
         assert_eq!(latency_preference_label("low"), "Low");
     }

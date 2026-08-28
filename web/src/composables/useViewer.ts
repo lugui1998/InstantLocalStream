@@ -15,6 +15,8 @@ export interface BootstrapProgress {
   detail: string
 }
 
+const waitingForStreamMessage = 'Connected. Waiting for stream to start'
+
 function clientIdentifier() {
   return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
@@ -229,6 +231,14 @@ export function useViewer() {
     return status.value.stream_enabled !== false
   }
 
+  function setStreamUnavailableMessage() {
+    const message = signalState.value === 'Connected'
+      ? waitingForStreamMessage
+      : 'Connecting to stream'
+    connection.value = message
+    bootstrapProgress.value = { title: message, detail: '' }
+  }
+
   function statusIndicatesStopped(value: StreamStatus) {
     return value.stream_enabled === false
       || (value.stream_enabled === undefined && value.status === 'stopped')
@@ -245,7 +255,7 @@ export function useViewer() {
     failedCodec = null
     clearPeer()
     bootstrapProgress.value = null
-    connection.value = 'Stream stopped'
+    setStreamUnavailableMessage()
   }
 
   function resumeAfterStreamStart() {
@@ -372,9 +382,10 @@ export function useViewer() {
 
   async function bootstrapInitialWebRtc() {
     if (bootstrapPromise) return bootstrapPromise
+    if (!initialSessionReady) return
     bootstrapPromise = (async () => {
       if (!streamIsRunning()) {
-        connection.value = 'Stream stopped'
+        setStreamUnavailableMessage()
         bootstrapPromise = null
         return
       }
@@ -382,7 +393,7 @@ export function useViewer() {
       const metrics = await probeBootstrap()
       if (!streamIsRunning()) {
         bootstrapProgress.value = null
-        connection.value = 'Stream stopped'
+        setStreamUnavailableMessage()
         bootstrapPromise = null
         return
       }
@@ -408,12 +419,12 @@ export function useViewer() {
       }
       if (!streamIsRunning()) {
         bootstrapProgress.value = null
-        connection.value = 'Stream stopped'
+        setStreamUnavailableMessage()
         bootstrapPromise = null
         return
       }
       bootstrapComplete = true
-      bootstrapProgress.value = { title: 'Connecting to stream', detail: 'Negotiating the low-latency video session…' }
+      bootstrapProgress.value = { title: 'Connecting to stream', detail: '' }
       startInitialWebRtc()
     })()
     return bootstrapPromise
@@ -421,7 +432,7 @@ export function useViewer() {
 
   function startInitialWebRtc() {
     if (!initialSessionReady || !bootstrapComplete || initialWebRtcStarted || stopping || !streamIsRunning()) {
-      if (!stopping && !streamIsRunning()) connection.value = 'Stream stopped'
+      if (!stopping && !streamIsRunning()) setStreamUnavailableMessage()
       return
     }
     initialWebRtcStarted = true
@@ -440,16 +451,26 @@ export function useViewer() {
     })
     socket.on('connect', () => {
       signalState.value = 'Connected'
+      bootstrapProgress.value = { title: 'Connecting to stream', detail: '' }
       requestStatus()
       ping()
-      void bootstrapInitialWebRtc()
     })
-    socket.on('disconnect', () => { signalState.value = 'Reconnecting' })
-    socket.on('connect_error', () => { signalState.value = 'Reconnecting' })
+    socket.on('disconnect', () => {
+      signalState.value = 'Reconnecting'
+      if (!videoStream.value) setStreamUnavailableMessage()
+    })
+    socket.on('connect_error', () => {
+      signalState.value = 'Reconnecting'
+      if (!videoStream.value) setStreamUnavailableMessage()
+    })
     socket.on('session.ready', (ready: SessionReady) => {
-      mergeStatus(ready.status)
       initialSessionReady = true
-      startInitialWebRtc()
+      mergeStatus(ready.status)
+      if (streamIsRunning()) {
+        resumeAfterStreamStart()
+      } else {
+        connection.value = waitingForStreamMessage
+      }
     })
     socket.on('status.snapshot', mergeStatus)
     socket.on('status.changed', mergeStatus)
@@ -859,7 +880,7 @@ export function useViewer() {
 
   function scheduleReconnect(reason: string, immediate = false) {
     if (stopping || !streamIsRunning()) {
-      if (!stopping) connection.value = 'Stream stopped'
+      if (!stopping) setStreamUnavailableMessage()
       return
     }
     if (awaitingCodecFallback || reconnectTimer !== null || negotiating) return
@@ -874,7 +895,7 @@ export function useViewer() {
   function handleWebRtcFailure(error: unknown) {
     clearPeer()
     if (!streamIsRunning()) {
-      connection.value = 'Stream stopped'
+      setStreamUnavailableMessage()
       return
     }
     connection.value = error instanceof Error ? error.message : 'WebRTC failed'
@@ -997,6 +1018,7 @@ export function useViewer() {
   }
 
   function start() {
+    bootstrapProgress.value = { title: 'Connecting to stream', detail: '' }
     connectSignal()
     pingTimer = window.setInterval(ping, 2_000)
     window.addEventListener('online', reconnect)
@@ -1006,7 +1028,7 @@ export function useViewer() {
     reconnectAttempt = 0
     requestStatus()
     if (!streamIsRunning()) {
-      connection.value = 'Stream stopped'
+      setStreamUnavailableMessage()
       return
     }
     if (!initialWebRtcStarted) {

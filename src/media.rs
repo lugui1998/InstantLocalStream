@@ -791,8 +791,11 @@ impl MediaPipeline {
             "-hide_banner".to_owned(),
             "-loglevel".to_owned(),
             "error".to_owned(),
-            "-fflags".to_owned(),
-            "nobuffer".to_owned(),
+            // `nobuffer` makes FFmpeg's rawvideo demuxer hold back the first
+            // packet until a second frame arrives. Windows Graphics Capture
+            // is event-driven and may publish only one frame for a completely
+            // static window, so that behavior can deadlock encoder startup.
+            // A raw pipe has no network/demux jitter to buffer here anyway.
             "-f".to_owned(),
             "rawvideo".to_owned(),
             "-pix_fmt".to_owned(),

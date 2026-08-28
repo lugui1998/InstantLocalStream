@@ -21,6 +21,8 @@ use crate::media::CaptureSettings;
 const STARTUP_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const WGC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(windows)]
+type CapturedWindowPixels = (Arc<[u8]>, (u32, u32));
 
 /// Pixel representation of a frame published to encoder variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +71,10 @@ struct LatestFrame {
 
 struct SharedCaptureInner {
     format: Mutex<CaptureFormat>,
+    /// Latest native compositor dimensions observed by the window backend.
+    /// The published frame bus remains at `format` until the server has
+    /// debounced the resize and can replace all encoders as one transaction.
+    observed_source_dimensions: AtomicU64,
     backend: Mutex<&'static str>,
     stopped: AtomicBool,
     generation: AtomicU64,
@@ -100,6 +106,12 @@ pub struct SharedCapture {
     ffmpeg: OsString,
 }
 
+#[cfg(windows)]
+pub(crate) enum WindowCaptureRestartError {
+    Preflight(anyhow::Error),
+    Restart(anyhow::Error),
+}
+
 /// A cursor over a [`SharedCapture`]'s latest frame.
 ///
 /// Each subscription holds at most one frame logically: it remembers a sequence
@@ -115,6 +127,10 @@ impl SharedCapture {
         let format = target_format(&settings)?;
         let inner = Arc::new(SharedCaptureInner {
             format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((
+                format.width,
+                format.height,
+            ))),
             backend: Mutex::new("starting"),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(1),
@@ -131,8 +147,13 @@ impl SharedCapture {
         let previous_sequence = capture.latest_sequence()?;
         capture.start_producer(&settings)?;
         if let Err(error) = capture.wait_for_new_frame(previous_sequence) {
+            let backend = capture.backend_name();
+            let observed = capture.observed_source_dimensions();
             let _ = capture.stop();
-            return Err(error.context("shared FFmpeg capture did not produce an initial frame"));
+            return Err(error.context(format!(
+                "shared FFmpeg capture did not produce an initial frame (backend={backend}, expected={}x{}, observed={}x{})",
+                format.width, format.height, observed.0, observed.1
+            )));
         }
         Ok(capture)
     }
@@ -148,6 +169,24 @@ impl SharedCapture {
             .latest
             .lock()
             .map(|latest| latest.sequence)
+            .unwrap_or_default();
+        SourceSubscription {
+            inner: Arc::clone(&self.inner),
+            seen_sequence,
+        }
+    }
+
+    /// Creates a cursor that can consume the current cached frame. This is
+    /// used only for the primary encoder immediately after a fresh capture
+    /// starts; unlike a replacement encoder, that frame belongs to the new
+    /// capture generation and may be the only frame available from a static
+    /// window until its compositor produces another update.
+    pub fn subscribe_including_latest(&self) -> SourceSubscription {
+        let seen_sequence = self
+            .inner
+            .latest
+            .lock()
+            .map(|latest| latest.sequence.saturating_sub(1))
             .unwrap_or_default();
         SourceSubscription {
             inner: Arc::clone(&self.inner),
@@ -174,6 +213,45 @@ impl SharedCapture {
     /// Callers must recreate the encoder variants after this returns, because
     /// their raw input dimensions may have changed.
     pub fn restart(&self, settings: &CaptureSettings) -> Result<()> {
+        self.restart_with_format(settings, target_format(settings)?)
+    }
+
+    /// Resolves the candidate window format before touching the running
+    /// producer and reports which side of that boundary failed. The server
+    /// uses this to avoid rolling back a capture that was never stopped.
+    #[cfg(windows)]
+    pub(crate) fn restart_for_window_resize(
+        &self,
+        settings: &CaptureSettings,
+    ) -> std::result::Result<(), WindowCaptureRestartError> {
+        let format = target_format(settings).map_err(WindowCaptureRestartError::Preflight)?;
+        self.restart_with_format(settings, format)
+            .map_err(WindowCaptureRestartError::Restart)
+    }
+
+    /// Restarts a window producer on an explicit stable canvas. This is used
+    /// only to roll back an automatic resize if replacement encoders fail to
+    /// start after the native compositor dimensions have already changed.
+    #[cfg(windows)]
+    pub(crate) fn restart_with_output_dimensions(
+        &self,
+        settings: &CaptureSettings,
+        dimensions: (u32, u32),
+    ) -> Result<()> {
+        if dimensions.0 < 2 || dimensions.1 < 2 {
+            bail!("shared capture dimensions must be at least 2x2")
+        }
+        let mut format = *self
+            .inner
+            .format
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared capture format lock poisoned"))?;
+        format.width = dimensions.0;
+        format.height = dimensions.1;
+        self.restart_with_format(settings, format)
+    }
+
+    fn restart_with_format(&self, settings: &CaptureSettings, format: CaptureFormat) -> Result<()> {
         let _restart = self
             .inner
             .restart_lock
@@ -182,12 +260,15 @@ impl SharedCapture {
         if self.inner.stopped.load(Ordering::Acquire) {
             bail!("shared capture has already stopped")
         }
-        let format = target_format(settings)?;
         let previous_sequence = self.latest_sequence()?;
         self.stop_producer()?;
         if let Ok(mut current) = self.inner.format.lock() {
             *current = format;
         }
+        self.inner.observed_source_dimensions.store(
+            pack_dimensions((format.width, format.height)),
+            Ordering::Release,
+        );
         if let Err(error) = self
             .start_producer(settings)
             .and_then(|()| self.wait_for_new_frame(previous_sequence))
@@ -218,6 +299,17 @@ impl SharedCapture {
             .lock()
             .map(|format| (format.width, format.height))
             .unwrap_or((2, 2))
+    }
+
+    /// Returns the most recent native source dimensions reported by the live
+    /// window compositor, which may temporarily differ from the stable frame
+    /// bus while an interactive resize is being debounced.
+    pub fn observed_source_dimensions(&self) -> (u32, u32) {
+        unpack_dimensions(
+            self.inner
+                .observed_source_dimensions
+                .load(Ordering::Acquire),
+        )
     }
 
     pub fn source_fps(&self) -> u32 {
@@ -605,10 +697,20 @@ fn spawn_window_reader(
                     Ok(Some(frame))
                         if frame.width == format.width && frame.height == format.height =>
                     {
+                        record_observed_source_dimensions(
+                            &inner,
+                            generation,
+                            (frame.source_width, frame.source_height),
+                        );
                         latest_frame = Some(CapturedWindowFrame::new(Arc::from(frame.pixels)));
                         break;
                     }
                     Ok(Some(frame)) => {
+                        record_observed_source_dimensions(
+                            &inner,
+                            generation,
+                            (frame.source_width, frame.source_height),
+                        );
                         tracing::warn!(
                             expected_width = format.width,
                             expected_height = format.height,
@@ -624,7 +726,7 @@ fn spawn_window_reader(
                         }
                         if let Some(window) = fallback_window.as_ref()
                             && window.is_minimized().unwrap_or(false)
-                            && let Ok(data) = capture_xcap_frame(
+                            && let Ok((data, source_dimensions)) = capture_xcap_frame(
                                 window,
                                 format,
                                 false,
@@ -632,6 +734,11 @@ fn spawn_window_reader(
                                 source_native_id,
                             )
                         {
+                            record_observed_source_dimensions(
+                                &inner,
+                                generation,
+                                source_dimensions,
+                            );
                             latest_frame = Some(CapturedWindowFrame::new(data));
                             break;
                         }
@@ -648,6 +755,11 @@ fn spawn_window_reader(
                     *backend = "windows-graphics-capture";
                 }
                 tracing::info!("using Windows Graphics Capture window backend");
+                // The first frame was held back while deciding whether WGC
+                // had started successfully. Publish it before waiting for a
+                // second compositor event; a static window may not produce
+                // another event before the startup readiness timeout.
+                latest_frame.publish(&inner, format);
                 let mut last_minimized_refresh = Instant::now() - Duration::from_secs(1);
                 loop {
                     if inner.stopped.load(Ordering::Acquire)
@@ -663,24 +775,54 @@ fn spawn_window_reader(
                         break;
                     }
                     let frame_started = Instant::now();
-                    let mut publish_frame = false;
+                    // WGC is event-driven and may not deliver another frame
+                    // while the captured window is completely static. Keep
+                    // publishing the most recent pixels at the configured
+                    // capture cadence so encoders can start, late viewers can
+                    // receive a keyframe, and RTP timing continues to advance.
+                    let mut publish_frame = true;
                     capture.refresh_cursor_visibility();
                     match capture.next_frame(frame_duration) {
                         Ok(Some(frame))
                             if frame.width == format.width && frame.height == format.height =>
                         {
+                            record_observed_source_dimensions(
+                                &inner,
+                                generation,
+                                (frame.source_width, frame.source_height),
+                            );
                             latest_frame = CapturedWindowFrame::new(Arc::from(frame.pixels));
                             publish_frame = true;
                         }
                         Ok(Some(frame)) => {
-                            finish_reader(
+                            record_observed_source_dimensions(
                                 &inner,
-                                Some(format!(
-                                    "Windows Graphics Capture frame size changed from {}x{} to {}x{}; restart after resizing the selected window",
-                                    format.width, format.height, frame.width, frame.height
-                                )),
+                                generation,
+                                (frame.source_width, frame.source_height),
                             );
-                            break;
+                            // A compositor resize can race the first few
+                            // frames after startup. Keep the producer alive
+                            // and let the resize monitor replace the graph
+                            // once the new native dimensions settle; ending
+                            // the reader here makes the encoder report a
+                            // misleading "did not produce its first frame".
+                            tracing::debug!(
+                                expected_width = format.width,
+                                expected_height = format.height,
+                                actual_width = frame.width,
+                                actual_height = frame.height,
+                                "ignoring a transient WGC frame size change while resize is pending"
+                            );
+                            if let Some(pixels) = resize_rgba(
+                                &frame.pixels,
+                                frame.width,
+                                frame.height,
+                                format.width,
+                                format.height,
+                            ) {
+                                latest_frame = CapturedWindowFrame::new(Arc::from(pixels));
+                                publish_frame = true;
+                            }
                         }
                         Ok(None) => {
                             if capture.is_closed() {
@@ -695,13 +837,18 @@ fn spawn_window_reader(
                                 && let Some(window) = fallback_window.as_ref()
                                 && window.is_minimized().unwrap_or(false)
                             {
-                                if let Ok(data) = capture_xcap_frame(
+                                if let Ok((data, source_dimensions)) = capture_xcap_frame(
                                     window,
                                     format,
                                     false,
                                     source_index,
                                     source_native_id,
                                 ) {
+                                    record_observed_source_dimensions(
+                                        &inner,
+                                        generation,
+                                        source_dimensions,
+                                    );
                                     latest_frame = CapturedWindowFrame::new(data);
                                     publish_frame = true;
                                 }
@@ -733,17 +880,9 @@ fn spawn_window_reader(
         if let Ok(mut backend) = inner.backend.lock() {
             *backend = "xcap-printwindow";
         }
-        let window = match fallback_window {
-            Some(window) => window,
-            None => match crate::capture::selected_window(source_index, source_native_id) {
-                Ok(window) => window,
-                Err(error) => {
-                    finish_reader(&inner, Some(format!("select fallback window: {error}")));
-                    return;
-                }
-            },
-        };
+        let mut fallback_window = fallback_window;
         let mut latest_frame: Option<CapturedWindowFrame> = None;
+        let mut fallback_errors = 0_u32;
         loop {
             if inner.stopped.load(Ordering::Acquire)
                 || inner.generation.load(Ordering::Acquire) != generation
@@ -751,32 +890,53 @@ fn spawn_window_reader(
                 break;
             }
             let frame_started = Instant::now();
-            match capture_xcap_frame(
-                &window,
-                format,
-                capture_cursor,
-                source_index,
-                source_native_id,
-            ) {
-                Ok(data) => {
+            let capture_result = fallback_window.as_ref().map(|window| {
+                capture_xcap_frame(
+                    window,
+                    format,
+                    capture_cursor,
+                    source_index,
+                    source_native_id,
+                )
+            });
+            match capture_result {
+                Some(Ok((data, source_dimensions))) => {
+                    fallback_errors = 0;
+                    record_observed_source_dimensions(&inner, generation, source_dimensions);
                     let frame = CapturedWindowFrame::new(data);
                     frame.publish(&inner, format);
                     latest_frame = Some(frame);
                 }
-                Err(error) => {
-                    if window.is_minimized().unwrap_or(false)
-                        && let Some(frame) = latest_frame.as_ref()
-                    {
+                Some(Err(error)) => {
+                    fallback_errors = fallback_errors.saturating_add(1);
+                    let was_minimized = fallback_window
+                        .as_ref()
+                        .is_some_and(|window| window.is_minimized().unwrap_or(false));
+                    fallback_window =
+                        crate::capture::selected_window(source_index, source_native_id).ok();
+                    if fallback_errors == 1 || fallback_errors.is_multiple_of(30) {
+                        tracing::warn!(
+                            %error,
+                            retries = fallback_errors,
+                            "XCap window readback failed; retrying"
+                        );
+                    }
+                    if was_minimized && let Some(frame) = latest_frame.as_ref() {
                         // Some applications cannot service PrintWindow while
                         // minimized. Preserve stream cadence and the last valid
                         // content until the target can render again.
                         frame.publish(&inner, format);
-                    } else {
-                        finish_reader(
-                            &inner,
-                            Some(format!("XCap fallback capture failed: {error}")),
+                    }
+                }
+                None => {
+                    fallback_errors = fallback_errors.saturating_add(1);
+                    fallback_window =
+                        crate::capture::selected_window(source_index, source_native_id).ok();
+                    if fallback_errors == 1 || fallback_errors.is_multiple_of(30) {
+                        tracing::warn!(
+                            retries = fallback_errors,
+                            "selected window is not currently available for XCap readback; retrying"
                         );
-                        break;
                     }
                 }
             }
@@ -795,7 +955,7 @@ fn capture_xcap_frame(
     capture_cursor: bool,
     source_index: usize,
     source_native_id: Option<u64>,
-) -> Result<Arc<[u8]>> {
+) -> Result<CapturedWindowPixels> {
     let frame = window.capture_image()?;
     let source_width = frame.width();
     let source_height = frame.height();
@@ -821,7 +981,7 @@ fn capture_xcap_frame(
             pixel.swap(0, 2);
         }
     }
-    Ok(Arc::from(pixels))
+    Ok((Arc::from(pixels), (source_width, source_height)))
 }
 
 #[cfg(windows)]
@@ -936,6 +1096,28 @@ fn finish_reader(inner: &SharedCaptureInner, failure: Option<String>) {
         latest.failure = failure;
         inner.frame_ready.notify_all();
     }
+}
+
+fn pack_dimensions((width, height): (u32, u32)) -> u64 {
+    (u64::from(width) << 32) | u64::from(height)
+}
+
+fn unpack_dimensions(dimensions: u64) -> (u32, u32) {
+    ((dimensions >> 32) as u32, dimensions as u32)
+}
+
+#[cfg(windows)]
+fn record_observed_source_dimensions(
+    inner: &SharedCaptureInner,
+    generation: u64,
+    dimensions: (u32, u32),
+) {
+    if inner.generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    inner
+        .observed_source_dimensions
+        .store(pack_dimensions(dimensions), Ordering::Release);
 }
 
 fn target_dimensions(settings: &CaptureSettings) -> Result<(u32, u32)> {
@@ -1165,6 +1347,7 @@ mod tests {
         };
         let inner = SharedCaptureInner {
             format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((2, 2))),
             backend: Mutex::new("test"),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(1),
@@ -1187,6 +1370,83 @@ mod tests {
         assert_eq!(latest.frame.as_ref().unwrap().captured_at_unix_nanos, 123);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn window_dimension_observations_are_scoped_to_the_capture_generation() {
+        let format = CaptureFormat {
+            width: 800,
+            height: 600,
+            fps: 30,
+            pixel_format: SourcePixelFormat::Bgra,
+        };
+        let inner = SharedCaptureInner {
+            format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((800, 600))),
+            backend: Mutex::new("test"),
+            stopped: AtomicBool::new(false),
+            generation: AtomicU64::new(4),
+            restart_lock: Mutex::new(()),
+            child: Mutex::new(None),
+            reader: Mutex::new(None),
+            latest: Mutex::new(LatestFrame::default()),
+            frame_ready: Condvar::new(),
+        };
+
+        record_observed_source_dimensions(&inner, 4, (1200, 700));
+        assert_eq!(
+            unpack_dimensions(inner.observed_source_dimensions.load(Ordering::Acquire)),
+            (1200, 700)
+        );
+        inner.generation.store(5, Ordering::Release);
+        record_observed_source_dimensions(&inner, 4, (300, 200));
+        assert_eq!(
+            unpack_dimensions(inner.observed_source_dimensions.load(Ordering::Acquire)),
+            (1200, 700)
+        );
+        record_observed_source_dimensions(&inner, 5, (1400, 900));
+        assert_eq!(
+            unpack_dimensions(inner.observed_source_dimensions.load(Ordering::Acquire)),
+            (1400, 900)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_resize_preflight_error_does_not_advance_the_capture_generation() {
+        let format = CaptureFormat {
+            width: 800,
+            height: 600,
+            fps: 30,
+            pixel_format: SourcePixelFormat::Bgra,
+        };
+        let inner = Arc::new(SharedCaptureInner {
+            format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((800, 600))),
+            backend: Mutex::new("test"),
+            stopped: AtomicBool::new(false),
+            generation: AtomicU64::new(9),
+            restart_lock: Mutex::new(()),
+            child: Mutex::new(None),
+            reader: Mutex::new(None),
+            latest: Mutex::new(LatestFrame::default()),
+            frame_ready: Condvar::new(),
+        });
+        let capture = SharedCapture {
+            inner: Arc::clone(&inner),
+            ffmpeg: OsString::from("ffmpeg"),
+        };
+        let mut settings = test_settings();
+        settings.source_kind = "window".to_owned();
+        settings.source_native_id = Some(1);
+
+        assert!(matches!(
+            capture.restart_for_window_resize(&settings),
+            Err(WindowCaptureRestartError::Preflight(_))
+        ));
+        assert_eq!(inner.generation.load(Ordering::Acquire), 9);
+        assert_eq!(capture.source_dimensions(), (800, 600));
+    }
+
     #[test]
     fn new_subscriber_skips_a_cached_frame_from_before_its_creation() {
         let format = CaptureFormat {
@@ -1197,6 +1457,7 @@ mod tests {
         };
         let inner = Arc::new(SharedCaptureInner {
             format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((4, 2))),
             backend: Mutex::new("test"),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(1),
@@ -1220,6 +1481,37 @@ mod tests {
         let frame = subscription.recv().unwrap().unwrap();
         published.join().unwrap();
         assert_eq!(frame.data.as_ref(), &[2_u8; 12]);
+    }
+
+    #[test]
+    fn primary_subscriber_can_consume_the_cached_initial_frame() {
+        let format = CaptureFormat {
+            width: 4,
+            height: 2,
+            fps: 30,
+            pixel_format: SourcePixelFormat::Yuv420p,
+        };
+        let inner = Arc::new(SharedCaptureInner {
+            format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((4, 2))),
+            backend: Mutex::new("test"),
+            stopped: AtomicBool::new(false),
+            generation: AtomicU64::new(1),
+            restart_lock: Mutex::new(()),
+            child: Mutex::new(None),
+            reader: Mutex::new(None),
+            latest: Mutex::new(LatestFrame::default()),
+            frame_ready: Condvar::new(),
+        });
+        publish_frame(&inner, format, Arc::from(vec![7_u8; 12]));
+        let capture = SharedCapture {
+            inner,
+            ffmpeg: OsString::from("ffmpeg"),
+        };
+        let mut subscription = capture.subscribe_including_latest();
+
+        let frame = subscription.recv().unwrap().unwrap();
+        assert_eq!(frame.data.as_ref(), &[7_u8; 12]);
     }
 
     #[cfg(windows)]
@@ -1314,6 +1606,7 @@ mod tests {
         };
         let inner = Arc::new(SharedCaptureInner {
             format: Mutex::new(format),
+            observed_source_dimensions: AtomicU64::new(pack_dimensions((4, 2))),
             backend: Mutex::new("test"),
             stopped: AtomicBool::new(false),
             generation: AtomicU64::new(1),
