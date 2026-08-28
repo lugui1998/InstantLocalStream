@@ -46,7 +46,7 @@ use webrtc::peer_connection::{
 use crate::audio::AudioPipeline;
 use crate::config::AppConfig;
 use crate::media::{CaptureSettings, MediaPipeline};
-use crate::shared_capture::SharedCapture;
+use crate::shared_capture::{SharedCapture, SourceFrame};
 use crate::udp_mux::UdpMux;
 
 pub enum ServerCommand {
@@ -54,8 +54,21 @@ pub enum ServerCommand {
         settings: CaptureSettings,
         result: Option<oneshot::Sender<std::result::Result<(), String>>>,
     },
-    StopStream,
+    StopStream {
+        result: Option<oneshot::Sender<()>>,
+    },
     Update(CaptureSettings),
+    UpdateMaxViewers(usize),
+    PreviewSnapshot {
+        result: std::sync::mpsc::SyncSender<Option<CapturePreviewSnapshot>>,
+    },
+    ResetToken(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct CapturePreviewSnapshot {
+    pub settings: CaptureSettings,
+    pub frame: SourceFrame,
 }
 
 #[derive(RustEmbed)]
@@ -65,14 +78,16 @@ struct WebAssets;
 #[derive(Clone)]
 pub struct ServerState {
     pub config: Arc<AppConfig>,
+    active_token: Arc<StdMutex<String>>,
     settings_revision: Arc<AtomicU64>,
     media_session_revision: Arc<AtomicU64>,
     pub audio: Option<Arc<AudioPipeline>>,
     stream_enabled: Arc<AtomicBool>,
+    max_viewers: Arc<AtomicUsize>,
     settings: Arc<StdMutex<CaptureSettings>>,
     viewer_metrics: Arc<StdMutex<HashMap<String, ViewerMetrics>>>,
     groups: Arc<TranscodeGroups>,
-    shared_capture: Option<Arc<SharedCapture>>,
+    shared_capture: Arc<CaptureSlot>,
     pub connections: Arc<Mutex<std::collections::HashMap<Uuid, Arc<dyn PeerConnection>>>>,
     pub udp_mux: Arc<UdpMux>,
     pending_connections: Arc<StdMutex<HashSet<Uuid>>>,
@@ -80,6 +95,49 @@ pub struct ServerState {
     client_connections: Arc<StdMutex<std::collections::HashMap<String, Uuid>>>,
     connection_bindings: Arc<StdMutex<HashMap<Uuid, ConnectionMediaBinding>>>,
     client_sockets: Arc<StdMutex<std::collections::HashMap<String, SocketRef>>>,
+}
+
+impl ServerState {
+    fn token_matches(&self, token: &str) -> bool {
+        self.active_token
+            .lock()
+            .map(|active_token| active_token.as_str() == token)
+            .unwrap_or(false)
+    }
+
+    fn reset_token(&self, token: String) {
+        if let Ok(mut active_token) = self.active_token.lock() {
+            *active_token = token;
+        }
+    }
+}
+
+/// Owns the currently running raw capture.  Keeping this indirection lets the
+/// server remain completely cold until Start is requested and makes each run
+/// use a fresh capture reader.
+#[derive(Default)]
+struct CaptureSlot(StdMutex<Option<Arc<SharedCapture>>>);
+
+impl CaptureSlot {
+    fn current(&self) -> Option<Arc<SharedCapture>> {
+        self.0.lock().ok().and_then(|capture| capture.clone())
+    }
+
+    fn install(&self, capture: Arc<SharedCapture>) -> Result<()> {
+        let mut slot = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capture slot lock poisoned"))?;
+        if slot.is_some() {
+            anyhow::bail!("shared capture is already running");
+        }
+        *slot = Some(capture);
+        Ok(())
+    }
+
+    fn take(&self) -> Option<Arc<SharedCapture>> {
+        self.0.lock().ok().and_then(|mut capture| capture.take())
+    }
 }
 
 /// The exact media graph used by a negotiated peer.
@@ -162,6 +220,7 @@ impl GroupLifecycle {
 }
 
 impl TranscodeGroup {
+    #[cfg(test)]
     fn active(id: usize, media: Arc<MediaPipeline>, settings: CaptureSettings) -> Self {
         let codec = media.codec_id().to_owned();
         Self {
@@ -211,7 +270,7 @@ impl TranscodeGroup {
 #[derive(Clone)]
 struct GroupFactory {
     ffmpeg: String,
-    shared_capture: Arc<SharedCapture>,
+    capture_slot: Arc<CaptureSlot>,
     codec_policy: String,
     host_codecs: Arc<HashSet<String>>,
     stream_enabled: Arc<AtomicBool>,
@@ -220,13 +279,34 @@ struct GroupFactory {
 
 impl GroupFactory {
     fn start(&self, codec: &str, settings: CaptureSettings) -> Result<Arc<MediaPipeline>> {
+        if !self.stream_enabled.load(Ordering::Acquire) {
+            anyhow::bail!("cannot start a transcode group while the stream is stopped");
+        }
+        self.start_with_capture(codec, settings)
+    }
+
+    /// The primary group is intentionally brought up before `stream_enabled`
+    /// flips so startup can fail atomically without publishing a live stream.
+    fn start_primary(&self, codec: &str, settings: CaptureSettings) -> Result<Arc<MediaPipeline>> {
+        self.start_with_capture(codec, settings)
+    }
+
+    fn start_with_capture(
+        &self,
+        codec: &str,
+        settings: CaptureSettings,
+    ) -> Result<Arc<MediaPipeline>> {
+        let shared_capture = self
+            .capture_slot
+            .current()
+            .context("shared capture is not running")?;
         let media = Arc::new(MediaPipeline::with_codec(codec)?);
-        let source_dimensions = self.shared_capture.source_dimensions();
-        let source_pixel_format = self.shared_capture.source_pixel_format();
-        let source_fps = self.shared_capture.source_fps();
+        let source_dimensions = shared_capture.source_dimensions();
+        let source_pixel_format = shared_capture.source_pixel_format();
+        let source_fps = shared_capture.source_fps();
         let task = media.clone().spawn_from_shared_source(
             self.ffmpeg.clone(),
-            self.shared_capture.subscribe(),
+            shared_capture.subscribe(),
             source_dimensions,
             source_pixel_format,
             source_fps,
@@ -245,6 +325,7 @@ impl GroupFactory {
 
     fn register_task(&self, task: tokio::task::JoinHandle<()>) {
         if let Ok(mut tasks) = self.tasks.lock() {
+            tasks.retain(|task| !task.is_finished());
             tasks.push(task);
         }
     }
@@ -402,6 +483,35 @@ impl TranscodeGroups {
         if let Ok(mut drain_started_at) = group.drain_started_at.lock() {
             *drain_started_at = None;
         }
+        Ok(media)
+    }
+
+    fn start_primary(&self) -> Result<Arc<MediaPipeline>> {
+        let group = self.group(0);
+        if let Some(media) = group.media() {
+            return Ok(media);
+        }
+        let _lifecycle = self
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("group lifecycle lock poisoned"))?;
+        if let Some(media) = group.media() {
+            return Ok(media);
+        }
+        let factory = self
+            .factory
+            .as_ref()
+            .context("dynamic transcode group factory is unavailable")?;
+        let media = factory.start_primary(&group.codec(), self.group_settings(0))?;
+        *group
+            .media
+            .lock()
+            .map_err(|_| anyhow::anyhow!("group media lock poisoned"))? = Some(Arc::clone(&media));
+        *group
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("group lifecycle lock poisoned"))? =
+            GroupLifecycle::Active;
         Ok(media)
     }
 
@@ -715,15 +825,22 @@ impl TranscodeGroups {
     }
 
     fn stop(&self) {
+        let Ok(_lifecycle) = self.lifecycle_lock.lock() else {
+            return;
+        };
+        let mut stopped_media = Vec::new();
         for group in self.groups.iter() {
             if let Ok(mut media) = group.media.lock()
                 && let Some(media) = media.take()
             {
-                media.stop();
+                stopped_media.push(media);
             }
             if let Ok(mut lifecycle) = group.lifecycle.lock() {
                 *lifecycle = GroupLifecycle::Stopped;
             }
+        }
+        for media in stopped_media {
+            media.stop();
         }
     }
 
@@ -1662,8 +1779,20 @@ pub async fn run(config: AppConfig, shutdown: oneshot::Receiver<()>) -> Result<(
 
 pub async fn run_with_control(
     config: AppConfig,
+    shutdown: oneshot::Receiver<()>,
+    control_rx: tokio::sync::mpsc::UnboundedReceiver<ServerCommand>,
+) -> Result<()> {
+    run_with_control_readiness(config, shutdown, control_rx, None).await
+}
+
+/// Runs the host and reports readiness only once its TCP listener owns the
+/// configured HTTP address.  Startup failures are returned normally, which
+/// lets native callers keep a failed start retryable.
+pub async fn run_with_control_readiness(
+    config: AppConfig,
     mut shutdown: oneshot::Receiver<()>,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ServerCommand>,
+    ready: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
     let addr = config.http_addr()?;
     #[cfg(windows)]
@@ -1695,7 +1824,6 @@ pub async fn run_with_control(
         .context("validate selected capture source")?;
     }
     let initial_codec = initial_codec_for_policy(&config.codec);
-    let media = Arc::new(MediaPipeline::with_codec(initial_codec)?);
     // Keep one stable audio track graph even while audio is disabled. This
     // lets live source/mode changes reopen the native loopback input without
     // invalidating already-negotiated WebRTC tracks.
@@ -1722,13 +1850,7 @@ pub async fn run_with_control(
     let ffmpeg = crate::packaging::prepare_ffmpeg()?;
     let initial_settings = CaptureSettings::from_config(&config);
     let settings_slot = Arc::new(StdMutex::new(initial_settings.clone()));
-    let shared_capture = Arc::new(SharedCapture::start(
-        &ffmpeg.command,
-        initial_settings.clone(),
-    )?);
-    let source_dimensions = shared_capture.source_dimensions();
-    let source_pixel_format = shared_capture.source_pixel_format();
-    let source_fps = shared_capture.source_fps();
+    let capture_slot = Arc::new(CaptureSlot::default());
     let group_budget = if config.quality_mode == "adaptive" {
         configured_group_count(&config.max_quality_groups)
     } else {
@@ -1736,7 +1858,7 @@ pub async fn run_with_control(
     };
     let group_factory = Arc::new(GroupFactory {
         ffmpeg: ffmpeg.command.clone(),
-        shared_capture: Arc::clone(&shared_capture),
+        capture_slot: Arc::clone(&capture_slot),
         codec_policy: config.codec.clone(),
         host_codecs: Arc::new(discover_host_codecs(&ffmpeg.command, initial_codec)),
         stream_enabled: Arc::clone(&stream_enabled),
@@ -1747,24 +1869,7 @@ pub async fn run_with_control(
     let mut groups = Vec::with_capacity(4);
     for group_id in 0..4 {
         let settings = group_settings(&initial_settings, group_id);
-        if group_id == 0 {
-            let task = media.clone().spawn_from_shared_source(
-                ffmpeg.command.clone(),
-                shared_capture.subscribe(),
-                source_dimensions,
-                source_pixel_format,
-                source_fps,
-                settings.clone(),
-            );
-            group_factory.register_task(task);
-            groups.push(TranscodeGroup::active(
-                group_id,
-                Arc::clone(&media),
-                settings,
-            ));
-        } else {
-            groups.push(TranscodeGroup::stopped(group_id, settings, initial_codec));
-        }
+        groups.push(TranscodeGroup::stopped(group_id, settings, initial_codec));
     }
     let groups = Arc::new(TranscodeGroups::with_factory(
         groups,
@@ -1775,16 +1880,18 @@ pub async fn run_with_control(
         .as_ref()
         .map(|audio| Arc::clone(audio).spawn(initial_settings.clone()));
     let viewer_metrics = Arc::new(StdMutex::new(HashMap::new()));
-        let state = ServerState {
-            config: Arc::new(config.clone()),
-            settings_revision: Arc::new(AtomicU64::new(0)),
-            media_session_revision: Arc::new(AtomicU64::new(0)),
+    let state = ServerState {
+        config: Arc::new(config.clone()),
+        active_token: Arc::new(StdMutex::new(config.token.clone())),
+        settings_revision: Arc::new(AtomicU64::new(0)),
+        media_session_revision: Arc::new(AtomicU64::new(0)),
         audio: audio.clone(),
         stream_enabled: Arc::clone(&stream_enabled),
+        max_viewers: Arc::new(AtomicUsize::new(config.max_viewers.max(1))),
         settings: Arc::clone(&settings_slot),
         viewer_metrics: Arc::clone(&viewer_metrics),
         groups: Arc::clone(&groups),
-        shared_capture: Some(Arc::clone(&shared_capture)),
+        shared_capture: Arc::clone(&capture_slot),
         connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
         udp_mux,
         pending_connections: Arc::new(StdMutex::new(HashSet::new())),
@@ -1812,6 +1919,23 @@ pub async fn run_with_control(
                         }
                         continue;
                     }
+                    if !control_state.stream_enabled.load(Ordering::Acquire) {
+                        let startup = (|| -> Result<()> {
+                            let capture =
+                                Arc::new(SharedCapture::start(&ffmpeg.command, settings.clone())?);
+                            control_state.shared_capture.install(capture)?;
+                            control_state.groups.start_primary()?;
+                            Ok(())
+                        })();
+                        if let Err(error) = startup {
+                            stop_stream_resources(&control_state).await;
+                            warn!(%error, "could not start stream capture");
+                            if let Some(result) = result {
+                                let _ = result.send(Err(error.to_string()));
+                            }
+                            continue;
+                        }
+                    }
                     control_state.stream_enabled.store(true, Ordering::Release);
                     // A new host start is a fresh media session, even when its
                     // capture settings match the previous run.  Existing
@@ -1828,8 +1952,13 @@ pub async fn run_with_control(
                         let _ = result.send(Ok(()));
                     }
                 }
-                ServerCommand::StopStream => {
-                    control_state.stream_enabled.store(false, Ordering::Release);
+                ServerCommand::StopStream { result } => {
+                    if !control_state.stream_enabled.swap(false, Ordering::AcqRel) {
+                        if let Some(result) = result {
+                            let _ = result.send(());
+                        }
+                        continue;
+                    }
                     control_state
                         .media_session_revision
                         .fetch_add(1, Ordering::AcqRel);
@@ -1837,7 +1966,11 @@ pub async fn run_with_control(
                     if let Some(audio) = &control_state.audio {
                         audio.deactivate();
                     }
+                    stop_stream_resources(&control_state).await;
                     broadcast_status(&control_state);
+                    if let Some(result) = result {
+                        let _ = result.send(());
+                    }
                 }
                 ServerCommand::Update(settings) => {
                     if let Err(error) = apply_capture_settings(&control_state, settings) {
@@ -1845,6 +1978,30 @@ pub async fn run_with_control(
                         continue;
                     }
                     broadcast_status(&control_state);
+                }
+                ServerCommand::UpdateMaxViewers(max_viewers) => {
+                    control_state
+                        .max_viewers
+                        .store(max_viewers.max(1), Ordering::Release);
+                    broadcast_status(&control_state);
+                }
+                ServerCommand::PreviewSnapshot { result } => {
+                    let settings = control_state
+                        .settings
+                        .lock()
+                        .ok()
+                        .map(|settings| settings.clone());
+                    let frame = control_state
+                        .shared_capture
+                        .current()
+                        .and_then(|capture| capture.latest_frame_snapshot());
+                    let snapshot = settings
+                        .zip(frame)
+                        .map(|(settings, frame)| CapturePreviewSnapshot { settings, frame });
+                    let _ = result.try_send(snapshot);
+                }
+                ServerCommand::ResetToken(token) => {
+                    control_state.reset_token(token);
                 }
             }
         }
@@ -1868,9 +2025,12 @@ pub async fn run_with_control(
             .native_id
             .map(|native_id| format!("{}:{native_id}", config.source.kind))
             .unwrap_or_else(|| format!("{}:{}", config.source.kind, config.source.index)),
-        codec: media.codec_name().to_owned(),
+        codec: display_codec_name(initial_codec).to_owned(),
     })?;
     info!(address = %listener.local_addr()?, viewer_url = %config.viewer_url(), "viewer server listening");
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = (&mut shutdown).await;
@@ -1883,15 +2043,9 @@ pub async fn run_with_control(
     for adaptive_task in adaptive_tasks {
         adaptive_task.abort();
     }
-    state.groups.stop();
-    if let Some(shared_capture) = &state.shared_capture {
-        let _ = shared_capture.stop();
-    }
+    stop_stream_resources(&state).await;
     if let Some(audio) = &audio {
         audio.stop();
-    }
-    for media_task in state.groups.take_tasks() {
-        let _ = media_task.await;
     }
     if let Some(audio_task) = audio_task {
         let _ = audio_task.await;
@@ -1908,6 +2062,16 @@ pub async fn run_with_control(
     Ok(())
 }
 
+async fn stop_stream_resources(state: &ServerState) {
+    state.groups.stop();
+    if let Some(capture) = state.shared_capture.take() {
+        let _ = capture.stop();
+    }
+    for media_task in state.groups.take_tasks() {
+        let _ = media_task.await;
+    }
+}
+
 fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Result<()> {
     let previous = state
         .settings
@@ -1918,10 +2082,18 @@ fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Res
     let encoder_profile_changed = encoder_profile_changed(&previous, &settings);
     let audio_topology_changed = audio_enabled(&previous) != audio_enabled(&settings);
     if raw_capture_changed {
-        let shared_capture = state
-            .shared_capture
-            .as_ref()
-            .context("shared capture is unavailable")?;
+        // When cold, settings are only desired metadata.  The next Start
+        // creates a fresh capture directly with them.
+        let Some(shared_capture) = state.shared_capture.current() else {
+            if let Ok(mut current) = state.settings.lock() {
+                *current = settings.clone();
+            }
+            state.groups.reconfigure(settings.clone(), false);
+            if let Some(audio) = &state.audio {
+                audio.reconfigure(settings);
+            }
+            return Ok(());
+        };
         if let Err(error) = shared_capture.restart(&settings) {
             // A monitor/window can disappear between UI discovery and capture
             // startup.  Put the last working source back and rebuild its
@@ -1975,7 +2147,7 @@ fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Res
                 if raw_capture_changed {
                     let shared_capture = state
                         .shared_capture
-                        .as_ref()
+                        .current()
                         .context("shared capture is unavailable during rollback")?;
                     if let Err(restore_error) = shared_capture.restart(&previous) {
                         return Err(error.context(format!(
@@ -2018,9 +2190,7 @@ fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Res
         // WebRTC cannot add or remove an audio m-line on an already-negotiated
         // peer.  Publish a new session generation so viewers reconnect with
         // the authoritative audio topology.
-        state
-            .media_session_revision
-            .fetch_add(1, Ordering::AcqRel);
+        state.media_session_revision.fetch_add(1, Ordering::AcqRel);
     }
     Ok(())
 }
@@ -2095,6 +2265,10 @@ async fn adaptive_loop(state: ServerState) {
     let mut last_change = std::time::Instant::now() - Duration::from_secs(10);
     loop {
         interval.tick().await;
+        if !state.stream_enabled.load(Ordering::Acquire) {
+            stable_since = Instant::now();
+            continue;
+        }
         let should_adapt = state
             .settings
             .lock()
@@ -2181,6 +2355,9 @@ async fn group_adaptive_loop(state: ServerState) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
+        if !state.stream_enabled.load(Ordering::Acquire) {
+            continue;
+        }
         let adaptive_quality_enabled = state
             .settings
             .lock()
@@ -2245,7 +2422,7 @@ async fn index(
     Path(token): Path<String>,
     State(state): State<ServerState>,
 ) -> Result<Response, StatusCode> {
-    if token == state.config.token {
+    if state.token_matches(&token) {
         let file = WebAssets::get("index.html").ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
         let html = String::from_utf8_lossy(file.data.as_ref()).into_owned();
         Ok(Html(html).into_response())
@@ -2283,7 +2460,7 @@ async fn token_status(
     Path(token): Path<String>,
     State(state): State<ServerState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if token != state.config.token.as_str() {
+    if !state.token_matches(&token) {
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(Json(status_snapshot(&state)))
@@ -2293,7 +2470,7 @@ async fn connection_probe(
     Path(token): Path<String>,
     State(state): State<ServerState>,
 ) -> Result<Response, StatusCode> {
-    if token != state.config.token.as_str() {
+    if !state.token_matches(&token) {
         return Err(StatusCode::NOT_FOUND);
     }
     let payload = network_probe_payload();
@@ -2333,10 +2510,12 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
     let settings = state.settings.lock().ok().map(|settings| settings.clone());
     let audio_enabled = settings.as_ref().is_some_and(audio_enabled);
     let primary_media = state.groups.media_by_id(state.groups.primary_group_id());
-    let capture_error = state
-        .shared_capture
+    let capture = state.shared_capture.current();
+    let capture_error = capture.as_ref().and_then(|capture| capture.failure());
+    let codec = primary_media
         .as_ref()
-        .and_then(|capture| capture.failure());
+        .map(|media| media.codec_name().to_owned())
+        .unwrap_or_else(|| state.groups.group(0).codec());
     json!({
         "status": primary_media.as_ref().map(|media| media.status()).unwrap_or("stopped"),
         "stream_enabled": state.stream_enabled.load(Ordering::Acquire),
@@ -2345,7 +2524,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "bind": state.config.bind,
         "http_port": state.config.http_port,
         "media_port": state.config.media_ports.first,
-        "codec": primary_media.as_ref().map(|media| media.codec_name()).unwrap_or("Unknown"),
+        "codec": codec,
         "media_error": capture_error.clone().or_else(|| primary_media.as_ref().and_then(|media| media.failure())),
         "capture_error": capture_error,
         "encoder_delay_ms": primary_media.as_ref().and_then(|media| media.encoder_delay_ms()),
@@ -2357,7 +2536,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "quality": settings.as_ref().and_then(|settings| settings.output_height).map(|height| format!("{height}p")).unwrap_or_else(|| "Source".to_owned()),
         "fps": settings.as_ref().and_then(|settings| settings.output_fps).map(|fps| fps.to_string()).unwrap_or_else(|| "Source".to_owned()),
         "bitrate_bps": settings.as_ref().map(|settings| settings.bitrate),
-        "max_viewers": state.config.max_viewers,
+        "max_viewers": state.max_viewers.load(Ordering::Acquire),
         "active_group_count": state.groups.count(),
         "max_group_count": settings
             .as_ref()
@@ -2373,7 +2552,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "latency_mode": "latest-frame",
         "sync_mode": "latest-frame",
         "media_transport": "webrtc",
-        "capture_backend": state.shared_capture.as_ref().map(|capture| capture.backend_name())
+        "capture_backend": capture.as_ref().map(|capture| capture.backend_name())
     })
 }
 
@@ -2429,7 +2608,7 @@ async fn session(
     Path(token): Path<String>,
     State(state): State<ServerState>,
 ) -> Json<serde_json::Value> {
-    if token != state.config.token.as_str() {
+    if !state.token_matches(&token) {
         return Json(json!({ "ok": false, "error": "invalid token" }));
     }
     Json(json!({ "ok": true, "message": "signaling session endpoint is ready" }))
@@ -2444,8 +2623,14 @@ async fn offer(
     State(state): State<ServerState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<RTCSessionDescription>, (StatusCode, String)> {
-    if token != state.config.token.as_str() {
+    if !state.token_matches(&token) {
         return Err((StatusCode::NOT_FOUND, "invalid token".to_owned()));
+    }
+    if !state.stream_enabled.load(Ordering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream is stopped".to_owned(),
+        ));
     }
     let client_id = request
         .get("clientId")
@@ -2466,7 +2651,7 @@ async fn offer(
             .pending_connections
             .lock()
             .map_err(|_| internal_error("pending connection lock poisoned"))?;
-        if connections.len() + pending.len() >= state.config.max_viewers {
+        if connections.len() + pending.len() >= state.max_viewers.load(Ordering::Acquire).max(1) {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "viewer limit reached".to_owned(),
@@ -2715,7 +2900,7 @@ async fn control_connect(
     SocketState(state): SocketState<ServerState>,
 ) {
     let client_id = auth.client_id.trim();
-    if auth.token != state.config.token.as_str() || client_id.is_empty() || client_id.len() > 128 {
+    if !state.token_matches(&auth.token) || client_id.is_empty() || client_id.len() > 128 {
         warn!("rejecting invalid control socket authentication");
         let _ = socket.disconnect();
         return;
@@ -3066,12 +3251,12 @@ mod tests {
 
     fn test_state() -> ServerState {
         let config = AppConfig::default();
+        let active_token = Arc::new(StdMutex::new(config.token.clone()));
         let settings = CaptureSettings::from_config(&config);
-        let media = Arc::new(MediaPipeline::with_codec("vp8").unwrap());
-        let groups = Arc::new(TranscodeGroups::new(vec![TranscodeGroup::active(
+        let groups = Arc::new(TranscodeGroups::new(vec![TranscodeGroup::stopped(
             0,
-            Arc::clone(&media),
             settings.clone(),
+            "vp8",
         )]));
         let mux = UdpMux::bind(
             "127.0.0.1:0".parse().unwrap(),
@@ -3080,14 +3265,16 @@ mod tests {
         .unwrap();
         ServerState {
             config: Arc::new(config),
+            active_token,
             settings_revision: Arc::new(AtomicU64::new(0)),
             media_session_revision: Arc::new(AtomicU64::new(0)),
             audio: None,
             stream_enabled: Arc::new(AtomicBool::new(false)),
+            max_viewers: Arc::new(AtomicUsize::new(8)),
             settings: Arc::new(StdMutex::new(settings)),
             viewer_metrics: Arc::new(StdMutex::new(HashMap::new())),
             groups,
-            shared_capture: None,
+            shared_capture: Arc::new(CaptureSlot::default()),
             connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             udp_mux: mux,
             pending_connections: Arc::new(StdMutex::new(HashSet::new())),
@@ -3151,10 +3338,24 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         let server = tokio::spawn(run_with_control(bootstrap, shutdown_rx, control_rx));
+        let (initial_snapshot_tx, initial_snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        control_tx
+            .send(ServerCommand::PreviewSnapshot {
+                result: initial_snapshot_tx,
+            })
+            .unwrap();
+        let initial_snapshot = tokio::task::spawn_blocking(move || {
+            initial_snapshot_rx.recv_timeout(Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("initial cold preview snapshot timed out");
+        assert!(initial_snapshot.is_none());
+
         let (result_tx, result_rx) = oneshot::channel();
         control_tx
             .send(ServerCommand::StartStream {
-                settings: selected,
+                settings: selected.clone(),
                 result: Some(result_tx),
             })
             .unwrap();
@@ -3164,6 +3365,82 @@ mod tests {
             .expect("UI-style stream start timed out")
             .expect("server dropped the UI stream-start result");
         assert!(start_result.is_ok(), "{start_result:?}");
+
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        control_tx
+            .send(ServerCommand::PreviewSnapshot {
+                result: snapshot_tx,
+            })
+            .unwrap();
+        let running_snapshot =
+            tokio::task::spawn_blocking(move || snapshot_rx.recv_timeout(Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .expect("running preview snapshot timed out");
+        assert!(running_snapshot.is_some());
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        control_tx
+            .send(ServerCommand::StopStream {
+                result: Some(stop_tx),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), stop_rx)
+            .await
+            .expect("stream stop timed out")
+            .expect("server dropped the stream-stop result");
+
+        let (cold_snapshot_tx, cold_snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        control_tx
+            .send(ServerCommand::PreviewSnapshot {
+                result: cold_snapshot_tx,
+            })
+            .unwrap();
+        let cold_snapshot = tokio::task::spawn_blocking(move || {
+            cold_snapshot_rx.recv_timeout(Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("cold preview snapshot timed out");
+        assert!(cold_snapshot.is_none());
+
+        let (restart_tx, restart_rx) = oneshot::channel();
+        control_tx
+            .send(ServerCommand::StartStream {
+                settings: selected,
+                result: Some(restart_tx),
+            })
+            .unwrap();
+        let restart_result = tokio::time::timeout(Duration::from_secs(15), restart_rx)
+            .await
+            .expect("second stream start timed out")
+            .expect("server dropped the second stream-start result");
+        assert!(restart_result.is_ok(), "{restart_result:?}");
+
+        let (second_stop_tx, second_stop_rx) = oneshot::channel();
+        control_tx
+            .send(ServerCommand::StopStream {
+                result: Some(second_stop_tx),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), second_stop_rx)
+            .await
+            .expect("second stream stop timed out")
+            .expect("server dropped the second stream-stop result");
+
+        let (second_cold_tx, second_cold_rx) = std::sync::mpsc::sync_channel(1);
+        control_tx
+            .send(ServerCommand::PreviewSnapshot {
+                result: second_cold_tx,
+            })
+            .unwrap();
+        let second_cold = tokio::task::spawn_blocking(move || {
+            second_cold_rx.recv_timeout(Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("second cold preview snapshot timed out");
+        assert!(second_cold.is_none());
 
         let _ = shutdown_tx.send(());
         tokio::time::timeout(Duration::from_secs(10), server)
@@ -3422,6 +3699,23 @@ mod tests {
         assert!(capture_format_changed(&original, &different_quality));
         assert!(capture_format_changed(&original, &different_fps));
         assert!(!capture_format_changed(&original, &bitrate_only));
+    }
+
+    #[test]
+    fn capture_slot_is_empty_until_a_capture_is_installed() {
+        let slot = CaptureSlot::default();
+        assert!(slot.current().is_none());
+        assert!(slot.take().is_none());
+        assert!(slot.current().is_none());
+    }
+
+    #[test]
+    fn cold_groups_have_no_media_or_visible_primary() {
+        let settings = CaptureSettings::from_config(&AppConfig::default());
+        let groups = TranscodeGroups::new(vec![TranscodeGroup::stopped(0, settings, "vp8")]);
+        assert_eq!(groups.resource_count(), 0);
+        assert!(groups.active_group_ids().is_empty());
+        assert!(groups.media_by_id(0).is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@ eframe = { version = "0.36", default-features = true }
 futures-util = "0.3"
 flexaudio = "0.2"
 mime_guess = "2"
+png = "0.18"
 opus-rs = "0.1.29"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
@@ -43,9 +44,12 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_System_WinRT",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

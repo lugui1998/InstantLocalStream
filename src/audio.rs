@@ -161,11 +161,17 @@ impl AudioPipeline {
     }
 
     pub fn activate(&self) {
-        self.active.store(true, Ordering::Release);
+        if !self.active.swap(true, Ordering::AcqRel) {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn deactivate(&self) {
-        self.active.store(false, Ordering::Release);
+        if self.active.swap(false, Ordering::AcqRel) {
+            // Break the inner poll loop so its native streams are stopped.
+            // The outer loop remains parked until the next activation.
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn status(&self) -> &'static str {
@@ -198,6 +204,10 @@ impl AudioPipeline {
         let mut encoded = vec![0_u8; 1_500];
 
         while !self.stop.load(Ordering::Acquire) {
+            if !self.active.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             let revision = self.revision.load(Ordering::Acquire);
             let Some(settings) = self.settings.lock().ok().and_then(|value| value.clone()) else {
                 thread::sleep(Duration::from_millis(10));
@@ -478,5 +488,24 @@ mod tests {
             .excluded_audio_processes
             .push("example".to_owned());
         assert!(audio_input_changed(&previous, &exclusions));
+    }
+
+    #[test]
+    fn deactivate_advances_revision_once_to_close_native_streams() {
+        let audio = AudioPipeline::new();
+        let initial = audio.revision.load(Ordering::Acquire);
+
+        audio.activate();
+        let active_revision = audio.revision.load(Ordering::Acquire);
+        assert!(active_revision > initial);
+        assert!(audio.active.load(Ordering::Acquire));
+
+        audio.deactivate();
+        let paused_revision = audio.revision.load(Ordering::Acquire);
+        assert!(paused_revision > active_revision);
+        assert!(!audio.active.load(Ordering::Acquire));
+
+        audio.deactivate();
+        assert_eq!(audio.revision.load(Ordering::Acquire), paused_revision);
     }
 }

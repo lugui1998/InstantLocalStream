@@ -2847,6 +2847,7 @@ dependencies = [
  "http-body-util",
  "mime_guess",
  "opus-rs",
+ "png",
  "rand 0.9.5",
  "reqwest",
  "rtc",

@@ -202,6 +202,7 @@ export function useViewer() {
   }
 
   function mergeStatus(next: StreamStatus) {
+    const wasStopped = statusIndicatesStopped(status.value)
     if (typeof next.settings_revision === 'number') {
       if (next.settings_revision < authoritativeSettingsRevision) return false
       authoritativeSettingsRevision = Math.max(authoritativeSettingsRevision, next.settings_revision)
@@ -214,10 +215,48 @@ export function useViewer() {
       if (authoritative) group.value = { ...group.value, ...authoritative }
     }
     updateAssignedCodec(next.codec ?? next.group?.codec)
-    if (next.stream_enabled === false) connection.value = 'Waiting for stream'
+    if (statusIndicatesStopped(next)) {
+      pauseForStoppedStream()
+    } else if (streamIsRunning() && wasStopped) {
+      resumeAfterStreamStart()
+    }
     if (next.status === 'error' && next.media_error) connection.value = `Media error: ${next.media_error}`
     reconcileHostMediaTopology()
     return true
+  }
+
+  function streamIsRunning() {
+    return status.value.stream_enabled !== false
+  }
+
+  function statusIndicatesStopped(value: StreamStatus) {
+    return value.stream_enabled === false
+      || (value.stream_enabled === undefined && value.status === 'stopped')
+  }
+
+  function pauseForStoppedStream() {
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+    if (disconnectedTimer !== null) window.clearTimeout(disconnectedTimer)
+    if (codecFallbackTimer !== null) window.clearTimeout(codecFallbackTimer)
+    reconnectTimer = null
+    disconnectedTimer = null
+    codecFallbackTimer = null
+    awaitingCodecFallback = false
+    failedCodec = null
+    clearPeer()
+    bootstrapProgress.value = null
+    connection.value = 'Stream stopped'
+  }
+
+  function resumeAfterStreamStart() {
+    if (!initialSessionReady || stopping) return
+    if (!bootstrapComplete) {
+      void bootstrapInitialWebRtc()
+    } else if (!initialWebRtcStarted) {
+      startInitialWebRtc()
+    } else if (!peer && !negotiating) {
+      scheduleReconnect('Stream starting', true)
+    }
   }
 
   function applyAuthoritativeSettings(update: AuthoritativeStreamSettings) {
@@ -334,8 +373,19 @@ export function useViewer() {
   async function bootstrapInitialWebRtc() {
     if (bootstrapPromise) return bootstrapPromise
     bootstrapPromise = (async () => {
+      if (!streamIsRunning()) {
+        connection.value = 'Stream stopped'
+        bootstrapPromise = null
+        return
+      }
       connection.value = 'Measuring connection'
       const metrics = await probeBootstrap()
+      if (!streamIsRunning()) {
+        bootstrapProgress.value = null
+        connection.value = 'Stream stopped'
+        bootstrapPromise = null
+        return
+      }
       bootstrapProgress.value = metrics.timedOut
         ? { title: 'Selecting starting quality', detail: 'The check was slow, so the host is selecting a safe stream.' }
         : { title: 'Selecting starting quality', detail: `Measured ${formatBitrate(metrics.downloadBps)}. Choosing the best initial group…` }
@@ -356,6 +406,12 @@ export function useViewer() {
           if (bootstrapAssignmentReceived) finish()
         })
       }
+      if (!streamIsRunning()) {
+        bootstrapProgress.value = null
+        connection.value = 'Stream stopped'
+        bootstrapPromise = null
+        return
+      }
       bootstrapComplete = true
       bootstrapProgress.value = { title: 'Connecting to stream', detail: 'Negotiating the low-latency video session…' }
       startInitialWebRtc()
@@ -364,7 +420,10 @@ export function useViewer() {
   }
 
   function startInitialWebRtc() {
-    if (!initialSessionReady || !bootstrapComplete || initialWebRtcStarted || stopping) return
+    if (!initialSessionReady || !bootstrapComplete || initialWebRtcStarted || stopping || !streamIsRunning()) {
+      if (!stopping && !streamIsRunning()) connection.value = 'Stream stopped'
+      return
+    }
     initialWebRtcStarted = true
     void startWebRtc().catch(handleWebRtcFailure)
   }
@@ -799,7 +858,11 @@ export function useViewer() {
   }
 
   function scheduleReconnect(reason: string, immediate = false) {
-    if (stopping || awaitingCodecFallback || reconnectTimer !== null || negotiating) return
+    if (stopping || !streamIsRunning()) {
+      if (!stopping) connection.value = 'Stream stopped'
+      return
+    }
+    if (awaitingCodecFallback || reconnectTimer !== null || negotiating) return
     connection.value = reason
     const delay = immediate ? 0 : retryDelays[Math.min(reconnectAttempt++, retryDelays.length - 1)] + Math.round(Math.random() * 250)
     reconnectTimer = window.setTimeout(() => {
@@ -810,6 +873,10 @@ export function useViewer() {
 
   function handleWebRtcFailure(error: unknown) {
     clearPeer()
+    if (!streamIsRunning()) {
+      connection.value = 'Stream stopped'
+      return
+    }
     connection.value = error instanceof Error ? error.message : 'WebRTC failed'
     scheduleReconnect('WebRTC reconnecting')
   }
@@ -828,7 +895,7 @@ export function useViewer() {
   }
 
   async function startWebRtc() {
-    if (stopping || negotiating) return
+    if (stopping || !streamIsRunning() || negotiating) return
     negotiating = true
     clearPeer()
     connection.value = 'Negotiating'
@@ -938,6 +1005,10 @@ export function useViewer() {
   function reconnect() {
     reconnectAttempt = 0
     requestStatus()
+    if (!streamIsRunning()) {
+      connection.value = 'Stream stopped'
+      return
+    }
     if (!initialWebRtcStarted) {
       void bootstrapInitialWebRtc()
       startInitialWebRtc()

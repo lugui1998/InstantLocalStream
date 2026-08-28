@@ -26,21 +26,21 @@ const WGC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(750);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourcePixelFormat {
     Yuv420p,
-    Rgba,
+    Bgra,
 }
 
 impl SourcePixelFormat {
     pub const fn ffmpeg_name(self) -> &'static str {
         match self {
             Self::Yuv420p => "yuv420p",
-            Self::Rgba => "rgba",
+            Self::Bgra => "bgra",
         }
     }
 
     fn frame_size(self, width: u32, height: u32) -> Result<usize> {
         match self {
             Self::Yuv420p => yuv420p_frame_size(width, height),
-            Self::Rgba => rgba_frame_size(width, height),
+            Self::Bgra => packed_frame_size(width, height),
         }
     }
 }
@@ -153,6 +153,17 @@ impl SharedCapture {
             inner: Arc::clone(&self.inner),
             seen_sequence,
         }
+    }
+
+    /// Returns the current latest frame without waiting or advancing an
+    /// encoder subscription. Pixel storage remains shared through its `Arc`,
+    /// so thumbnail consumers do not copy a full capture frame.
+    pub fn latest_frame_snapshot(&self) -> Option<SourceFrame> {
+        self.inner
+            .latest
+            .lock()
+            .ok()
+            .and_then(|latest| latest.frame.clone())
     }
 
     /// Switches the producer to a new monitor, window, or test source.
@@ -558,6 +569,7 @@ fn spawn_window_reader(
             source_index,
             source_native_id,
             capture_cursor,
+            frame_duration,
         ) {
             Ok(capture) if capture.dimensions() == (format.width, format.height) => Some(capture),
             Ok(capture) => {
@@ -593,7 +605,7 @@ fn spawn_window_reader(
                     Ok(Some(frame))
                         if frame.width == format.width && frame.height == format.height =>
                     {
-                        latest_frame = Some(CapturedWindowFrame::new(Arc::from(frame.rgba)));
+                        latest_frame = Some(CapturedWindowFrame::new(Arc::from(frame.pixels)));
                         break;
                     }
                     Ok(Some(frame)) => {
@@ -651,12 +663,14 @@ fn spawn_window_reader(
                         break;
                     }
                     let frame_started = Instant::now();
+                    let mut publish_frame = false;
                     capture.refresh_cursor_visibility();
                     match capture.next_frame(frame_duration) {
                         Ok(Some(frame))
                             if frame.width == format.width && frame.height == format.height =>
                         {
-                            latest_frame = CapturedWindowFrame::new(Arc::from(frame.rgba));
+                            latest_frame = CapturedWindowFrame::new(Arc::from(frame.pixels));
+                            publish_frame = true;
                         }
                         Ok(Some(frame)) => {
                             finish_reader(
@@ -689,6 +703,7 @@ fn spawn_window_reader(
                                     source_native_id,
                                 ) {
                                     latest_frame = CapturedWindowFrame::new(data);
+                                    publish_frame = true;
                                 }
                                 last_minimized_refresh = Instant::now();
                             }
@@ -698,7 +713,9 @@ fn spawn_window_reader(
                             break;
                         }
                     }
-                    latest_frame.publish(&inner, format);
+                    if publish_frame {
+                        latest_frame.publish(&inner, format);
+                    }
                     let elapsed = frame_started.elapsed();
                     if elapsed < frame_duration {
                         thread::sleep(frame_duration - elapsed);
@@ -780,22 +797,76 @@ fn capture_xcap_frame(
     source_native_id: Option<u64>,
 ) -> Result<Arc<[u8]>> {
     let frame = window.capture_image()?;
-    anyhow::ensure!(
-        frame.width() == format.width && frame.height() == format.height,
-        "XCap fallback frame size changed from {}x{} to {}x{}; restart after resizing the selected window",
-        format.width,
-        format.height,
-        frame.width(),
-        frame.height(),
-    );
-    let mut rgba = frame.into_raw();
+    let source_width = frame.width();
+    let source_height = frame.height();
+    let mut pixels = frame.into_raw();
     if capture_cursor
         && let Some((x, y)) =
             crate::window_capture::cursor_position_for(source_index, source_native_id)
     {
-        draw_fallback_cursor(&mut rgba, format.width, format.height, x, y);
+        draw_fallback_cursor(&mut pixels, source_width, source_height, x, y);
     }
-    Ok(Arc::from(rgba))
+    if source_width != format.width || source_height != format.height {
+        pixels = resize_rgba(
+            &pixels,
+            source_width,
+            source_height,
+            format.width,
+            format.height,
+        )
+        .context("resize XCap fallback frame to the stream canvas")?;
+    }
+    if format.pixel_format == SourcePixelFormat::Bgra {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    Ok(Arc::from(pixels))
+}
+
+#[cfg(windows)]
+fn resize_rgba(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Option<Vec<u8>> {
+    let source_width = usize::try_from(source_width).ok()?;
+    let source_height = usize::try_from(source_height).ok()?;
+    let output_width = usize::try_from(output_width).ok()?;
+    let output_height = usize::try_from(output_height).ok()?;
+    let source_len = source_width.checked_mul(source_height)?.checked_mul(4)?;
+    let output_len = output_width.checked_mul(output_height)?.checked_mul(4)?;
+    if source_width == 0
+        || source_height == 0
+        || output_width == 0
+        || output_height == 0
+        || source.len() != source_len
+    {
+        return None;
+    }
+    let scale = (output_width as f64 / source_width as f64)
+        .min(output_height as f64 / source_height as f64);
+    let scaled_width = ((source_width as f64 * scale).round() as usize).clamp(1, output_width);
+    let scaled_height = ((source_height as f64 * scale).round() as usize).clamp(1, output_height);
+    let offset_x = (output_width - scaled_width) / 2;
+    let offset_y = (output_height - scaled_height) / 2;
+    let mut output = vec![0_u8; output_len];
+    for pixel in output.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    for y in 0..scaled_height {
+        let source_y = y * source_height / scaled_height;
+        for x in 0..scaled_width {
+            let source_x = x * source_width / scaled_width;
+            let source_offset = (source_y * source_width + source_x) * 4;
+            let output_offset = ((offset_y + y) * output_width + offset_x + x) * 4;
+            output[output_offset..output_offset + 4]
+                .copy_from_slice(&source[source_offset..source_offset + 4]);
+        }
+    }
+    Some(output)
 }
 
 #[cfg(windows)]
@@ -910,7 +981,7 @@ fn target_format(settings: &CaptureSettings) -> Result<CaptureFormat> {
             width,
             height,
             fps,
-            pixel_format: SourcePixelFormat::Rgba,
+            pixel_format: SourcePixelFormat::Bgra,
         });
     }
     let (width, height) = target_dimensions(settings)?;
@@ -959,7 +1030,7 @@ fn yuv420p_frame_size(width: u32, height: u32) -> Result<usize> {
         .context("shared capture dimensions overflow YUV420P frame size")
 }
 
-fn rgba_frame_size(width: u32, height: u32) -> Result<usize> {
+fn packed_frame_size(width: u32, height: u32) -> Result<usize> {
     let pixels = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -967,10 +1038,10 @@ fn rgba_frame_size(width: u32, height: u32) -> Result<usize> {
                 .ok()
                 .and_then(|height| width.checked_mul(height))
         })
-        .context("shared capture dimensions overflow RGBA frame size")?;
+        .context("shared capture dimensions overflow BGRA frame size")?;
     pixels
         .checked_mul(4)
-        .context("shared capture dimensions overflow RGBA frame size")
+        .context("shared capture dimensions overflow BGRA frame size")
 }
 
 fn ffmpeg_args(
@@ -1078,9 +1149,9 @@ mod tests {
     }
 
     #[test]
-    fn rgba_frames_use_four_bytes_per_pixel() {
-        assert_eq!(SourcePixelFormat::Rgba.frame_size(4, 2).unwrap(), 32);
-        assert_eq!(SourcePixelFormat::Rgba.ffmpeg_name(), "rgba");
+    fn packed_four_channel_frames_use_four_bytes_per_pixel() {
+        assert_eq!(SourcePixelFormat::Bgra.frame_size(4, 2).unwrap(), 32);
+        assert_eq!(SourcePixelFormat::Bgra.ffmpeg_name(), "bgra");
     }
 
     #[cfg(windows)]
@@ -1090,7 +1161,7 @@ mod tests {
             width: 2,
             height: 2,
             fps: 30,
-            pixel_format: SourcePixelFormat::Rgba,
+            pixel_format: SourcePixelFormat::Bgra,
         };
         let inner = SharedCaptureInner {
             format: Mutex::new(format),
@@ -1149,6 +1220,88 @@ mod tests {
         let frame = subscription.recv().unwrap().unwrap();
         published.join().unwrap();
         assert_eq!(frame.data.as_ref(), &[2_u8; 12]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows desktop with a capturable window"]
+    fn live_window_bgra_is_accepted_by_ffmpeg() {
+        use std::io::Write as _;
+
+        let source = crate::capture::list_windows()
+            .unwrap()
+            .into_iter()
+            .min_by_key(|source| u64::from(source.width) * u64::from(source.height))
+            .expect("interactive desktop has no capturable window");
+        let mut settings = test_settings();
+        settings.source_kind = "window".to_owned();
+        settings.source_index = source.index;
+        settings.source_native_id = source.native_id;
+        settings.width = source.width;
+        settings.height = source.height;
+        settings.fps = source.fps.unwrap_or(30).min(30);
+        settings.output_height = Some(360);
+        settings.output_fps = Some(5);
+        let ffmpeg = crate::packaging::prepare_ffmpeg().unwrap();
+        let capture = SharedCapture::start(&ffmpeg.command, settings).unwrap();
+        assert_eq!(capture.source_pixel_format(), SourcePixelFormat::Bgra);
+        let frame = capture.latest_frame_snapshot().unwrap();
+        let (width, height) = (frame.width.to_string(), frame.height.to_string());
+        capture.stop().unwrap();
+
+        let mut child = Command::new(&ffmpeg.command)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgra",
+                "-video_size",
+                &format!("{width}x{height}"),
+                "-framerate",
+                "5",
+                "-i",
+                "pipe:0",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=-2:360",
+                "-c:v",
+                "libvpx",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-lag-in-frames",
+                "0",
+                "-auto-alt-ref",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "ivf",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(frame.data.as_ref())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "FFmpeg rejected BGRA: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.len() > 32, "FFmpeg emitted no IVF frame");
     }
 
     #[test]

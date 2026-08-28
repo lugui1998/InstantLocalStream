@@ -95,6 +95,38 @@ function delayLabel() {
     : 'Frame delay estimate'
 }
 
+function delayModeLabel() {
+  if (frameDelayMode.value === 'host-correlated') return 'Host-correlated'
+  if (frameDelayMode.value === 'browser-estimated') return 'Browser estimate'
+  return 'Measuring'
+}
+
+function delayModeHint() {
+  if (frameDelayMode.value === 'host-correlated') {
+    return 'Matched to the host capture clock; uncertainty reflects timing round-trip variation.'
+  }
+  if (frameDelayMode.value === 'browser-estimated') {
+    return 'Estimated from browser frame timing when host-correlated timing is unavailable.'
+  }
+  return 'Delay measurement is still starting.'
+}
+
+function connectionTone() {
+  const value = connection.value.toLowerCase()
+  if (value === 'stream stopped') return 'stopped'
+  if (value.includes('error') || value.includes('failed') || value.includes('decode')) return 'error'
+  if (value === 'receiving') return 'ready'
+  return 'pending'
+}
+
+function connectionHeading() {
+  const tone = connectionTone()
+  if (tone === 'stopped') return 'Stream is stopped'
+  if (tone === 'ready') return 'Live stream connected'
+  if (tone === 'error') return 'Stream needs attention'
+  return 'Preparing stream'
+}
+
 function formatNetwork() {
   if (bitrateBps.value === null) return 'Measuring…'
   const bitrate = bitrateBps.value >= 1_000_000
@@ -119,60 +151,76 @@ onMounted(start)
   <main>
     <StreamVideo :stream="videoStream" :audio-enabled="status.audio_enabled === true" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
 
-    <section class="data-grid" aria-label="Stream details">
+    <section class="connection-status" :class="`connection-status--${connectionTone()}`" :aria-live="connectionTone() === 'error' ? 'assertive' : 'polite'">
+      <div>
+        <div class="meta-label">Stream status</div>
+        <div class="connection-status-title">{{ connectionHeading() }}</div>
+      </div>
+      <div class="connection-status-detail">{{ connection }}</div>
+    </section>
+
+    <section class="data-grid" aria-label="Live stream metrics">
       <div class="data-cell">
-        <div class="meta-label">Assigned target</div>
+        <div class="meta-label" title="Quality selected by the host for this viewer">Assigned target</div>
         <div class="meta-value">{{ quality }}</div>
       </div>
       <div class="data-cell">
-        <div class="meta-label">{{ delayLabel() }}</div>
+        <div class="meta-label" :title="delayModeHint()">{{ delayLabel() }}</div>
         <div class="meta-value">{{ formatDelay() }}</div>
+        <div class="metric-context" :title="delayModeHint()">{{ delayModeLabel() }}</div>
       </div>
       <div class="data-cell">
-        <div class="meta-label">Measured receive</div>
+        <div class="meta-label" title="Throughput and loss measured by this browser">Measured receive</div>
         <div class="meta-value">{{ formatNetwork() }}</div>
-      </div>
-      <div class="data-cell">
-        <div class="meta-label">Session</div>
-        <div class="meta-value" :class="{ error: connection.includes('error') || connection.includes('failed') }">{{ connection }}</div>
       </div>
       <div class="data-cell">
         <div class="meta-label">Viewers</div>
         <div class="meta-value">{{ viewers }}</div>
       </div>
-      <div class="data-cell">
-        <div class="meta-label">Group</div>
-        <div class="meta-value">{{ group ? `${group.label} · ${group.state}` : 'Unassigned' }}</div>
-      </div>
-      <div class="data-cell">
-        <div class="meta-label">Codec</div>
-        <div class="meta-value">{{ activeCodec }}</div>
-      </div>
-      <div class="data-cell">
-        <div class="meta-label">Synchronization</div>
-        <div class="meta-value">{{ synchronizationMode }}</div>
-      </div>
-      <div class="data-cell">
-        <div class="meta-label">Playback · 15s</div>
-        <div class="meta-value">{{ framesDropped ?? '—' }} dropped · {{ freezeCount ?? '—' }} freezes</div>
-      </div>
-      <div class="data-cell">
-        <div class="meta-label">Buffer / decode</div>
-        <div class="meta-value">{{ formatMilliseconds(jitterBufferDelayMs) }} / {{ formatMilliseconds(decodeTimeMs) }}</div>
-      </div>
     </section>
 
-    <DroppedFramesChart :samples="droppedFrameSamples" />
+    <details class="diagnostics">
+      <summary>
+        <span>Diagnostics</span>
+        <span class="diagnostics-summary">Playback, decoder, group, and synchronization details</span>
+      </summary>
+      <div class="diagnostics-content">
+        <section class="data-grid diagnostics-grid" aria-label="Detailed stream diagnostics">
+          <div class="data-cell">
+            <div class="meta-label">Group</div>
+            <div class="meta-value">{{ group ? `${group.label} · ${group.state}` : 'Unassigned' }}</div>
+          </div>
+          <div class="data-cell">
+            <div class="meta-label">Codec</div>
+            <div class="meta-value">{{ activeCodec }}</div>
+          </div>
+          <div class="data-cell">
+            <div class="meta-label">Synchronization</div>
+            <div class="meta-value">{{ synchronizationMode }}</div>
+          </div>
+          <div class="data-cell">
+            <div class="meta-label">Playback · 15s</div>
+            <div class="meta-value">{{ framesDropped ?? '—' }} dropped · {{ freezeCount ?? '—' }} freezes</div>
+          </div>
+          <div class="data-cell">
+            <div class="meta-label">Buffer / decode</div>
+            <div class="meta-value">{{ formatMilliseconds(jitterBufferDelayMs) }} / {{ formatMilliseconds(decodeTimeMs) }}</div>
+          </div>
+        </section>
 
-    <section v-if="status.groups?.length" class="group-profiles" aria-label="Available transcode groups">
-      <div class="meta-label">Available transcode targets</div>
-      <div class="group-profile-list">
-        <div v-for="profile in status.groups" :key="profile.id" class="group-profile">
-          <span>{{ profile.id.replace('-', ' ') }}</span>
-          <span>{{ profile.quality }} · {{ profile.fps }} FPS · {{ formatBitrate(profile.bitrate_bps) }} target · {{ profile.codec ?? '—' }}</span>
-          <span>{{ profile.state }}</span>
-        </div>
+        <DroppedFramesChart :samples="droppedFrameSamples" />
+
+        <section v-if="status.groups?.length" class="group-profiles" aria-label="Available transcode groups">
+          <div class="meta-label">Available transcode targets</div>
+          <div class="group-profile-list">
+            <div v-for="profile in status.groups" :key="profile.id" class="group-profile">
+              <span>{{ profile.id.replace('-', ' ') }}</span>
+              <span>{{ profile.quality }} · {{ profile.fps }} FPS · {{ formatBitrate(profile.bitrate_bps) }} target · {{ profile.codec ?? '—' }}</span>
+              <span>{{ profile.state }}</span>
+            </div>
+          </div>
+        </section>
       </div>
-    </section>
+    </details>
   </main>
 </template>

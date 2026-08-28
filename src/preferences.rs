@@ -7,9 +7,17 @@ use serde::{Deserialize, Serialize};
 use crate::config::{AppConfig, SourceSpec};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostNetworkTestResult {
+    pub upload_bps: u64,
+    pub tested_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserPreferences {
     pub bind: String,
     pub http_port: u16,
+    #[serde(default = "default_max_viewers")]
+    pub max_viewers: usize,
     pub source: SourceSpec,
     pub draw_mouse: bool,
     pub codec: String,
@@ -24,10 +32,19 @@ pub struct UserPreferences {
     pub latency_preference: String,
     pub audio_mode: String,
     pub excluded_audio_processes: Vec<String>,
+    #[serde(default)]
+    pub host_network_test: Option<HostNetworkTestResult>,
+}
+
+fn default_max_viewers() -> usize {
+    8
 }
 
 impl UserPreferences {
-    pub fn from_config(config: &AppConfig) -> Self {
+    pub fn from_config(
+        config: &AppConfig,
+        host_network_test: Option<HostNetworkTestResult>,
+    ) -> Self {
         let mut source = config.source.clone();
         // HWND values are reusable OS resources, not durable identities. Keep
         // them only in the running UI session and require a fresh card click
@@ -36,6 +53,7 @@ impl UserPreferences {
         Self {
             bind: config.bind.clone(),
             http_port: config.http_port,
+            max_viewers: config.max_viewers,
             source,
             draw_mouse: config.draw_mouse,
             codec: config.codec.clone(),
@@ -50,12 +68,14 @@ impl UserPreferences {
             latency_preference: config.latency_preference.clone(),
             audio_mode: config.audio_mode.clone(),
             excluded_audio_processes: config.excluded_audio_processes.clone(),
+            host_network_test,
         }
     }
 
     pub fn apply_to(&self, config: &mut AppConfig) {
         config.bind = self.bind.clone();
         config.http_port = self.http_port;
+        config.max_viewers = self.max_viewers.max(1);
         config.source = self.source.clone();
         config.draw_mouse = self.draw_mouse;
         config.codec = self.codec.clone();
@@ -86,7 +106,39 @@ mod tests {
         config.source.kind = "window".to_owned();
         config.source.native_id = Some(42);
 
-        assert_eq!(UserPreferences::from_config(&config).source.native_id, None);
+        assert_eq!(
+            UserPreferences::from_config(&config, None).source.native_id,
+            None
+        );
+    }
+
+    #[test]
+    fn older_preferences_get_defaults_for_new_persisted_fields() {
+        let config = AppConfig::default();
+        let mut value = serde_json::to_value(UserPreferences::from_config(&config, None)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("max_viewers");
+        object.remove("host_network_test");
+
+        let restored: UserPreferences = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.max_viewers, 8);
+        assert_eq!(restored.host_network_test, None);
+    }
+
+    #[test]
+    fn host_network_test_result_round_trips() {
+        let result = HostNetworkTestResult {
+            upload_bps: 94_000_000,
+            tested_at_unix_secs: 1_750_000_000,
+        };
+        let config = AppConfig::default();
+        let preferences = UserPreferences::from_config(&config, Some(result.clone()));
+
+        let restored: UserPreferences =
+            serde_json::from_value(serde_json::to_value(preferences).unwrap()).unwrap();
+
+        assert_eq!(restored.host_network_test, Some(result));
     }
 }
 
@@ -95,10 +147,11 @@ pub fn load() -> Option<UserPreferences> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn save(config: &AppConfig) -> Result<()> {
+pub fn save(config: &AppConfig, host_network_test: Option<HostNetworkTestResult>) -> Result<()> {
     let directory = preferences_directory();
     fs::create_dir_all(&directory).context("create preferences directory")?;
-    let bytes = serde_json::to_vec_pretty(&UserPreferences::from_config(config))?;
+    let bytes =
+        serde_json::to_vec_pretty(&UserPreferences::from_config(config, host_network_test))?;
     fs::write(path(), bytes).context("write user preferences")?;
     Ok(())
 }

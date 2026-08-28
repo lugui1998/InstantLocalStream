@@ -435,7 +435,7 @@ impl AppConfig {
         }
         match self.bind.as_str() {
             "localhost" | "loopback" => "127.0.0.1".to_owned(),
-            "lan" | "all" => discover_local_ipv4()
+            "lan" | "all" => local_ipv4()
                 .map(|address| address.to_string())
                 .unwrap_or_else(|| "<lan-ip>".to_owned()),
             "public" => "<public-ip>".to_owned(),
@@ -458,7 +458,7 @@ impl AppConfig {
         }
         match self.bind.as_str() {
             "localhost" | "loopback" => "127.0.0.1".to_owned(),
-            "lan" | "public" | "all" => discover_local_ipv4()
+            "lan" | "public" | "all" => local_ipv4()
                 .map(|address| address.to_string())
                 .unwrap_or_else(|| "127.0.0.1".to_owned()),
             custom => custom.to_owned(),
@@ -466,12 +466,11 @@ impl AppConfig {
     }
 
     pub fn viewer_url(&self) -> String {
-        format!(
-            "http://{}:{}/{}",
-            self.advertised_host(),
-            self.http_port,
-            self.token
-        )
+        self.viewer_url_for_host(&self.advertised_host())
+    }
+
+    pub fn viewer_url_for_host(&self, host: &str) -> String {
+        format!("http://{}:{}/{}", host, self.http_port, self.token)
     }
 }
 
@@ -517,7 +516,7 @@ pub fn fps_value(value: &str) -> Option<u32> {
         .flatten()
 }
 
-fn discover_local_ipv4() -> Option<std::net::Ipv4Addr> {
+pub fn local_ipv4() -> Option<std::net::Ipv4Addr> {
     static LOCAL_IPV4: OnceLock<Option<std::net::Ipv4Addr>> = OnceLock::new();
     *LOCAL_IPV4.get_or_init(|| {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -594,6 +593,18 @@ mod tests {
         assert_eq!(config.media_ports.first, config.media_ports.last);
         assert_eq!(config.codec, "auto");
         assert_eq!(config.bitrate, 14_000_000);
+    }
+
+    #[test]
+    fn viewer_url_for_host_always_uses_http_and_the_supplied_host() {
+        let mut config = AppConfig::default();
+        config.http_port = 9000;
+        config.token = "Ab12Cd34Ef56".to_owned();
+
+        assert_eq!(
+            config.viewer_url_for_host("stream.example.com"),
+            "http://stream.example.com:9000/Ab12Cd34Ef56"
+        );
     }
 
     #[test]

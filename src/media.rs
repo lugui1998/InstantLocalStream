@@ -132,6 +132,7 @@ impl VideoCodec {
         }
     }
 
+    #[cfg(test)]
     pub const fn id(self) -> &'static str {
         match self {
             Self::Vp8 => "vp8",
@@ -585,6 +586,7 @@ impl MediaPipeline {
     pub fn codec_name(&self) -> &'static str {
         self.codec.name()
     }
+    #[cfg(test)]
     pub fn codec_id(&self) -> &'static str {
         self.codec.id()
     }
@@ -1266,7 +1268,7 @@ fn source_pixel_format_frame_size(
 ) -> Result<usize> {
     match pixel_format {
         SourcePixelFormat::Yuv420p => yuv420p_frame_size(width, height),
-        SourcePixelFormat::Rgba => {
+        SourcePixelFormat::Bgra => {
             let pixels = usize::try_from(width)
                 .ok()
                 .and_then(|width| {
@@ -1274,10 +1276,10 @@ fn source_pixel_format_frame_size(
                         .ok()
                         .and_then(|height| width.checked_mul(height))
                 })
-                .context("shared source dimensions overflow RGBA frame size")?;
+                .context("shared source dimensions overflow BGRA frame size")?;
             pixels
                 .checked_mul(4)
-                .context("shared source dimensions overflow RGBA frame size")
+                .context("shared source dimensions overflow BGRA frame size")
         }
     }
 }

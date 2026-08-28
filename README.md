@@ -14,14 +14,15 @@ The project currently provides:
 - Opus audio in the same WebRTC session, with built-in application exclusion defaults for system audio.
 - One-to-four profile adaptive quality with a TCP bootstrap probe, per-viewer media telemetry, targeted group assignment, per-group tuning, reconnect-based migration, and source hot-switching.
 - A 14 Mbps fixed default and codec-aware automatic starting floors for screen readability; 1080p/30 starts at no less than 14 Mbps before telemetry-based adaptation.
-- The viewer server starts with the native UI; stream media starts and stops independently from the **Start Stream** control.
+- A persisted host upload-capacity probe with a conservative recommended viewer limit; the first run measures automatically when no result exists, and later tests run only on request.
+- The viewer server starts with the native UI, while video capture, FFmpeg encoding, and native audio input remain cold until **Start Stream** and are torn down again by **Stop Stream**.
 - FFmpeg encoding.
 - Multiple simultaneous viewers through one shared UDP mux.
 - Latest-frame per-viewer media queues that drop stale frames under backpressure.
 - Viewer autoplay, per-rendered-frame capture-to-display timing, live playout-buffer delay, acknowledged control RTT, and WebRTC RTT/jitter diagnostics.
 - XCap monitor and window discovery.
-- Native source cards with aspect-preserving previews, automatic refresh, background window-preview prefetch, clickable selection, and an animated test-pattern preview.
-- FFmpeg platform capture inputs (`gdigrab` on Windows and `x11grab` on X11) plus a deterministic test source. Windows application-window capture uses a stable native window identity, prefers Windows Graphics Capture, and automatically falls back to XCap/PrintWindow if WGC does not deliver its first frame. An active minimized target keeps its last valid frame and receives best-effort PrintWindow refreshes until WGC resumes; a new capture asks the user to restore an already-minimized target before starting.
+- Native source cards with immediate background discovery, cache-first progressive previews for visible cards, bounded Windows Graphics Capture thumbnails, live-source frame reuse while streaming, clickable selection, and a cached test-pattern preview.
+- FFmpeg platform capture inputs (`gdigrab` on Windows and `x11grab` on X11) plus a deterministic test source. Windows application-window capture uses a stable native window identity, prefers Windows Graphics Capture, coalesces GPU readback to the configured frame rate, and feeds native BGRA directly to FFmpeg. It automatically falls back to XCap/PrintWindow if WGC does not deliver its first frame. An active minimized target keeps its last valid frame and receives best-effort PrintWindow refreshes until WGC resumes; a new capture asks the user to restore an already-minimized target before starting.
 - Configurable cursor capture through `--draw-mouse` / `ILS_DRAW_MOUSE`; isolated window capture includes it only while the pointer is actually over the captured window, not an occluding one.
 - Optional build-time embedding of FFmpeg into the executable.
 - Native UI preferences persist under the OS temporary directory; access tokens are not persisted.
@@ -60,7 +61,7 @@ cargo run -- start --http-port 8080 --media-ports 40000 --source test:0 --codec 
 
 The server binds to all local interfaces by default, so the displayed LAN URL works from the host and other devices on the local network. The CLI still accepts `--bind localhost` for an explicitly loopback-only run. `--port N` binds HTTP over TCP and the shared WebRTC UDP mux using the same numeric port. All viewers use that one UDP port. `--media-ports` remains accepted for compatibility, but only its first port is used; prefer a single value such as `--media-ports 40000`.
 
-LAN mode derives a local IPv4 address for the copied URL. The native UI performs public-IP discovery automatically in the background, trying WTFIsMyIP first and a fallback service if necessary. The lookup service and its controls are not exposed in the UI. For public hosting, set `--advertise-host YOUR_PUBLIC_IP_OR_HOSTNAME` (or `ILS_ADVERTISE_HOST`) only when a manual override is needed.
+LAN mode derives a local IPv4 address for the copied URL. The native UI performs public-IP discovery automatically in the background, trying WTFIsMyIP first and a fallback service if necessary, and defaults the share-host selector to Public when no explicit advertised host is configured. You can choose Local, LAN, Public, or Custom for the displayed viewer URL. Custom hosts must be entered without a URL scheme; viewer URLs are HTTP-only for now. For public hosting, set `--advertise-host YOUR_PUBLIC_IP_OR_HOSTNAME` (or `ILS_ADVERTISE_HOST`) only when a manual override is needed.
 
 The native UI starts with `Source` quality and `Source` frame rate. It also offers 144p, 240p, 360p, 480p, 720p HD, 1080p HD, 1440p HD, 2160p 4K, and 4320p 8K presets, plus 5, 10, 24, 30, 60, 75, and 120 FPS. Resolution and FPS entries above the selected source are hidden. Changes made while streaming keep the HTTP/control service available, refresh the shared capture and active encoder tracks when the format changes, and ask connected viewers to renegotiate. A new capture must emit a frame before it replaces the old one; a failed monitor/window switch restores the prior source. A newly selected monitor/window keeps its own aspect ratio. The host guarantees a fixed raw frame canvas and adds black padding only when a capture backend reports a client area that differs from the selected window bounds, preventing raw-frame corruption; the browser then fits that canvas into the video element.
 
@@ -81,7 +82,9 @@ instantlocalstream version
 
 Configuration can come from command-line arguments or environment variables such as `ILS_HTTP_PORT`, `ILS_MEDIA_PORTS`, `ILS_SOURCE`, and `ILS_TOKEN`.
 
-`--max-viewers` (or `ILS_MAX_VIEWERS`) sets the server's admission limit and defaults to 8. The shared UDP mux means this limit is independent of the UDP port count; practical limits are CPU, upload bandwidth, and network conditions. For example, `--max-viewers 20 --media-ports 40000` permits up to 20 viewers subject to those resource limits. The adaptive implementation supports one to four active transcode groups. A bounded TCP probe selects the initial group, after which rolling WebRTC media telemetry moves individual viewers and tunes each group's active profile.
+`--max-viewers` (or `ILS_MAX_VIEWERS`) sets the server's admission limit and defaults to 8. The native UI also exposes this limit and can recommend a conservative value from a short Cloudflare upload-capacity test. The measured upload result is persisted and reused on later launches; use **Retest upload** to measure again. The shared UDP mux means this limit is independent of the UDP port count; practical limits are CPU, upload bandwidth, and network conditions. For example, `--max-viewers 20 --media-ports 40000` permits up to 20 viewers subject to those resource limits. The adaptive implementation supports one to four active transcode groups. A bounded TCP probe selects the initial group, after which rolling WebRTC media telemetry moves individual viewers and tunes each group's active profile.
+
+The native UI's Latency preference is available when bitrate mode is Auto. It adjusts the automatic bitrate target: Low favors responsiveness and bandwidth efficiency, while Quality favors image detail.
 
 `public-ip` queries the primary public IPv4 service and falls back to a second service on demand:
 
