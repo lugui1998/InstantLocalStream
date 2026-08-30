@@ -119,13 +119,26 @@ The repository also includes `scripts/build-portable.ps1` for Windows and `scrip
 .\scripts\build-portable.ps1 -FfmpegPath C:\path\to\ffmpeg.exe
 ```
 
-On Linux, the script requires a statically linked FFmpeg executable, always emits `dist/InstantLocalStream`, and, if `appimagetool` is available, also emits `dist/InstantLocalStream-linux-x86_64.AppImage`.
+On Linux, the script requires a statically linked FFmpeg executable, always emits `dist/InstantLocalStream`, and, if `linuxdeploy` and `appimagetool` are available, bundles native libraries and also emits `dist/InstantLocalStream-linux-x86_64.AppImage`.
 
 The application extracts the embedded executable into an application-owned temporary directory when the server starts and removes that directory during normal shutdown. Startup cleanup should handle stale directories after crashes.
 
 The portable build scripts emit `dist/InstantLocalStream.exe` on Windows or `dist/InstantLocalStream` on Linux. The executable contains the configured FFmpeg binary and extracts it only into the application-owned temporary directory at runtime.
 
 FFmpeg redistribution requires a license review. The build configuration determines whether LGPL, GPL, non-free, and codec-patent obligations apply.
+
+## Release automation
+
+The GitHub Actions release workflow is intentionally scoped to `v1.0.0`. Pushing that tag builds the Windows x86-64 executable and Linux x86-64 AppImage, embeds the pinned GPL FFmpeg build needed for VP8, VP9, and H.264, runs the frontend and Rust test suites, generates SHA-256 checksums and FFmpeg build-provenance files, and creates a draft GitHub release. Review the bundled license/source materials and clean-machine results before publishing the draft.
+
+Before tagging, configure a GitHub ruleset that restricts creation, update, and deletion of `v*` tags, and protect the `v1-release` environment with required reviewers. Make sure the release commit is on `main`, then create and push the exact signed tag:
+
+```text
+git tag -s v1.0.0 -m "InstantLocalStream v1.0.0"
+git push origin v1.0.0
+```
+
+The workflow rejects a tag that does not match the Cargo and viewer package versions.
 
 ## Browser diagnostics
 

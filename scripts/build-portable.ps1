@@ -20,7 +20,10 @@ if ($LASTEXITCODE -ne 0) {
 $env:ILS_FFMPEG_PATH = $resolvedFfmpeg
 
 & (Join-Path $PSScriptRoot "build-web.ps1")
-cargo build --release
+cargo build --release --locked
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo build failed with exit code $LASTEXITCODE"
+}
 
 $artifact = Join-Path (Get-Location) "target\release\instant-local-stream.exe"
 $dist = Join-Path (Get-Location) "dist"
