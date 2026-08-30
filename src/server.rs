@@ -44,7 +44,7 @@ use webrtc::peer_connection::{
 };
 
 use crate::audio::AudioPipeline;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, MAX_AUTOMATIC_BITRATE_BPS, automatic_bitrate_floor};
 use crate::media::{CaptureSettings, MediaPipeline};
 #[cfg(windows)]
 use crate::shared_capture::{SharedCapture, SourceFrame};
@@ -1374,24 +1374,13 @@ impl TranscodeGroups {
             }
         }
         let ceiling = self.group_settings(preferred_group_id);
-        let mut profile = ceiling.clone();
         let delivery_budget = if probe.timed_out || probe.download_bps <= 0.0 {
             250_000
         } else {
             (probe.download_bps * 0.65).round() as u32
         }
         .max(250_000);
-        while profile.bitrate > delivery_budget {
-            let previous = profile.clone();
-            profile.bitrate = (profile.bitrate.saturating_mul(3) / 5).max(250_000);
-            profile.output_fps = Some(lower_fps(profile.output_fps.unwrap_or(profile.fps)));
-            profile.output_height = Some(lower_height(
-                profile.output_height.unwrap_or(profile.height),
-            ));
-            if profile == previous {
-                break;
-            }
-        }
+        let profile = fit_profile_to_delivery_budget(&ceiling, delivery_budget);
         let mut group_id = self
             .group_for_codec_profile(&codec, preferred_group_id, profile.clone(), ceiling)
             .unwrap_or_else(|| self.primary_group_id());
@@ -1667,6 +1656,61 @@ fn higher_height(height: u32, ceiling: u32) -> u32 {
         .unwrap_or(ceiling)
 }
 
+fn profile_width(base: &CaptureSettings, height: u32) -> u32 {
+    ((base.width.max(2) as u64 * height as u64) / base.height.max(2) as u64).max(2) as u32
+}
+
+fn automatic_profile_bitrate(base: &CaptureSettings, height: u32, fps: u32) -> u32 {
+    let base_height = base.output_height.unwrap_or(base.height).max(2);
+    let base_fps = base.output_fps.unwrap_or(base.fps).max(1);
+    let base_width = profile_width(base, base_height);
+    let width = profile_width(base, height);
+    let base_pixel_rate = base_width as f64 * base_height as f64 * base_fps as f64;
+    let pixel_rate = width as f64 * height as f64 * fps as f64;
+    let scaled = (base.bitrate as f64 * pixel_rate / base_pixel_rate).round() as u32;
+    scaled
+        .max(automatic_bitrate_floor(width, height, fps))
+        .clamp(250_000, MAX_AUTOMATIC_BITRATE_BPS)
+}
+
+fn lowered_profile_bitrate(
+    ceiling: &CaptureSettings,
+    previous_bitrate: u32,
+    height: u32,
+    fps: u32,
+) -> u32 {
+    if ceiling.bitrate_mode == "automatic" {
+        automatic_profile_bitrate(ceiling, height, fps)
+    } else {
+        (previous_bitrate.saturating_mul(3) / 5).max(250_000)
+    }
+}
+
+fn fit_profile_to_delivery_budget(
+    ceiling: &CaptureSettings,
+    delivery_budget: u32,
+) -> CaptureSettings {
+    let mut profile = ceiling.clone();
+    while profile.bitrate > delivery_budget {
+        let previous = profile.clone();
+        let fps = lower_fps(profile.output_fps.unwrap_or(profile.fps));
+        let height = lower_height(profile.output_height.unwrap_or(profile.height));
+        if profile.output_fps.unwrap_or(profile.fps) == fps
+            && profile.output_height.unwrap_or(profile.height) == height
+        {
+            profile.bitrate = delivery_budget.max(250_000).min(profile.bitrate);
+            break;
+        }
+        profile.output_fps = Some(fps);
+        profile.output_height = Some(height);
+        profile.bitrate = lowered_profile_bitrate(ceiling, profile.bitrate, height, fps);
+        if profile == previous {
+            break;
+        }
+    }
+    profile
+}
+
 fn group_settings(base: &CaptureSettings, group_id: usize) -> CaptureSettings {
     let mut settings = base.clone();
     let mut height = base.output_height.unwrap_or(base.height);
@@ -1674,14 +1718,8 @@ fn group_settings(base: &CaptureSettings, group_id: usize) -> CaptureSettings {
     let mut bitrate = base.bitrate;
     for _ in 0..group_id {
         height = lower_height(height);
-        fps = match fps {
-            value if value > 30 => 30,
-            value if value > 24 => 24,
-            value if value > 15 => 15,
-            value if value > 10 => 10,
-            _ => 5,
-        };
-        bitrate = (bitrate.saturating_mul(3) / 5).max(250_000);
+        fps = lower_fps(fps);
+        bitrate = lowered_profile_bitrate(base, bitrate, height, fps);
     }
     settings.output_height = Some(height);
     settings.output_fps = Some(fps);
@@ -4602,7 +4640,7 @@ mod tests {
 
         assert_eq!(
             candidate,
-            "203.0.113.7:40000".parse::<std::net::SocketAddr>().unwrap()
+            "203.0.113.7:8475".parse::<std::net::SocketAddr>().unwrap()
         );
         assert_eq!(state.udp_mux.candidate_addr().unwrap(), candidate);
     }
@@ -4757,6 +4795,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn automatic_4k60_profiles_recalculate_bitrate_after_each_quality_step() {
+        let config = AppConfig {
+            codec: "vp8".to_owned(),
+            width: 3840,
+            height: 2160,
+            fps: 60,
+            quality_mode: "adaptive".to_owned(),
+            bitrate_mode: "automatic".to_owned(),
+            adaptive_quality_ceiling: "source".to_owned(),
+            adaptive_fps_ceiling: "source".to_owned(),
+            latency_preference: "balanced".to_owned(),
+            ..Default::default()
+        };
+        let ceiling = CaptureSettings::from_config(&config);
+        assert_eq!(ceiling.bitrate, 112_000_000);
+
+        let secondary = group_settings(&ceiling, 1);
+        assert_eq!(secondary.output_height, Some(1440));
+        assert_eq!(secondary.output_fps, Some(30));
+        assert_eq!(secondary.bitrate, 24_888_889);
+
+        let fitted = fit_profile_to_delivery_budget(&ceiling, 25_000_000);
+        assert_eq!(fitted, secondary);
+
+        let timeout_fallback = fit_profile_to_delivery_budget(&ceiling, 250_000);
+        assert_eq!(timeout_fallback.output_height, Some(144));
+        assert_eq!(timeout_fallback.output_fps, Some(5));
+        assert_eq!(timeout_fallback.bitrate, 250_000);
     }
 
     #[test]

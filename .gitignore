@@ -8,7 +8,7 @@
 /portable/
 /build/
 *.AppImage
-InstantLocalStream-*.exe
+Instant-Local-Stream-*.exe
 
 # Runtime extraction and local application state
 /.instant-local-stream/

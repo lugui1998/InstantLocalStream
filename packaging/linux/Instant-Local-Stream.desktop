@@ -2,7 +2,7 @@
 Type=Application
 Name=Instant Local Stream
 Comment=Portable low-latency local screen streaming host
-Exec=InstantLocalStream
+Exec=Instant-Local-Stream
 Terminal=true
 Categories=Network;AudioVideo;
-Icon=InstantLocalStream
+Icon=Instant-Local-Stream

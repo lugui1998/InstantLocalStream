@@ -28,6 +28,6 @@ if ($LASTEXITCODE -ne 0) {
 $artifact = Join-Path (Get-Location) "target\release\instant-local-stream.exe"
 $dist = Join-Path (Get-Location) "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$portable = Join-Path $dist "InstantLocalStream.exe"
+$portable = Join-Path $dist "Instant-Local-Stream.exe"
 Copy-Item -LiteralPath $artifact -Destination $portable -Force
 Write-Host "Portable artifact: $portable"

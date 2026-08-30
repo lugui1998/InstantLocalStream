@@ -2,9 +2,10 @@
 name = "instant-local-stream"
 version = "1.0.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "Portable low-latency local screen streaming host"
 default-run = "instant-local-stream"
+publish = false
 
 [dependencies]
 anyhow = "1"
@@ -56,3 +57,6 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 http-body-util = "0.1"
 tower = "0.5"
+
+[build-dependencies]
+embed-resource = "3.0.11"

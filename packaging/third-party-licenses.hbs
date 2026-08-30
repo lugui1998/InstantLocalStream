@@ -1,0 +1,18 @@
+Third-party Rust licenses for Instant Local Stream v1.0.0
+
+This file is generated from Cargo.lock with cargo-about. Each component remains
+subject to the listed license and copyright notice.
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}

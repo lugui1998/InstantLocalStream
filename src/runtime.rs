@@ -88,7 +88,7 @@ pub fn remove(http_port: u16) {
 }
 
 fn status_directory() -> PathBuf {
-    std::env::temp_dir().join("InstantLocalStream")
+    std::env::temp_dir().join("Instant-Local-Stream")
 }
 
 fn status_path(http_port: u16) -> PathBuf {

@@ -1,45 +1,53 @@
-# InstantLocalStream
+# Instant Local Stream
 
-Share your screen or an application window with any device that has a web browser. InstantLocalStream runs on your computer and sends video over WebRTC, with no app or account required for viewers.
-
-**[Download the latest release](https://github.com/lugui1998/InstantLocalStream/releases/latest)**
+Share your screen or an application window with any device that has a web browser. Instant Local Stream runs on your computer and sends video over WebRTC, with no app or account required for viewers.
 
 Available for Windows x86-64 and Linux x86-64.
 
+## Download
+
+### Windows
+
+[Download `Instant-Local-Stream-windows-x86_64.zip`](https://github.com/lugui1998/InstantLocalStream/releases/latest/download/Instant-Local-Stream-windows-x86_64.zip)
+
+Extract the ZIP and open `Instant-Local-Stream.exe`. Windows SmartScreen may warn because the application does not have a code-signing certificate.
+
+### Linux
+
+[Download `Instant-Local-Stream-linux-x86_64.AppImage`](https://github.com/lugui1998/InstantLocalStream/releases/latest/download/Instant-Local-Stream-linux-x86_64.AppImage)
+
+Make the AppImage executable, then run it:
+
+```bash
+chmod +x Instant-Local-Stream-linux-x86_64.AppImage
+./Instant-Local-Stream-linux-x86_64.AppImage
+```
+
+Linux screen capture uses X11. Wayland support depends on your desktop, portal, and capture permissions.
+
+## Sharing outside your computer
+
+**Public** is the default sharing mode. To make the viewer link reachable from the internet, configure your router to forward the selected port to the host computer for both **TCP and UDP**, and allow that port through the host firewall. The default port is `8475` unless you change it in the app.
+
+If your internet connection uses carrier-grade NAT (CGNAT), ordinary router port forwarding may not be available; ask your ISP for a public address or use a suitable tunnel or reverse-proxy setup.
+
+Public viewer links use HTTP and contain a private bearer token. Use a trusted network or place the host behind a secure reverse proxy, and do not publish the token link. Choose **LAN** for devices on the same network or **Local** to limit access to the host computer.
+
+The host accepts eight viewers by default. Your upload speed, selected resolution, and computer performance determine how many viewers it can serve.
+
 ## How it works
 
-1. Open InstantLocalStream.
+1. Open Instant Local Stream.
 2. Choose a monitor or application window.
 3. Click **Start Stream**.
 4. Copy the link and open it on another device.
 
 The link contains a private 12-character access token. Anyone with the link can watch the stream, so share it with care.
 
-## Download
-
-### Windows
-
-[Download `InstantLocalStream-windows-x86_64.exe`](https://github.com/lugui1998/InstantLocalStream/releases/latest/download/InstantLocalStream-windows-x86_64.exe)
-
-Open the downloaded file. Windows SmartScreen may warn about builds that do not have a code-signing certificate.
-
-### Linux
-
-[Download `InstantLocalStream-linux-x86_64.AppImage`](https://github.com/lugui1998/InstantLocalStream/releases/latest/download/InstantLocalStream-linux-x86_64.AppImage)
-
-Make the AppImage executable, then run it:
-
-```bash
-chmod +x InstantLocalStream-linux-x86_64.AppImage
-./InstantLocalStream-linux-x86_64.AppImage
-```
-
-Linux screen capture uses X11. Wayland support depends on your desktop, portal, and capture permissions.
-
 ## Features
 
 - Monitor and application-window capture
-- VP8, VP9, and H.264 video
+- VP8 video, with experimental VP9 and H.264 modes
 - Optional system or application audio
 - Automatic quality adjustment for each viewer
 - Low-latency WebRTC playback
@@ -47,15 +55,7 @@ Linux screen capture uses X11. Wayland support depends on your desktop, portal, 
 - Support for multiple viewers through one UDP port
 - Built-in test pattern for connection checks
 
-Audio starts disabled. You can enable it from the host window before starting the stream.
-
-## Sharing outside your computer
-
-The default **Local** mode limits access to the host computer. Choose **LAN** to share with devices on the same network.
-
-Public internet sharing requires firewall and router configuration. InstantLocalStream serves viewer links over HTTP, so use a trusted network or place the host behind a secure reverse proxy. Do not publish the token link.
-
-The host accepts eight viewers by default. Your upload speed, selected resolution, and computer performance determine how many viewers it can serve.
+Audio starts enabled for monitor sources. You can change the audio source or disable it from the host window before starting the stream.
 
 ## Build from source
 
@@ -84,4 +84,12 @@ Run `cargo run -- --help` to see the command-line options. Contributors can find
 
 ## Third-party software
 
-InstantLocalStream uses FFmpeg and other third-party components. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the [FFmpeg source information](packaging/FFMPEG_SOURCE_OFFER.md) for details.
+Instant Local Stream uses FFmpeg and other third-party components. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the [FFmpeg source information](packaging/FFMPEG_SOURCE_OFFER.md) for details.
+
+## Disclosure
+
+AI tools were used while creating this project.
+
+## License
+
+Instant Local Stream is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal and other noncommercial uses are permitted; commercial use requires separate permission from the licensor.

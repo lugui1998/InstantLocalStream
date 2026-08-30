@@ -17,6 +17,7 @@ pub const AUDIO_MODES: &[&str] = &["off", "system", "window"];
 pub const QUALITY_MODES: &[&str] = &["manual", "adaptive"];
 pub const BITRATE_MODES: &[&str] = &["fixed", "automatic"];
 pub const LATENCY_PREFERENCES: &[&str] = &["low", "balanced", "quality"];
+pub const MAX_AUTOMATIC_BITRATE_BPS: u32 = 1_500_000_000;
 pub const DEFAULT_AUDIO_EXCLUSIONS: &[&str] = &[
     "Discord",
     "WhatsApp",
@@ -81,9 +82,9 @@ pub struct ConfigArgs {
     pub port: Option<u16>,
     #[arg(long, default_value = "localhost", env = "ILS_BIND")]
     pub bind: String,
-    #[arg(long, default_value_t = 8080, env = "ILS_HTTP_PORT")]
+    #[arg(long, default_value_t = 8475, env = "ILS_HTTP_PORT")]
     pub http_port: u16,
-    #[arg(long, default_value = "40000", env = "ILS_MEDIA_PORTS")]
+    #[arg(long, default_value = "8475", env = "ILS_MEDIA_PORTS")]
     pub media_ports: String,
     #[arg(
         long,
@@ -160,10 +161,10 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             bind: "localhost".to_owned(),
-            http_port: 8080,
+            http_port: 8475,
             media_ports: PortRange {
-                first: 40_000,
-                last: 40_000,
+                first: 8475,
+                last: 8475,
             },
             advertise_host: None,
             token: generate_token(),
@@ -187,7 +188,7 @@ impl Default for AppConfig {
             adaptive_fps_ceiling: "source".to_owned(),
             max_quality_groups: "2".to_owned(),
             latency_preference: "low".to_owned(),
-            audio_mode: "off".to_owned(),
+            audio_mode: "system".to_owned(),
             excluded_audio_processes: Vec::new(),
             json: false,
         }
@@ -254,7 +255,13 @@ impl AppConfig {
         self.adaptive_fps_ceiling = args.adaptive_fps_ceiling;
         self.max_quality_groups = args.max_quality_groups;
         self.latency_preference = args.latency_preference;
-        self.audio_mode = args.audio.unwrap_or_else(|| "off".to_owned());
+        self.audio_mode = args.audio.unwrap_or_else(|| {
+            if self.source.kind == "test" {
+                "off".to_owned()
+            } else {
+                "system".to_owned()
+            }
+        });
         if !args.exclude_audio_process.is_empty() {
             self.excluded_audio_processes = args.exclude_audio_process;
         }
@@ -389,12 +396,12 @@ impl AppConfig {
         let source_height = self.height.max(2);
         let width = ((source_width as u64 * height as u64) / source_height as u64).max(2) as u32;
         let fps = self.output_fps().unwrap_or(self.fps).max(5);
-        let bits_per_pixel_frame = match self.codec.to_ascii_lowercase().as_str() {
-            "vp8" => 0.080,
-            "vp9" => 0.055,
-            "h264" => 0.065,
-            "av1" => 0.040,
-            _ => 0.080,
+        let codec_multiplier = match self.codec.to_ascii_lowercase().as_str() {
+            "vp8" => 1.0,
+            "vp9" => 0.6875,
+            "h264" => 0.8125,
+            "av1" => 0.5,
+            _ => 1.0,
         };
         let multiplier = match self.latency_preference.as_str() {
             "low" => 0.90,
@@ -408,15 +415,20 @@ impl AppConfig {
         } else {
             1.0
         };
-        let recommendation = (width as f64
-            * height as f64
-            * fps as f64
-            * bits_per_pixel_frame
+        // Normalize the recommendation to 14 Mbps at 1920x1080/30. Scaling by
+        // pixel throughput gives higher resolutions and frame rates a larger
+        // budget instead of leaving 1080p60 and 4K pinned to the same floor.
+        let pixel_rate = width as f64 * height as f64 * fps as f64;
+        let baseline_pixel_rate = 1920.0 * 1080.0 * 30.0;
+        let recommendation = (14_000_000.0
+            * (pixel_rate / baseline_pixel_rate)
+            * codec_multiplier
             * multiplier
-            * content_multiplier) as u32;
+            * content_multiplier)
+            .round() as u32;
         recommendation
-            .max(automatic_bitrate_floor(height, fps))
-            .clamp(250_000, 25_000_000)
+            .max(automatic_bitrate_floor(width, height, fps))
+            .clamp(250_000, MAX_AUTOMATIC_BITRATE_BPS)
     }
 
     pub fn http_addr(&self) -> Result<SocketAddr> {
@@ -498,13 +510,20 @@ fn viewer_url_host(host: &str) -> String {
 /// them: the adaptive controller still lowers an individual group after a
 /// credible rolling congestion signal.  The 1080p/30 floor intentionally
 /// starts at 14 Mbps because text, UI edges, and scrolling expose compression
-/// artifacts well before a camera-video heuristic would.
-fn automatic_bitrate_floor(height: u32, fps: u32) -> u32 {
+/// artifacts well before a camera-video heuristic would. Above that baseline,
+/// the floor grows with the square root of pixel throughput so every larger or
+/// faster profile receives more bandwidth even with a more efficient codec.
+pub(crate) fn automatic_bitrate_floor(width: u32, height: u32, fps: u32) -> u32 {
+    const BASELINE_BITRATE: f64 = 14_000_000.0;
+    const BASELINE_PIXEL_RATE: f64 = 1920.0 * 1080.0 * 30.0;
+
+    if height >= 1_080 {
+        let pixel_rate = width as f64 * height as f64 * fps as f64;
+        let scale = (pixel_rate / BASELINE_PIXEL_RATE).max(1.0).sqrt();
+        return (BASELINE_BITRATE * scale).round() as u32;
+    }
+
     match height {
-        value if value >= 2_160 => 25_000_000,
-        value if value >= 1_440 && fps >= 60 => 20_000_000,
-        value if value >= 1_440 => 15_000_000,
-        value if value >= 1_080 => 14_000_000,
         value if value >= 720 && fps >= 60 => 7_000_000,
         value if value >= 720 => 4_000_000,
         value if value >= 480 => 2_000_000,
@@ -611,10 +630,12 @@ mod tests {
     fn default_uses_one_shared_media_port() {
         let config = AppConfig::default();
         assert_eq!(config.media_ports.first, config.media_ports.last);
+        assert_eq!(config.media_ports.first, config.http_port);
         assert_eq!(config.codec, "auto");
         assert_eq!(config.bitrate, 14_000_000);
         assert_eq!(config.bind, "localhost");
-        assert_eq!(config.audio_mode, "off");
+        assert_eq!(config.http_port, 8475);
+        assert_eq!(config.audio_mode, "system");
     }
 
     #[test]
@@ -650,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_to_loopback_with_audio_disabled() {
+    fn cli_defaults_to_loopback_with_system_audio() {
         let cli = Cli::try_parse_from(["instant-local-stream", "start"]).unwrap();
         let Command::Start(start) = cli.command.unwrap() else {
             panic!("expected the start command");
@@ -658,8 +679,18 @@ mod tests {
 
         let config = AppConfig::from_cli(Some(start)).unwrap();
         assert_eq!(config.bind, "localhost");
-        assert_eq!(config.audio_mode, "off");
+        assert_eq!(config.http_port, 8475);
+        assert_eq!(config.audio_mode, "system");
         assert!(config.excluded_audio_processes.is_empty());
+    }
+
+    #[test]
+    fn status_command_defaults_to_the_application_port() {
+        let cli = Cli::try_parse_from(["instant-local-stream", "status"]).unwrap();
+        let Command::Status { http_port } = cli.command.unwrap() else {
+            panic!("expected the status command");
+        };
+        assert_eq!(http_port, 8475);
     }
 
     #[test]
@@ -693,6 +724,25 @@ mod tests {
     }
 
     #[test]
+    fn test_pattern_defaults_to_audio_off() {
+        let cli = Cli::try_parse_from([
+            "instant-local-stream",
+            "start",
+            "--source",
+            "test:0",
+        ])
+        .unwrap();
+        let Command::Start(start) = cli.command.unwrap() else {
+            panic!("expected the start command");
+        };
+
+        assert_eq!(
+            AppConfig::from_cli(Some(start)).unwrap().audio_mode,
+            "off"
+        );
+    }
+
+    #[test]
     fn h264_is_an_available_initial_codec() {
         let config = AppConfig {
             codec: "h264".to_owned(),
@@ -713,35 +763,82 @@ mod tests {
     }
 
     #[test]
-    fn automatic_vp8_1080p60_uses_a_quality_preserving_start_bitrate() {
-        let mut config = AppConfig::default();
-        config.source.kind = "test".to_owned();
-        config.codec = "vp8".to_owned();
-        config.width = 1920;
-        config.height = 1080;
+    fn automatic_vp8_bitrate_scales_from_the_1080p30_baseline() {
+        let mut config = AppConfig {
+            codec: "vp8".to_owned(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            quality_mode: "manual".to_owned(),
+            quality: "custom".to_owned(),
+            fps_preset: "custom".to_owned(),
+            bitrate_mode: "automatic".to_owned(),
+            latency_preference: "balanced".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_bitrate(), 14_000_000);
+
         config.fps = 60;
-        config.quality_mode = "manual".to_owned();
-        config.quality = "1080p".to_owned();
-        config.fps_preset = "60".to_owned();
-        config.bitrate_mode = "automatic".to_owned();
-        config.latency_preference = "low".to_owned();
-        assert!(config.effective_bitrate() >= 14_000_000);
+        assert_eq!(config.effective_bitrate(), 28_000_000);
+
+        config.width = 2560;
+        config.height = 1440;
+        config.fps = 30;
+        assert_eq!(config.effective_bitrate(), 24_888_889);
+
+        config.width = 3840;
+        config.height = 2160;
+        config.fps = 60;
+        assert_eq!(config.effective_bitrate(), 112_000_000);
+
+        config.width = 7680;
+        config.height = 4320;
+        assert_eq!(config.effective_bitrate(), 448_000_000);
+
+        config.fps = 120;
+        assert_eq!(config.effective_bitrate(), 896_000_000);
     }
 
     #[test]
-    fn automatic_1080p30_starts_at_fourteen_megabits_or_more() {
-        let mut config = AppConfig::default();
-        config.source.kind = "test".to_owned();
-        config.codec = "vp8".to_owned();
-        config.width = 1920;
-        config.height = 1080;
-        config.fps = 30;
-        config.quality_mode = "manual".to_owned();
-        config.quality = "1080p".to_owned();
-        config.fps_preset = "30".to_owned();
-        config.bitrate_mode = "automatic".to_owned();
+    fn automatic_bitrate_increases_for_efficient_codecs_too() {
+        let mut config = AppConfig {
+            codec: "vp9".to_owned(),
+            fps: 30,
+            quality_mode: "manual".to_owned(),
+            quality: "custom".to_owned(),
+            fps_preset: "custom".to_owned(),
+            bitrate_mode: "automatic".to_owned(),
+            latency_preference: "balanced".to_owned(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        let baseline = config.effective_bitrate();
 
-        assert!(config.effective_bitrate() >= 14_000_000);
+        config.width = 3840;
+        config.height = 2160;
+
+        assert_eq!(baseline, 14_000_000);
+        assert!(config.validate().is_ok());
+        assert!(config.effective_bitrate() > baseline);
+    }
+
+    #[test]
+    fn automatic_h264_level_31_profile_stays_within_its_bitrate_limit() {
+        let config = AppConfig {
+            codec: "h264".to_owned(),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            quality_mode: "manual".to_owned(),
+            quality: "custom".to_owned(),
+            fps_preset: "custom".to_owned(),
+            bitrate_mode: "automatic".to_owned(),
+            latency_preference: "balanced".to_owned(),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+        assert!(config.effective_bitrate() <= 14_000_000);
     }
 
     #[test]
@@ -751,7 +848,7 @@ mod tests {
             .apply_args(ConfigArgs {
                 port: Some(18080),
                 bind: "localhost".to_owned(),
-                http_port: 8080,
+                http_port: 8475,
                 media_ports: "40000-40010".to_owned(),
                 advertise_host: None,
                 token: None,

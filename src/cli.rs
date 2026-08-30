@@ -13,7 +13,7 @@ use crate::server;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "instantlocalstream",
+    name = "instant-local-stream",
     version,
     about = "Portable low-latency local screen streaming host"
 )]
@@ -45,7 +45,7 @@ pub enum Command {
     Validate(ValidateArgs),
     PublicIp,
     Status {
-        #[arg(long, default_value_t = 8080)]
+        #[arg(long, default_value_t = 8475)]
         http_port: u16,
     },
     Version,

@@ -78,15 +78,10 @@ impl UserPreferences {
     }
 
     pub fn apply_to(&self, config: &mut AppConfig) {
-        // Version 0 predates privacy-safe defaults. Since it cannot distinguish
-        // an explicit choice from the former implicit LAN/system defaults,
-        // migrate once to the safer settings and let the user opt back in.
+        // Version 0 predates the current persisted preference schema. Keep
+        // its legacy system-audio selection when restoring old preferences.
         let legacy_defaults = self.schema_version == 0;
-        config.bind = if legacy_defaults && self.bind == "lan" {
-            "localhost".to_owned()
-        } else {
-            self.bind.clone()
-        };
+        config.bind = self.bind.clone();
         config.http_port = self.http_port;
         config.max_viewers = self.max_viewers.max(1);
         config.source = self.source.clone();
@@ -104,11 +99,7 @@ impl UserPreferences {
             _ => self.max_quality_groups.clone(),
         };
         config.latency_preference = self.latency_preference.clone();
-        config.audio_mode = if legacy_defaults && self.audio_mode == "system" {
-            "off".to_owned()
-        } else {
-            self.audio_mode.clone()
-        };
+        config.audio_mode = self.audio_mode.clone();
         let legacy_default_exclusions = self.excluded_audio_processes.len()
             == DEFAULT_AUDIO_EXCLUSIONS.len()
             && DEFAULT_AUDIO_EXCLUSIONS.iter().all(|default| {
@@ -126,9 +117,10 @@ impl UserPreferences {
 
 pub fn load() -> Option<UserPreferences> {
     let bytes = fs::read(path())
-        // Preserve settings written by older releases until the next save
-        // migrates them into the durable per-user configuration directory.
-        .or_else(|_| fs::read(legacy_path()))
+        // Preserve settings written under either historical directory name
+        // until the next save migrates them to Instant-Local-Stream.
+        .or_else(|_| fs::read(legacy_preferences_path()))
+        .or_else(|_| fs::read(legacy_temp_path()))
         .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -143,6 +135,10 @@ pub fn save(config: &AppConfig, host_network_test: Option<HostNetworkTestResult>
 }
 
 fn preferences_directory() -> PathBuf {
+    preferences_base_directory().join("Instant-Local-Stream")
+}
+
+fn preferences_base_directory() -> PathBuf {
     let base = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
@@ -159,14 +155,19 @@ fn preferences_directory() -> PathBuf {
             })
     };
     base.unwrap_or_else(std::env::temp_dir)
-        .join("InstantLocalStream")
 }
 
 fn path() -> PathBuf {
     preferences_directory().join("preferences.json")
 }
 
-fn legacy_path() -> PathBuf {
+fn legacy_preferences_path() -> PathBuf {
+    preferences_base_directory()
+        .join("InstantLocalStream")
+        .join("preferences.json")
+}
+
+fn legacy_temp_path() -> PathBuf {
     std::env::temp_dir()
         .join("InstantLocalStream")
         .join("preferences.json")
@@ -203,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_implicit_network_and_audio_defaults_migrate_to_safe_values() {
+    fn legacy_network_selection_is_preserved_with_system_audio() {
         let config = AppConfig {
             bind: "lan".to_owned(),
             audio_mode: "system".to_owned(),
@@ -220,8 +221,8 @@ mod tests {
 
         legacy.apply_to(&mut migrated);
 
-        assert_eq!(migrated.bind, "localhost");
-        assert_eq!(migrated.audio_mode, "off");
+        assert_eq!(migrated.bind, "lan");
+        assert_eq!(migrated.audio_mode, "system");
         assert!(migrated.excluded_audio_processes.is_empty());
     }
 

@@ -24,7 +24,7 @@ use crate::config::AppConfig;
 
 fn main() {
     std::panic::set_hook(Box::new(|panic| {
-        let directory = std::env::temp_dir().join("InstantLocalStream");
+        let directory = std::env::temp_dir().join("Instant-Local-Stream");
         let _ = std::fs::create_dir_all(&directory);
         let report = format!(
             "panic: {panic}\nbacktrace:\n{}\n",
@@ -33,7 +33,7 @@ fn main() {
         let _ = std::fs::write(directory.join("last-crash.txt"), report);
     }));
     if let Err(error) = run() {
-        let directory = std::env::temp_dir().join("InstantLocalStream");
+        let directory = std::env::temp_dir().join("Instant-Local-Stream");
         let _ = std::fs::create_dir_all(&directory);
         let _ = std::fs::write(directory.join("last-error.txt"), format!("{error:?}\n"));
         std::process::exit(1);

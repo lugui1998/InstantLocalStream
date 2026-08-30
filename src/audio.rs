@@ -76,7 +76,7 @@ impl AudioPipeline {
         let track = TrackLocalStaticSample::new(MediaStreamTrack::new(
             "instant-local-stream".to_owned(),
             format!("screen-audio-{connection_id}"),
-            "InstantLocalStream audio".to_owned(),
+            "Instant Local Stream audio".to_owned(),
             RtpCodecKind::Audio,
             vec![RTCRtpEncodingParameters {
                 rtp_coding_parameters: RTCRtpCodingParameters {

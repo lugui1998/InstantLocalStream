@@ -50,6 +50,13 @@ jobs:
           test "$(node -p "require('./web/package.json').version")" = "$RELEASE_VERSION"
           test "$(node -p "require('./web/package-lock.json').version")" = "$RELEASE_VERSION"
           test "$(node -p "require('./web/package-lock.json').packages[''].version")" = "$RELEASE_VERSION"
+          test -s LICENSE
+          test "$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "instant-local-stream") | .license')" = "PolyForm-Noncommercial-1.0.0"
+          test -s THIRD_PARTY_NOTICES.md
+          test -s packaging/THIRD_PARTY_LICENSES-RUST.txt
+          test -s packaging/THIRD_PARTY_LICENSES-NPM.txt
+          test -s packaging/RELEASE_NOTES_v1.0.0.md
+          ! grep -Eiq 'must be recorded|before publishing|placeholder|TODO' THIRD_PARTY_NOTICES.md
 
   windows:
     name: Build Windows x86-64
@@ -112,7 +119,7 @@ jobs:
             }
           }
           ./scripts/build-portable.ps1 -FfmpegPath $ffmpeg.FullName
-          Move-Item dist/InstantLocalStream.exe dist/InstantLocalStream-windows-x86_64.exe
+          Move-Item dist/Instant-Local-Stream.exe dist/Instant-Local-Stream-windows-x86_64.exe
           Copy-Item $ffmpegLicense.FullName dist/FFMPEG-LICENSE-windows-x86_64.txt
           @(
             "Provider: https://github.com/BtbN/FFmpeg-Builds"
@@ -121,15 +128,16 @@ jobs:
             "Archive: $env:FFMPEG_ARCHIVE"
             "Variant: Windows x86-64 GPL static"
             ""
-          ) | Set-Content dist/InstantLocalStream-windows-x86_64.ffmpeg.txt
-          & $ffmpeg.FullName -version 2>&1 | Add-Content dist/InstantLocalStream-windows-x86_64.ffmpeg.txt
-          if ((Get-Item dist/InstantLocalStream-windows-x86_64.exe).Length -le 0) {
+          ) | Set-Content dist/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
+          & $ffmpeg.FullName -version 2>&1 | Add-Content dist/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
+          if ((Get-Item dist/Instant-Local-Stream-windows-x86_64.exe).Length -le 0) {
             throw "Windows release artifact is empty"
           }
+          ./scripts/verify-windows-icon.ps1 -ExePath dist/Instant-Local-Stream-windows-x86_64.exe
           $stdoutPath = Join-Path $env:RUNNER_TEMP "instant-local-stream-validate.json"
           $stderrPath = Join-Path $env:RUNNER_TEMP "instant-local-stream-validate.stderr"
           $processArguments = @{
-            FilePath = (Resolve-Path dist/InstantLocalStream-windows-x86_64.exe)
+            FilePath = (Resolve-Path dist/Instant-Local-Stream-windows-x86_64.exe)
             ArgumentList = @("validate", "--json", "--source", "test:0")
             Wait = $true
             PassThru = $true
@@ -150,8 +158,8 @@ jobs:
         with:
           name: release-windows-x86_64
           path: |
-            dist/InstantLocalStream-windows-x86_64.exe
-            dist/InstantLocalStream-windows-x86_64.ffmpeg.txt
+            dist/Instant-Local-Stream-windows-x86_64.exe
+            dist/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
             dist/FFMPEG-LICENSE-windows-x86_64.txt
           if-no-files-found: error
           retention-days: 7
@@ -250,8 +258,8 @@ jobs:
           for encoder in libvpx libvpx-vp9 libx264; do
             grep -Eq "[[:space:]]${encoder}[[:space:]]" <<<"$encoders"
           done
-          bash scripts/build-portable.sh "$ffmpeg_path"
-          test -s dist/InstantLocalStream-linux-x86_64.AppImage
+          bash scripts/build-portable.sh "$ffmpeg_path" "$ffmpeg_license"
+          test -s dist/Instant-Local-Stream-linux-x86_64.AppImage
           cp "$ffmpeg_license" dist/FFMPEG-LICENSE-linux-x86_64.txt
           {
             echo "Provider: https://github.com/BtbN/FFmpeg-Builds"
@@ -261,15 +269,15 @@ jobs:
             echo "Variant: Linux x86-64 GPL static"
             echo
             "$ffmpeg_path" -version
-          } > dist/InstantLocalStream-linux-x86_64.ffmpeg.txt
+          } > dist/Instant-Local-Stream-linux-x86_64.ffmpeg.txt
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-linux-x86_64
           path: |
-            dist/InstantLocalStream-linux-x86_64.AppImage
-            dist/InstantLocalStream-linux-x86_64.ffmpeg.txt
+            dist/Instant-Local-Stream-linux-x86_64.AppImage
+            dist/Instant-Local-Stream-linux-x86_64.ffmpeg.txt
             dist/FFMPEG-LICENSE-linux-x86_64.txt
           if-no-files-found: error
           retention-days: 7
@@ -291,10 +299,10 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
           set -euo pipefail
-          chmod +x release-linux/InstantLocalStream-linux-x86_64.AppImage
-          output="$(release-linux/InstantLocalStream-linux-x86_64.AppImage version)"
+          chmod +x release-linux/Instant-Local-Stream-linux-x86_64.AppImage
+          output="$(release-linux/Instant-Local-Stream-linux-x86_64.AppImage version)"
           test "$output" = "instant-local-stream $RELEASE_VERSION"
-          validation="$(release-linux/InstantLocalStream-linux-x86_64.AppImage validate --json --source test:0)"
+          validation="$(release-linux/Instant-Local-Stream-linux-x86_64.AppImage validate --json --source test:0)"
           jq -e '.ok == true and .ffmpeg.available == true and .ffmpeg.command == "embedded FFmpeg"' <<<"$validation"
 
   release:
@@ -328,27 +336,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir release
-          cp release-windows/InstantLocalStream-windows-x86_64.exe release/
-          cp release-windows/InstantLocalStream-windows-x86_64.ffmpeg.txt release/
+          mkdir release windows-package
+          cp release-windows/Instant-Local-Stream-windows-x86_64.exe windows-package/
+          cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt windows-package/
+          cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt windows-package/FFMPEG-LICENSE.txt
+          cp THIRD_PARTY_NOTICES.md windows-package/THIRD_PARTY_NOTICES.md
+          cp packaging/THIRD_PARTY_LICENSES-RUST.txt windows-package/THIRD_PARTY_LICENSES-RUST.txt
+          cp packaging/THIRD_PARTY_LICENSES-NPM.txt windows-package/THIRD_PARTY_LICENSES-NPM.txt
+          cp packaging/FFMPEG_SOURCE_OFFER.md windows-package/FFMPEG_SOURCE_OFFER.md
+          cp LICENSE windows-package/LICENSE
+          (
+            cd windows-package
+            zip -9 -r ../release/Instant-Local-Stream-windows-x86_64.zip .
+          )
+          cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt release/
           cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt release/
-          cp release-linux/InstantLocalStream-linux-x86_64.AppImage release/
-          cp release-linux/InstantLocalStream-linux-x86_64.ffmpeg.txt release/
+          cp release-linux/Instant-Local-Stream-linux-x86_64.AppImage release/
+          cp release-linux/Instant-Local-Stream-linux-x86_64.ffmpeg.txt release/
           cp release-linux/FFMPEG-LICENSE-linux-x86_64.txt release/
           cp THIRD_PARTY_NOTICES.md release/THIRD_PARTY_NOTICES.md
+          cp packaging/THIRD_PARTY_LICENSES-RUST.txt release/THIRD_PARTY_LICENSES-RUST.txt
+          cp packaging/THIRD_PARTY_LICENSES-NPM.txt release/THIRD_PARTY_LICENSES-NPM.txt
           cp packaging/FFMPEG_SOURCE_OFFER.md release/FFMPEG_SOURCE_OFFER.md
+          cp LICENSE release/LICENSE
           cp Cargo.lock release/Cargo.lock
           cp web/package-lock.json release/web-package-lock.json
           cd release
           sha256sum \
-            InstantLocalStream-windows-x86_64.exe \
-            InstantLocalStream-linux-x86_64.AppImage \
-            InstantLocalStream-windows-x86_64.ffmpeg.txt \
-            InstantLocalStream-linux-x86_64.ffmpeg.txt \
+            Instant-Local-Stream-windows-x86_64.zip \
+            Instant-Local-Stream-linux-x86_64.AppImage \
+            Instant-Local-Stream-windows-x86_64.ffmpeg.txt \
+            Instant-Local-Stream-linux-x86_64.ffmpeg.txt \
             FFMPEG-LICENSE-windows-x86_64.txt \
             FFMPEG-LICENSE-linux-x86_64.txt \
             FFMPEG_SOURCE_OFFER.md \
             THIRD_PARTY_NOTICES.md \
+            THIRD_PARTY_LICENSES-RUST.txt \
+            THIRD_PARTY_LICENSES-NPM.txt \
+            LICENSE \
             Cargo.lock \
             web-package-lock.json \
             > SHA256SUMS.txt
@@ -360,20 +385,26 @@ jobs:
         run: |
           set -euo pipefail
           release_files=(
-            release/InstantLocalStream-windows-x86_64.exe
-            release/InstantLocalStream-linux-x86_64.AppImage
-            release/InstantLocalStream-windows-x86_64.ffmpeg.txt
-            release/InstantLocalStream-linux-x86_64.ffmpeg.txt
+            release/Instant-Local-Stream-windows-x86_64.zip
+            release/Instant-Local-Stream-linux-x86_64.AppImage
+            release/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
+            release/Instant-Local-Stream-linux-x86_64.ffmpeg.txt
             release/FFMPEG-LICENSE-windows-x86_64.txt
             release/FFMPEG-LICENSE-linux-x86_64.txt
             release/FFMPEG_SOURCE_OFFER.md
             release/THIRD_PARTY_NOTICES.md
+            release/THIRD_PARTY_LICENSES-RUST.txt
+            release/THIRD_PARTY_LICENSES-NPM.txt
+            release/LICENSE
             release/Cargo.lock
             release/web-package-lock.json
             release/SHA256SUMS.txt
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = "true"
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "Instant Local Stream $GITHUB_REF_NAME" \
+              --notes-file packaging/RELEASE_NOTES_v1.0.0.md
             for file in "${release_files[@]}"; do
               asset="$(basename "$file")"
               if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq "$asset"; then
@@ -385,6 +416,6 @@ jobs:
             gh release create "$GITHUB_REF_NAME" "${release_files[@]}" \
               --verify-tag \
               --draft \
-              --generate-notes \
-              --title "InstantLocalStream $GITHUB_REF_NAME"
+              --notes-file packaging/RELEASE_NOTES_v1.0.0.md \
+              --title "Instant Local Stream $GITHUB_REF_NAME"
           fi

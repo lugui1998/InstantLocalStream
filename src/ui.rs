@@ -52,6 +52,8 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
     let saved_preferences = load_preferences.then(preferences::load).flatten();
     if let Some(saved) = &saved_preferences {
         saved.apply_to(&mut config);
+    } else if load_preferences {
+        apply_first_run_share_default(&mut config);
     }
     // The native UI exposes one share port. Use that same number for the
     // HTTP/WebSocket listener (TCP) and WebRTC media mux (UDP), so WAN users
@@ -1534,6 +1536,8 @@ impl HostUi {
         let source_selected = self.has_valid_source_selection();
         let source_minimized = self.selected_window_is_minimized();
         let source_ready = source_selected && !source_minimized;
+        let share_endpoint_ready =
+            self.viewer_url_mode != ViewerUrlMode::Public || self.public_ipv4.is_some();
         let action = if !server_alive {
             ui.add(egui::Button::new("Retry viewer server"))
                 .on_hover_text(
@@ -1553,7 +1557,7 @@ impl HostUi {
             .on_hover_text("Stop media delivery while keeping the viewer server online.")
         } else {
             let start_button = ui.add_enabled(
-                server_ready && source_ready,
+                server_ready && source_ready && share_endpoint_ready,
                 egui::Button::new(
                     egui::RichText::new("Start Stream")
                         .strong()
@@ -1569,6 +1573,10 @@ impl HostUi {
             } else if source_minimized {
                 start_button.on_disabled_hover_text(
                     "Restore the selected window before starting its capture.",
+                )
+            } else if !share_endpoint_ready {
+                start_button.on_disabled_hover_text(
+                    "Wait for the public IPv4 lookup, or select Local, LAN, or Custom sharing.",
                 )
             } else if server_ready {
                 start_button.on_hover_text("Start media delivery for connected viewers.")
@@ -1798,6 +1806,11 @@ fn initial_viewer_url_state(config: &AppConfig) -> (ViewerUrlMode, String, Optio
         .filter(|host| host.parse::<std::net::Ipv4Addr>().is_ok())
         .map(str::to_owned);
     (mode, custom_host, public_ipv4)
+}
+
+fn apply_first_run_share_default(config: &mut AppConfig) {
+    config.bind = "public".to_owned();
+    config.advertise_host = None;
 }
 
 fn bind_for_viewer_url_mode(mode: ViewerUrlMode) -> &'static str {
@@ -2517,6 +2530,8 @@ impl eframe::App for HostUi {
                 }
 
                 ui.label("Bitrate mode");
+                let previous_bitrate_mode = self.config.bitrate_mode.clone();
+                let automatic_bitrate = self.config.effective_bitrate();
                 egui::ComboBox::from_id_salt("bitrate-mode")
                     .selected_text(bitrate_mode_label(&self.config.bitrate_mode))
                     .show_ui(ui, |ui| {
@@ -2528,12 +2543,17 @@ impl eframe::App for HostUi {
                             );
                         }
                     });
+                if previous_bitrate_mode == "automatic" && self.config.bitrate_mode == "fixed" {
+                    self.config.bitrate = automatic_bitrate;
+                }
                 ui.end_row();
 
                 ui.label("Bitrate");
                 if self.config.bitrate_mode == "fixed" {
                     ui.add(
-                        egui::DragValue::new(&mut self.config.bitrate).range(250_000..=50_000_000),
+                        egui::DragValue::new(&mut self.config.bitrate)
+                            .range(250_000..=crate::config::MAX_AUTOMATIC_BITRATE_BPS)
+                            .speed(250_000.0),
                     );
                 } else {
                     ui.label(format!(
@@ -3394,12 +3414,14 @@ mod tests {
     }
 
     #[test]
-    fn default_share_settings_choose_local_mode() {
-        let config = AppConfig::default();
+    fn first_run_share_settings_choose_public_mode() {
+        let mut config = AppConfig::default();
+        apply_first_run_share_default(&mut config);
 
         let (mode, custom_host, public_ipv4) = initial_viewer_url_state(&config);
 
-        assert_eq!(mode, ViewerUrlMode::Local);
+        assert_eq!(config.bind, "public");
+        assert_eq!(mode, ViewerUrlMode::Public);
         assert!(custom_host.is_empty());
         assert!(public_ipv4.is_none());
     }

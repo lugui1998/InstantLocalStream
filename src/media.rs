@@ -540,7 +540,7 @@ impl MediaPipeline {
         let track = TrackLocalStaticSample::new(MediaStreamTrack::new(
             "instant-local-stream".to_owned(),
             format!("screen-video-{connection_id}"),
-            "InstantLocalStream screen".to_owned(),
+            "Instant Local Stream screen".to_owned(),
             RtpCodecKind::Video,
             vec![RTCRtpEncodingParameters {
                 rtp_coding_parameters: RTCRtpCodingParameters {

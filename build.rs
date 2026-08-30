@@ -3,6 +3,16 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=ILS_FFMPEG_PATH");
     println!("cargo:rerun-if-changed=web");
+    println!("cargo:rerun-if-changed=packaging/windows/Instant-Local-Stream.rc");
+    println!("cargo:rerun-if-changed=packaging/windows/Instant-Local-Stream.ico");
+
+    embed_resource::compile(
+        "packaging/windows/Instant-Local-Stream.rc",
+        embed_resource::NONE,
+    )
+    .manifest_required()
+    .expect("embed Windows application icon");
+
     if !PathBuf::from("web/dist/index.html").is_file() {
         panic!(
             "web/dist/index.html is missing; run scripts/build-web.ps1 or scripts/build-web.sh before building the Rust application"

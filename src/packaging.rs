@@ -26,7 +26,7 @@ pub fn prepare_ffmpeg() -> Result<PreparedFfmpeg> {
             bail!("embedded FFmpeg is empty; rebuild with a valid FFmpeg executable");
         }
         let directory = std::env::temp_dir()
-            .join("InstantLocalStream")
+            .join("Instant-Local-Stream")
             .join(format!(
                 "run-{}-{}",
                 std::process::id(),
@@ -61,7 +61,7 @@ pub fn prepare_ffmpeg() -> Result<PreparedFfmpeg> {
 }
 
 fn cleanup_stale_runtime_dirs() {
-    let root = std::env::temp_dir().join("InstantLocalStream");
+    let root = std::env::temp_dir().join("Instant-Local-Stream");
     let Ok(entries) = fs::read_dir(&root) else {
         return;
     };

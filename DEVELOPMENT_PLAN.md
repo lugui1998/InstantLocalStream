@@ -1,10 +1,10 @@
-# InstantLocalStream Development Plan
+# Instant Local Stream Development Plan
 
 Status: VP8/VP9/H.264 video baseline, Vue/Vite static viewer, Socket.IO-compatible control sessions, native audio capture, and Opus/WebRTC integration are implemented. The initial adaptive implementation uses a one-to-four-slot encoder budget: only the primary encoder begins running; later groups are created on bootstrap/degradation, merged when near-identical, and drained after becoming unused. All four lightweight slots exist so a live switch between Manual and Auto changes the active budget immediately. A paced raw capture source fans out its newest frame to encoder-only variants. When a live source, resolution, or frame-rate change alters that raw format, the host rebuilds active encoder tracks and asks connected viewers to renegotiate. Replacement encoders must produce their first encoded frame before profile state is committed, and a failed source/profile switch restores the previous capture and group graph. The raw bus always uses one exact output canvas: if a capture backend reports a client area whose aspect differs from the selected window bounds, FFmpeg preserves the source aspect and pads that canvas rather than emitting variable-size YUV frames. On Windows, selected application windows prefer continuous Windows Graphics Capture. A 750 ms first-frame watchdog automatically switches to the same XCap/PrintWindow path used by source previews when WGC is silent, and status exposes the active capture backend. Window selection retains the native HWND for the running UI session rather than trusting a transient enumeration index, so preview refreshes and window-order changes cannot retarget capture. HWNDs are not written to preferences or accepted through the headless CLI because Windows may recycle them. The control server starts on a neutral local test source and still requires an explicit card selection. Stream start is acknowledged only after the host successfully applies the selected source and replacement encoder; the UI no longer reports Running optimistically. A selected window remains in the UI while minimized even if XCap temporarily omits it. An active capture tries a low-rate PrintWindow refresh while WGC is paused and otherwise republishes the last valid frame; starting a new capture is disabled until the window is restored because Windows reports a collapsed, non-content surface while it is minimized. Closing the target raises a capture error through the WGC Closed event instead of replaying the final frame indefinitely. If mouse capture is enabled, the cursor is included only while the OS hit-test says it belongs to the captured window; an occluding window under the pointer suppresses it. A new capture must produce a frame before the switch is committed; failures restore the previous source and viewer tracks. The native source UI warms window thumbnails on its background worker before the Windows tab is selected, and Start Stream remains disabled until an explicit valid source selection exists. The audio graph keeps stable WebRTC tracks and dynamically reopens system/window loopback when audio mode, exclusions, or selected HWND changes. VPx lookahead and alternate-reference buffering are disabled, FFmpeg output is flushed, and encoded access units older than 250 ms are discarded instead of being paced to viewers. Each viewer now receives explicit RTP timestamps; the host retains a bounded per-viewer RTP-to-capture-time map, and the browser correlates `requestVideoFrameCallback()` metadata for the exact frame submitted to the compositor. The displayed capture-to-display value includes the whole host, network, receiver, decoder, and compositor path and shows clock-sync uncertainty; a clearly labeled estimate remains only as fallback. The viewer performs a visible, same-origin streaming bootstrap probe (up to 1 MiB or five seconds), reports a rolling 15-second playback window, and shows the selected codec plus group codec. Automatic codec policy uses VP8 as the validated cross-browser baseline; VP9 and H.264 remain explicit options until first-frame interoperability is proven. A client that receives no video RTP after negotiation now reports codec failure after two bounded checks and requests reassignment instead of waiting forever. Fixed H.264 uses constrained baseline, one slice per picture, and a bounded ordered NAL queue, but its browser packetization path remains under investigation. AV1 remains the next codec milestone.
 
 ## 1. Product definition
 
-InstantLocalStream will let a person capture a monitor or application window, encode it with FFmpeg, and share it through a browser. The host application will run a local HTTP server and a WebRTC media endpoint. Viewers will open a URL in a modern browser.
+Instant Local Stream will let a person capture a monitor or application window, encode it with FFmpeg, and share it through a browser. The host application will run a local HTTP server and a WebRTC media endpoint. Viewers will open a URL in a modern browser.
 
 The first release will target Windows and Linux. Each platform may use a different capture backend and build artifact, while the Rust application core remains shared.
 
@@ -179,12 +179,12 @@ The CLI will provide a second interface to the same application services. It wil
 The provisional command set is:
 
 ```text
-instantlocalstream gui
-instantlocalstream start
-instantlocalstream list-sources
-instantlocalstream status
-instantlocalstream validate
-instantlocalstream version
+instant-local-stream gui
+instant-local-stream start
+instant-local-stream list-sources
+instant-local-stream status
+instant-local-stream validate
+instant-local-stream version
 ```
 
 The application can launch the UI when the user runs it without a subcommand. The project should decide this default during Phase 0.
@@ -208,11 +208,10 @@ The `start` command should support options for:
 Example automation command:
 
 ```text
-instantlocalstream start \
+instant-local-stream start \
   --source monitor:0 \
   --bind lan \
-  --http-port 8080 \
-  --media-ports 40000 \
+  --port 8475 \
   --codec vp8 \
   --width 1920 \
   --height 1080 \
@@ -299,7 +298,7 @@ The project should document the supported desktop environments instead of promis
 
 Implementation status: audio configuration, default exclusions, flexaudio-backed native capture, Opus encoding, WebRTC negotiation, browser playback, and audio status reporting are implemented. Full process exclusion validation and live audio reconfiguration remain follow-up validation work.
 
-Audio is disabled by default. The native UI should expose source-specific controls:
+Audio is enabled by default for monitor sources. The native UI should expose source-specific controls:
 
 - For a selected monitor: `Capture system audio`.
 - For a selected window: `Capture window audio`.
@@ -374,7 +373,7 @@ The configuration model should distinguish the requested policy from the effecti
 - Maximum adaptive quality groups: `Auto` or a fixed integer greater than or equal to one.
 - Latency preference and host resource budget.
 
-Automatic bitrate should begin with a codec-, resolution-, frame-rate-, and content-aware recommendation, then adapt from measured encoder and viewer conditions. It is a starting target, not a guarantee of available network capacity. The current readable-screen floor is 14 Mbps for 1080p at 30 or 60 FPS; lower groups may be reduced only after sustained credible congestion.
+Automatic bitrate should begin with a codec-, resolution-, frame-rate-, and content-aware recommendation, then adapt from measured encoder and viewer conditions. It is a starting target, not a guarantee of available network capacity. The readable-screen baseline is 14 Mbps for 1080p at 30 FPS. Instant Local Stream raises the initial target for higher resolutions and frame rates; lower groups may be reduced only after sustained credible congestion.
 
 Adaptive decisions should sample metrics continuously but change settings over smoothed multi-second windows. Downshifts should happen faster than upshifts, and every change should have a cooldown and hysteresis threshold to avoid oscillation.
 
@@ -531,7 +530,7 @@ The browser can provide WebRTC statistics through `RTCPeerConnection.getStats()`
 
 Viewer statistics should be reported over the existing Socket.IO-compatible control session at a bounded interval. The host should combine browser-reported inbound statistics with server-side RTP/RTCP statistics and per-viewer queue drops. Missing browser fields must not be treated as failures; the controller should use the signals available for that browser.
 
-The browser now reports one-second media-path samples: observed inbound bitrate, candidate-pair RTT, packet loss, jitter, optional available incoming bitrate, rendered-video dropped frames, freeze count, average jitter-buffer delay, average decode time, and page visibility. Before the first WebRTC offer it also runs one fresh, same-origin streaming HTTP probe with `Cache-Control: no-store`, identity encoding, an incompressible body, a 1 MiB byte cap, and a five-second deadline. The client counts `ReadableStream` chunks as they arrive, reports first-body-byte latency and observed throughput, and surfaces that progress inside the empty video area. This probe is only an initial placement hint because its TCP path can differ from WebRTC UDP media. Both the client display and host controller retain only a rolling 15-second window. Drop and freeze counters are converted to per-sample deltas, so old playback incidents expire naturally. The client labels this interval explicitly and uses `getVideoPlaybackQuality()` when the browser exposes it, falling back to WebRTC inbound stats otherwise. Deadline-based host pacing accounts for encode/packetization time rather than sleeping an additional whole frame duration, preventing a slowly accumulating source-side latency debt. VPx lookahead and alternate-reference frames are disabled, encoder packets are flushed, and any output whose submitted source frame is older than 250 ms is discarded without pacing. If encoded frames remain at least 750 ms behind for eight consecutive outputs, the affected encoder is restarted against the latest shared source frame; this clears FFmpeg-internal backlog that output dropping alone cannot remove, and the recovery count is exposed in status. Catch-up starts at 100 ms of current playout-buffer delay and increases playback speed more aggressively at larger delays. The status correlates a rendered frame's RTP timestamp to the host capture timestamp and reports capture-to-display delay directly, with capture-to-receive and receiver-to-display components plus clock uncertainty. The sender-timeline/jitter/decode calculation is retained only as a labeled fallback and no longer adds half RTT a second time. Assigned and group bitrates are explicitly labeled encoder targets, while measured receive bitrate is observed RTP traffic and may be lower for simple content. Automatic bitrate now uses codec-aware pixels-per-frame-rate targets plus a readable-screen floor of at least 14 Mbps for 1080p at 30 or 60 FPS, rather than the prior roughly 3.7 Mbps target. The controller gives a new assignment 30 seconds to settle and lowers a healthy group after corroborated transport congestion, repeated freezes, or an extreme 15-second dropped-frame count; ordinary drops are diagnostics and only defer an upgrade. The control-session RTT is useful for control-path health, but it must not be used as a substitute for WebRTC media capacity. When the browser exposes `availableIncomingBitrate`, read it only from the selected/nominated candidate pair and reject values that contradict observed delivery; otherwise react to sustained delivered-bitrate, loss, jitter, and capacity evidence.
+The browser now reports one-second media-path samples: observed inbound bitrate, candidate-pair RTT, packet loss, jitter, optional available incoming bitrate, rendered-video dropped frames, freeze count, average jitter-buffer delay, average decode time, and page visibility. Before the first WebRTC offer it also runs one fresh, same-origin streaming HTTP probe with `Cache-Control: no-store`, identity encoding, an incompressible body, a 1 MiB byte cap, and a five-second deadline. The client counts `ReadableStream` chunks as they arrive, reports first-body-byte latency and observed throughput, and surfaces that progress inside the empty video area. This probe is only an initial placement hint because its TCP path can differ from WebRTC UDP media. Both the client display and host controller retain only a rolling 15-second window. Drop and freeze counters are converted to per-sample deltas, so old playback incidents expire naturally. The client labels this interval explicitly and uses `getVideoPlaybackQuality()` when the browser exposes it, falling back to WebRTC inbound stats otherwise. Deadline-based host pacing accounts for encode/packetization time rather than sleeping an additional whole frame duration, preventing a slowly accumulating source-side latency debt. VPx lookahead and alternate-reference frames are disabled, encoder packets are flushed, and any output whose submitted source frame is older than 250 ms is discarded without pacing. If encoded frames remain at least 750 ms behind for eight consecutive outputs, the affected encoder is restarted against the latest shared source frame; this clears FFmpeg-internal backlog that output dropping alone cannot remove, and the recovery count is exposed in status. Catch-up starts at 100 ms of current playout-buffer delay and increases playback speed more aggressively at larger delays. The status correlates a rendered frame's RTP timestamp to the host capture timestamp and reports capture-to-display delay directly, with capture-to-receive and receiver-to-display components plus clock uncertainty. The sender-timeline/jitter/decode calculation is retained only as a labeled fallback and no longer adds half RTT a second time. Assigned and group bitrates are explicitly labeled encoder targets, while measured receive bitrate is observed RTP traffic and may be lower for simple content. Automatic bitrate uses a 14 Mbps VP8 baseline at 1080p30 and scales with pixel throughput, codec efficiency, latency preference, and content. A quality floor also rises above 1080p30 so efficient codecs receive more bandwidth at higher resolutions or frame rates. The controller gives a new assignment 30 seconds to settle and lowers a healthy group after corroborated transport congestion, repeated freezes, or an extreme 15-second dropped-frame count; ordinary drops are diagnostics and only defer an upgrade. The control-session RTT is useful for control-path health, but it must not be used as a substitute for WebRTC media capacity. When the browser exposes `availableIncomingBitrate`, read it only from the selected/nominated candidate pair and reject values that contradict observed delivery; otherwise react to sustained delivered-bitrate, loss, jitter, and capacity evidence.
 
 The client renders the per-sample dropped-frame deltas from that 15-second window as a compact time-series chart. This makes recent bursts visible while naturally removing incidents that have aged out.
 
@@ -572,7 +571,7 @@ The first release should show a warning when the user enables internet sharing a
 
 ### Localhost mode
 
-Bind the HTTP server and WebRTC media to loopback. This mode should require no router changes and should start by default.
+Bind the HTTP server and WebRTC media to loopback. This mode requires no router changes and remains available as an explicit privacy-focused option.
 
 ### LAN mode
 
@@ -604,8 +603,8 @@ The application can add STUN configuration later to discover server-reflexive ca
 The UI should separate address discovery from connectivity verification. Public-IP discovery is an internal implementation detail: the application queries its fixed primary/fallback services automatically, but it should not expose those service URLs or provide copy/refresh controls for them. The UI may still show the generated viewer URL; manual advertised-host override remains a CLI-only escape hatch.
 
 ```text
-Local URL:   [http://192.168.1.20:8080/Ab12Cd34Ef56] [Copy]
-Public URL:  [http://203.0.113.10:8080/Ab12Cd34Ef56]  [Copy]
+Local URL:   [http://192.168.1.20:8475/Ab12Cd34Ef56] [Copy]
+Public URL:  [http://203.0.113.10:8475/Ab12Cd34Ef56]  [Copy]
              [Test instructions]
 ```
 
@@ -631,8 +630,8 @@ An external IP lookup cannot prove that port forwarding works. If the ISP uses C
 
 The release pipeline should produce:
 
-- `InstantLocalStream-windows-x86_64.exe`
-- `InstantLocalStream-linux-x86_64.AppImage`
+- `Instant-Local-Stream-windows-x86_64.zip` (contains the portable `.exe` and license files)
+- `Instant-Local-Stream-linux-x86_64.AppImage`
 
 The project can add ARM builds after the x86-64 paths work.
 
@@ -653,7 +652,7 @@ The host can serve the viewer assets from memory. It should extract FFmpeg only 
 The runtime should create a unique application-owned directory under the operating system temporary path:
 
 ```text
-<temp>/InstantLocalStream/<random-run-id>/
+<temp>/Instant-Local-Stream/<random-run-id>/
 ```
 
 The directory should contain a manifest with the application version and embedded asset hashes. The application should use restrictive permissions where the platform supports them and should never build paths from viewer input.
