@@ -55,7 +55,6 @@ The link contains a private 12-character access token. Anyone with the link can 
 - Support for multiple viewers through one UDP port
 - Built-in test pattern for connection checks
 
-Audio starts enabled for monitor sources. You can change the audio source or disable it from the host window before starting the stream.
 
 ## Build from source
 
