@@ -14,6 +14,9 @@ concurrency:
 
 env:
   RUST_VERSION: 1.95.0
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
+  FFMPEG_ARCHIVE: ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-8.1.zip
+  FFMPEG_SHA256: cc4156d51387566ea8ba653fc3a04897bdf812fddf652428d9030bbf7ae24835
 
 jobs:
   web:
@@ -47,8 +50,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  quality:
-    name: Quality and Windows tests
+  windows:
+    name: Windows build
     needs: web
     runs-on: windows-2022
     timeout-minutes: 30
@@ -70,6 +73,28 @@ jobs:
           rustup toolchain install $env:RUST_VERSION --profile minimal --component clippy --component rustfmt
           rustup default $env:RUST_VERSION
 
+      - name: Set up test FFmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $download = Join-Path $env:RUNNER_TEMP "ffmpeg-download"
+          $extracted = Join-Path $env:RUNNER_TEMP "ffmpeg-extracted"
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          gh release download $env:FFMPEG_RELEASE --repo BtbN/FFmpeg-Builds --pattern $env:FFMPEG_ARCHIVE --dir $download
+          $archive = Join-Path $download $env:FFMPEG_ARCHIVE
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:FFMPEG_SHA256) {
+            throw "FFmpeg checksum mismatch: expected $env:FFMPEG_SHA256, got $actual"
+          }
+          Expand-Archive $archive -DestinationPath $extracted
+          $ffmpeg = Get-ChildItem $extracted -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          if (-not $ffmpeg) {
+            throw "ffmpeg.exe was not found in $env:FFMPEG_ARCHIVE"
+          }
+          $ffmpeg.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Check and test Rust
         shell: pwsh
         run: |
@@ -79,7 +104,7 @@ jobs:
           cargo test --locked
 
   linux:
-    name: Linux compatibility
+    name: Linux build
     needs: web
     runs-on: ubuntu-24.04
     timeout-minutes: 30

@@ -4666,7 +4666,24 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(run_with_control(bootstrap, shutdown_rx, control_rx));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let mut server = tokio::spawn(run_with_control_readiness(
+            bootstrap,
+            shutdown_rx,
+            control_rx,
+            Some(ready_tx),
+            None,
+        ));
+        match tokio::time::timeout(Duration::from_secs(10), ready_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let result = (&mut server)
+                    .await
+                    .expect("server task panicked before readiness");
+                panic!("server failed before readiness: {result:?}");
+            }
+            Err(_) => panic!("server readiness timed out"),
+        }
         let (initial_snapshot_tx, initial_snapshot_rx) = std::sync::mpsc::sync_channel(1);
         control_tx
             .send(ServerCommand::PreviewSnapshot {
