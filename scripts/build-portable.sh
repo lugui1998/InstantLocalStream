@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 /path/to/ffmpeg /path/to/ffmpeg-license" >&2
+if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && ${3:-} != "--use-prebuilt-web" ) ]]; then
+  echo "usage: $0 /path/to/ffmpeg /path/to/ffmpeg-license [--use-prebuilt-web]" >&2
   exit 2
 fi
 
@@ -22,7 +22,18 @@ if ! grep -Eq "not a dynamic executable|statically linked" <<<"$ldd_output"; the
   echo "Linux portable builds require a statically linked FFmpeg executable" >&2
   exit 1
 fi
-bash "$(dirname "$0")/build-web.sh"
+if [[ "${3:-}" == "--use-prebuilt-web" ]]; then
+  if [[ ! -s web/dist/index.html ]]; then
+    echo "Prebuilt viewer is missing: $(pwd)/web/dist/index.html" >&2
+    exit 1
+  fi
+  if ! find web/dist/assets -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+    echo "Prebuilt viewer assets are missing: $(pwd)/web/dist/assets" >&2
+    exit 1
+  fi
+else
+  bash "$(dirname "$0")/build-web.sh"
+fi
 cargo build --release --locked
 mkdir -p dist
 cp target/release/instant-local-stream dist/Instant-Local-Stream

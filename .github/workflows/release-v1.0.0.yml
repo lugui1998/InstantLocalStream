@@ -147,7 +147,7 @@ jobs:
               throw "Required FFmpeg encoder is missing: $encoder"
             }
           }
-          ./scripts/build-portable.ps1 -FfmpegPath $ffmpeg.FullName
+          ./scripts/build-portable.ps1 -FfmpegPath $ffmpeg.FullName -UsePrebuiltWeb
           Move-Item dist/Instant-Local-Stream.exe dist/Instant-Local-Stream-windows-x86_64.exe
           Copy-Item $ffmpegLicense.FullName dist/FFMPEG-LICENSE-windows-x86_64.txt
           @(
@@ -284,7 +284,7 @@ jobs:
           for encoder in libvpx libvpx-vp9 libx264; do
             grep -Eq "[[:space:]]${encoder}[[:space:]]" <<<"$encoders"
           done
-          bash scripts/build-portable.sh "$ffmpeg_path" "$ffmpeg_license"
+          bash scripts/build-portable.sh "$ffmpeg_path" "$ffmpeg_license" --use-prebuilt-web
           test -s dist/Instant-Local-Stream-linux-x86_64.AppImage
           cp "$ffmpeg_license" dist/FFMPEG-LICENSE-linux-x86_64.txt
           {
@@ -362,32 +362,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir release windows-package
-          cp release-windows/Instant-Local-Stream-windows-x86_64.exe windows-package/Instant-Local-Stream.exe
-          cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt windows-package/
-          cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt windows-package/FFMPEG-LICENSE.txt
-          cp THIRD_PARTY_NOTICES.md windows-package/THIRD_PARTY_NOTICES.md
-          cp packaging/THIRD_PARTY_LICENSES-RUST.txt windows-package/THIRD_PARTY_LICENSES-RUST.txt
-          cp packaging/THIRD_PARTY_LICENSES-NPM.txt windows-package/THIRD_PARTY_LICENSES-NPM.txt
-          cp packaging/FFMPEG_SOURCE_OFFER.md windows-package/FFMPEG_SOURCE_OFFER.md
-          cp LICENSE windows-package/LICENSE
-          (
-            cd windows-package
-            zip -9 -r ../release/Instant-Local-Stream-windows-x86_64.zip .
-          )
-          expected_windows_files=(
-            FFMPEG-LICENSE.txt
-            FFMPEG_SOURCE_OFFER.md
-            Instant-Local-Stream-windows-x86_64.ffmpeg.txt
-            Instant-Local-Stream.exe
-            LICENSE
-            THIRD_PARTY_LICENSES-NPM.txt
-            THIRD_PARTY_LICENSES-RUST.txt
-            THIRD_PARTY_NOTICES.md
-          )
-          for expected in "${expected_windows_files[@]}"; do
-            unzip -Z1 release/Instant-Local-Stream-windows-x86_64.zip | grep -Fxq "$expected"
-          done
+          mkdir release
+          cp release-windows/Instant-Local-Stream-windows-x86_64.exe release/
           cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt release/
           cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt release/
           cp release-linux/Instant-Local-Stream-linux-x86_64.AppImage release/
@@ -402,7 +378,7 @@ jobs:
           cp web/package-lock.json release/web-package-lock.json
           cd release
           sha256sum \
-            Instant-Local-Stream-windows-x86_64.zip \
+            Instant-Local-Stream-windows-x86_64.exe \
             Instant-Local-Stream-linux-x86_64.AppImage \
             Instant-Local-Stream-windows-x86_64.ffmpeg.txt \
             Instant-Local-Stream-linux-x86_64.ffmpeg.txt \
@@ -424,7 +400,7 @@ jobs:
         run: |
           set -euo pipefail
           release_files=(
-            release/Instant-Local-Stream-windows-x86_64.zip
+            release/Instant-Local-Stream-windows-x86_64.exe
             release/Instant-Local-Stream-linux-x86_64.AppImage
             release/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
             release/Instant-Local-Stream-linux-x86_64.ffmpeg.txt

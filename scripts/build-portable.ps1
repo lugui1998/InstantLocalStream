@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$FfmpegPath
+    [string]$FfmpegPath,
+    [switch]$UsePrebuiltWeb
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +20,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 $env:ILS_FFMPEG_PATH = $resolvedFfmpeg
 
-& (Join-Path $PSScriptRoot "build-web.ps1")
+if ($UsePrebuiltWeb) {
+    $webIndex = Join-Path (Get-Location) "web\dist\index.html"
+    $webAssets = Join-Path (Get-Location) "web\dist\assets"
+    if (-not (Test-Path -LiteralPath $webIndex -PathType Leaf)) {
+        throw "Prebuilt viewer is missing: $webIndex"
+    }
+    if (-not (Get-ChildItem -LiteralPath $webAssets -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        throw "Prebuilt viewer assets are missing: $webAssets"
+    }
+} else {
+    & (Join-Path $PSScriptRoot "build-web.ps1")
+}
 cargo build --release --locked
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE"

@@ -8,9 +8,9 @@ Available for Windows x86-64 and Linux x86-64.
 
 ### Windows
 
-[Download `Instant-Local-Stream-windows-x86_64.zip`](https://github.com/lugui1998/InstantLocalStream/releases/latest/download/Instant-Local-Stream-windows-x86_64.zip)
+[Download `Instant-Local-Stream-windows-x86_64.exe`](https://github.com/lugui1998/InstantLocalStream/releases/latest/download/Instant-Local-Stream-windows-x86_64.exe)
 
-Extract the ZIP and open `Instant-Local-Stream.exe`. Windows SmartScreen may warn because the application does not have a code-signing certificate.
+Open the downloaded executable. Windows SmartScreen may warn because the application does not have a code-signing certificate.
 
 ### Linux
 

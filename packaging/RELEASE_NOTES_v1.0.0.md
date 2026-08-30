@@ -19,7 +19,7 @@ for sharing a monitor or application window to modern browsers over WebRTC.
 
 ## Downloads
 
-- Windows: `Instant-Local-Stream-windows-x86_64.zip`
+- Windows: `Instant-Local-Stream-windows-x86_64.exe`
 - Linux: `Instant-Local-Stream-linux-x86_64.AppImage`
 
 Both applications include the pinned FFmpeg build used by the release. Verify

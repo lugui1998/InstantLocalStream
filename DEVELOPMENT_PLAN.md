@@ -630,8 +630,10 @@ An external IP lookup cannot prove that port forwarding works. If the ISP uses C
 
 The release pipeline should produce:
 
-- `Instant-Local-Stream-windows-x86_64.zip` (contains the portable `.exe` and license files)
+- `Instant-Local-Stream-windows-x86_64.exe`
 - `Instant-Local-Stream-linux-x86_64.AppImage`
+
+The release publishes license and provenance files as separate assets.
 
 The project can add ARM builds after the x86-64 paths work.
 
