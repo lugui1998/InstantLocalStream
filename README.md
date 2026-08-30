@@ -25,15 +25,6 @@ chmod +x Instant-Local-Stream-linux-x86_64.AppImage
 
 Linux screen capture uses X11. Wayland support depends on your desktop, portal, and capture permissions.
 
-## Sharing outside your computer
-
-**Public** is the default sharing mode. To make the viewer link reachable from the internet, configure your router to forward the selected port to the host computer for both **TCP and UDP**, and allow that port through the host firewall. The default port is `8475` unless you change it in the app.
-
-If your internet connection uses carrier-grade NAT (CGNAT), ordinary router port forwarding may not be available; ask your ISP for a public address or use a suitable tunnel or reverse-proxy setup.
-
-Public viewer links use HTTP and contain a private bearer token. Use a trusted network or place the host behind a secure reverse proxy, and do not publish the token link. Choose **LAN** for devices on the same network or **Local** to limit access to the host computer.
-
-The host accepts eight viewers by default. Your upload speed, selected resolution, and computer performance determine how many viewers it can serve.
 
 ## How it works
 
@@ -43,6 +34,10 @@ The host accepts eight viewers by default. Your upload speed, selected resolutio
 4. Copy the link and open it on another device.
 
 The link contains a private 12-character access token. Anyone with the link can watch the stream, so share it with care.
+
+## Sharing public stream
+
+**Public** is the default sharing mode. To make the viewer link reachable from the internet, configure your router to forward the selected port to the host computer for both **TCP and UDP**, and allow that port through the host firewall. The default port is `8475` unless you change it in the app.
 
 ## Features
 
