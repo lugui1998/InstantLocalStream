@@ -42,11 +42,12 @@ fn main() {
 
 fn run() -> Result<()> {
     if std::env::args_os().nth(1).is_none() {
-        cli::init_logging(false);
+        cli::init_logging(false, true);
         return ui::run(AppConfig::from_cli(None)?);
     }
     let cli = Cli::parse();
-    cli::init_logging(cli.json);
+    let gui_mode = cli.ui || matches!(&cli.command, None | Some(Command::Gui));
+    cli::init_logging(cli.json, gui_mode);
     let json_output = cli.json;
     let open_ui = cli.ui;
 

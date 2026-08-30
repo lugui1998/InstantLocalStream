@@ -65,6 +65,7 @@ pub enum ServerCommand {
     FinalizeStop,
     Update(CaptureSettings),
     UpdateMaxViewers(usize),
+    UpdateMediaCandidateHost(String),
     PreviewSnapshot {
         result: std::sync::mpsc::SyncSender<Option<CapturePreviewSnapshot>>,
     },
@@ -80,7 +81,6 @@ pub enum ServerCommand {
     },
     #[cfg(windows)]
     RetryWindowCapture {
-        settings: CaptureSettings,
         previous_dimensions: (u32, u32),
         stop_request_revision: u64,
         attempt: usize,
@@ -99,6 +99,8 @@ const WINDOW_RESIZE_FRAME_GRACE: Duration = Duration::from_millis(40);
 const WINDOW_RESIZE_RESTART_ATTEMPTS: usize = 3;
 #[cfg(windows)]
 const WINDOW_RESIZE_RETRY_DELAY: Duration = Duration::from_millis(150);
+#[cfg(windows)]
+const WINDOW_RESIZE_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(2);
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -2194,6 +2196,17 @@ pub async fn run_with_control_readiness(
                         .store(max_viewers.max(1), Ordering::Release);
                     broadcast_status(&control_state);
                 }
+                ServerCommand::UpdateMediaCandidateHost(host) => {
+                    match update_media_candidate(&control_state, &host).await {
+                        Ok(candidate_addr) => {
+                            info!(%candidate_addr, "updated WebRTC media candidate");
+                            broadcast_status(&control_state);
+                        }
+                        Err(error) => {
+                            warn!(%error, %host, "could not resolve WebRTC media candidate host");
+                        }
+                    }
+                }
                 ServerCommand::PreviewSnapshot { result } => {
                     let settings = control_state
                         .settings
@@ -2350,11 +2363,19 @@ pub async fn run_with_control_readiness(
                 }
                 #[cfg(windows)]
                 ServerCommand::RetryWindowCapture {
-                    settings,
                     previous_dimensions,
                     stop_request_revision,
                     attempt,
                 } => {
+                    let settings = match control_state.settings.lock() {
+                        Ok(settings) => settings.clone(),
+                        Err(_) => {
+                            warn!(
+                                "could not retry resized capture: capture settings lock poisoned"
+                            );
+                            continue;
+                        }
+                    };
                     execute_window_capture_restart_attempt(
                         &control_state,
                         &ffmpeg.command,
@@ -2736,33 +2757,46 @@ async fn execute_window_capture_restart_attempt(
     if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
         return;
     }
-    if attempt < WINDOW_RESIZE_RESTART_ATTEMPTS {
+    // The first few attempts cover the normal compositor transition.  Do not
+    // turn their exhaustion into a permanently stopped stream, though: both
+    // the resize observer and the health observer intentionally stand down
+    // while this internal Stop -> Start is in progress.  A delayed explicit
+    // retry is therefore the only component that can recover after Windows
+    // makes the capture item available again.
+    let delay = window_resize_retry_delay(attempt);
+    if attempt <= WINDOW_RESIZE_RESTART_ATTEMPTS || attempt % 10 == 0 {
         warn!(
             attempt,
-            max_attempts = WINDOW_RESIZE_RESTART_ATTEMPTS,
+            quick_attempts = WINDOW_RESIZE_RESTART_ATTEMPTS,
+            retry_delay_ms = delay.as_millis(),
             %error,
-            "fresh window capture did not start after resize; scheduling retry"
+            "fresh window capture did not start after resize; keeping the reset alive"
         );
-        let retry_tx = retry_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(WINDOW_RESIZE_RETRY_DELAY * attempt as u32).await;
-            let _ = retry_tx.send(ServerCommand::RetryWindowCapture {
-                settings,
-                previous_dimensions,
-                stop_request_revision,
-                attempt: attempt + 1,
-            });
-        });
-        return;
+    } else {
+        info!(
+            attempt,
+            retry_delay_ms = delay.as_millis(),
+            %error,
+            "resized window capture is still unavailable; retrying"
+        );
     }
+    let retry_tx = retry_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = retry_tx.send(ServerCommand::RetryWindowCapture {
+            previous_dimensions,
+            stop_request_revision,
+            attempt: attempt.saturating_add(1),
+        });
+    });
+}
 
-    state.stream_resetting.store(false, Ordering::Release);
-    broadcast_status(state);
-    warn!(%error, "window resize failed after rebuilding the complete media graph");
-    if let Some(callback) = &state.stream_failure_callback {
-        callback(format!(
-            "stream stopped because the resized window could not start a fresh capture: {error}"
-        ));
+#[cfg(windows)]
+fn window_resize_retry_delay(attempt: usize) -> Duration {
+    if attempt < WINDOW_RESIZE_RESTART_ATTEMPTS {
+        WINDOW_RESIZE_RETRY_DELAY * attempt as u32
+    } else {
+        WINDOW_RESIZE_RECOVERY_RETRY_DELAY
     }
 }
 
@@ -3327,6 +3361,23 @@ async fn connection_probe(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn resolve_media_candidate(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve media candidate host '{host}'"))?
+        .find(std::net::SocketAddr::is_ipv4)
+        .with_context(|| format!("media candidate host '{host}' has no IPv4 address"))
+}
+
+async fn update_media_candidate(state: &ServerState, host: &str) -> Result<std::net::SocketAddr> {
+    let candidate_addr = resolve_media_candidate(host, state.config.media_ports.first).await?;
+    state.udp_mux.set_candidate_addr(candidate_addr)?;
+    Ok(candidate_addr)
+}
+
 fn network_probe_payload() -> Bytes {
     const PROBE_BYTES: usize = 1024 * 1024;
     static PAYLOAD: OnceLock<Bytes> = OnceLock::new();
@@ -3377,6 +3428,7 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "bind": state.config.bind,
         "http_port": state.config.http_port,
         "media_port": state.config.media_ports.first,
+        "media_candidate": state.udp_mux.candidate_addr().ok().map(|address| address.to_string()),
         "codec": codec,
         "media_error": capture_error.clone().or_else(|| primary_media.as_ref().and_then(|media| media.failure())),
         "capture_error": capture_error,
@@ -4191,6 +4243,18 @@ mod tests {
         assert_eq!(stopped["stream_resetting"], false);
     }
 
+    #[tokio::test]
+    async fn explicit_public_ip_becomes_the_media_candidate() {
+        let state = test_state();
+        let candidate = update_media_candidate(&state, "203.0.113.7").await.unwrap();
+
+        assert_eq!(
+            candidate,
+            "203.0.113.7:40000".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(state.udp_mux.candidate_addr().unwrap(), candidate);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ui_bootstrap_can_switch_to_an_explicit_test_pattern() {
         let mut bootstrap = AppConfig::default();
@@ -4615,6 +4679,21 @@ mod tests {
                 start + WINDOW_RESIZE_SAFETY_SETTLE_TIME + Duration::from_millis(200)
             ),
             Some((1000, 700))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_resize_retries_switch_from_quick_attempts_to_persistent_recovery() {
+        assert_eq!(window_resize_retry_delay(1), WINDOW_RESIZE_RETRY_DELAY);
+        assert_eq!(window_resize_retry_delay(2), WINDOW_RESIZE_RETRY_DELAY * 2);
+        assert_eq!(
+            window_resize_retry_delay(WINDOW_RESIZE_RESTART_ATTEMPTS),
+            WINDOW_RESIZE_RECOVERY_RETRY_DELAY
+        );
+        assert_eq!(
+            window_resize_retry_delay(WINDOW_RESIZE_RESTART_ATTEMPTS + 100),
+            WINDOW_RESIZE_RECOVERY_RETRY_DELAY
         );
     }
 

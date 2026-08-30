@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::io::IoSliceMut;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -30,7 +30,7 @@ struct Route {
 
 pub struct UdpMux {
     socket: Arc<UdpSocket>,
-    candidate_addr: SocketAddr,
+    candidate_addr: RwLock<SocketAddr>,
     routes: Mutex<HashMap<Uuid, Arc<Route>>>,
     by_remote_ufrag: Mutex<HashMap<String, Uuid>>,
     by_remote_addr: Mutex<HashMap<SocketAddr, Uuid>>,
@@ -56,7 +56,7 @@ impl fmt::Debug for UdpMuxEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UdpMuxEndpoint")
             .field("connection_id", &self.connection_id)
-            .field("candidate_addr", &self.mux.candidate_addr)
+            .field("candidate_addr", &self.mux.candidate_addr().ok())
             .finish()
     }
 }
@@ -69,7 +69,7 @@ impl UdpMux {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let mux = Arc::new(Self {
             socket,
-            candidate_addr,
+            candidate_addr: RwLock::new(candidate_addr),
             routes: Mutex::new(HashMap::new()),
             by_remote_ufrag: Mutex::new(HashMap::new()),
             by_remote_addr: Mutex::new(HashMap::new()),
@@ -81,6 +81,22 @@ impl UdpMux {
             UdpMux::receive_loop(receiver, socket, shutdown_rx).await;
         });
         Ok(mux)
+    }
+
+    pub fn candidate_addr(&self) -> io::Result<SocketAddr> {
+        self.candidate_addr
+            .read()
+            .map(|address| *address)
+            .map_err(|_| io::Error::other("media candidate address lock poisoned"))
+    }
+
+    pub fn set_candidate_addr(&self, candidate_addr: SocketAddr) -> io::Result<()> {
+        let mut address = self
+            .candidate_addr
+            .write()
+            .map_err(|_| io::Error::other("media candidate address lock poisoned"))?;
+        *address = candidate_addr;
+        Ok(())
     }
 
     pub fn endpoint(
@@ -221,7 +237,7 @@ impl Drop for UdpMux {
 
 impl AsyncUdpSocket for UdpMuxEndpoint {
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.mux.candidate_addr)
+        self.mux.candidate_addr()
     }
 
     fn poll_send(&self, cx: &mut Context<'_>, transmit: &Transmit<'_>) -> Poll<io::Result<usize>> {
@@ -341,5 +357,18 @@ mod tests {
         drop(mux);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(std::net::UdpSocket::bind(("127.0.0.1", bound_port)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn new_endpoints_use_the_updated_public_candidate() {
+        let bind_address = "127.0.0.1:0".parse().unwrap();
+        let initial_candidate = "192.168.1.10:8475".parse().unwrap();
+        let public_candidate = "203.0.113.7:8475".parse().unwrap();
+        let mux = UdpMux::bind(bind_address, initial_candidate).unwrap();
+
+        mux.set_candidate_addr(public_candidate).unwrap();
+        let endpoint = mux.endpoint(Uuid::new_v4(), "viewer".to_owned());
+
+        assert_eq!(endpoint.local_addr().unwrap(), public_candidate);
     }
 }

@@ -63,9 +63,18 @@ pub struct ValidateArgs {
     pub config: ConfigArgs,
 }
 
-pub fn init_logging(json_output: bool) {
+pub fn init_logging(json_output: bool, gui_mode: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if json_output {
+    if cfg!(windows) && gui_mode && !json_output {
+        // A Windows GUI executable may have no console at all, or it may
+        // outlive the terminal pipe inherited from `cargo run`. The default
+        // tracing stderr writer panics when that pipe is closed. Recovery
+        // warnings must never be able to terminate the host.
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::sink)
+            .try_init();
+    } else if json_output {
         let _ = fmt().with_env_filter(filter).json().try_init();
     } else {
         let _ = fmt().with_env_filter(filter).try_init();

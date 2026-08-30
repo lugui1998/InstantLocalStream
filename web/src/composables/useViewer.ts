@@ -21,21 +21,31 @@ function clientIdentifier() {
   return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
-function waitForIce(peer: RTCPeerConnection) {
+function waitForIce(peer: RTCPeerConnection, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     if (peer.iceGatheringState === 'complete') return resolve()
+    const abort = () => {
+      cleanup()
+      reject(new DOMException('ICE gathering aborted', 'AbortError'))
+    }
     const timeout = window.setTimeout(() => {
-      peer.removeEventListener('icegatheringstatechange', complete)
+      cleanup()
       reject(new Error('ICE gathering timed out'))
     }, 8_000)
+    function cleanup() {
+      window.clearTimeout(timeout)
+      peer.removeEventListener('icegatheringstatechange', complete)
+      signal.removeEventListener('abort', abort)
+    }
     function complete() {
       if (peer.iceGatheringState === 'complete') {
-        window.clearTimeout(timeout)
-        peer.removeEventListener('icegatheringstatechange', complete)
+        cleanup()
         resolve()
       }
     }
     peer.addEventListener('icegatheringstatechange', complete)
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
   })
 }
 
@@ -496,10 +506,21 @@ export function useViewer() {
       if (!videoStream.value) setInactiveStreamMessage()
     })
     socket.on('session.ready', (ready: SessionReady) => {
+      const resumedSignalingSession = initialSessionReady
+      // This snapshot begins a new authoritative signaling session. The host
+      // process may have restarted while this page stayed open, in which case
+      // its settings and media revision counters legitimately start over.
+      // Keeping the old high-water mark would reject every update from the
+      // replacement host and strand the page in its last reset state.
+      authoritativeSettingsRevision = -1
       initialSessionReady = true
       mergeStatus(ready.status)
       if (streamIsRunning()) {
-        resumeAfterStreamStart()
+        if (resumedSignalingSession && initialWebRtcStarted) {
+          restartWebRtcSession('Stream reconnecting')
+        } else {
+          resumeAfterStreamStart()
+        }
       } else {
         setInactiveStreamMessage()
       }
@@ -963,6 +984,8 @@ export function useViewer() {
       ? offerMediaSessionRevision
       : null
     videoFrameRendered = false
+    const controller = new AbortController()
+    negotiationAbortController = controller
     try {
       const videoTransceiver = current.addTransceiver('video', { direction: 'recvonly' })
       const videoReceiver = videoTransceiver.receiver
@@ -999,9 +1022,7 @@ export function useViewer() {
         if (peer === current && ['failed', 'closed'].includes(current.connectionState)) scheduleReconnect(`WebRTC ${current.connectionState}`, true)
       })
       await current.setLocalDescription(await current.createOffer())
-      await waitForIce(current)
-      const controller = new AbortController()
-      negotiationAbortController = controller
+      await waitForIce(current, controller.signal)
       const timeout = window.setTimeout(() => controller.abort(), 8_000)
       let response: Response
       try {
@@ -1024,6 +1045,7 @@ export function useViewer() {
         decodeStartupTimer = window.setTimeout(() => void checkStartupDecodeFailure(current), decodeStartupTimeoutMs)
       }
     } finally {
+      if (negotiationAbortController === controller) negotiationAbortController = null
       negotiating = false
       if (restartRequested) {
         restartRequested = false

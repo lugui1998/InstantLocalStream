@@ -53,6 +53,11 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
     if let Some(saved) = &saved_preferences {
         saved.apply_to(&mut config);
     }
+    // The native UI exposes one share port. Use that same number for the
+    // HTTP/WebSocket listener (TCP) and WebRTC media mux (UDP), so WAN users
+    // need one router rule with both protocols instead of a hidden second port.
+    let viewer_port = config.http_port;
+    configure_shared_port(&mut config, viewer_port);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([DEFAULT_WINDOW_WIDTH, 650.0])
@@ -132,6 +137,7 @@ struct HostUi {
     network_test_error: Option<String>,
     network_test_progress: Option<UploadSpeedTestProgress>,
     last_sent_max_viewers: Option<usize>,
+    last_sent_media_candidate_host: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -429,6 +435,7 @@ impl HostUi {
             network_test_error: None,
             network_test_progress: None,
             last_sent_max_viewers: None,
+            last_sent_media_candidate_host: None,
         };
         // Discover both classes cheaply in the background so tab switches can
         // render cards immediately. Thumbnails are requested separately and
@@ -1375,6 +1382,8 @@ impl HostUi {
             match event {
                 UiEvent::ServerReady => {
                     self.status = HostStatus::Ready;
+                    self.last_sent_media_candidate_host = None;
+                    self.sync_selected_viewer_host();
                 }
                 UiEvent::StreamStarted => {
                     self.status = HostStatus::Running;
@@ -1391,6 +1400,9 @@ impl HostUi {
                 UiEvent::PublicIp(address) => {
                     self.public_ipv4 = Some(address);
                     self.public_ip_error = None;
+                    if self.viewer_url_mode == ViewerUrlMode::Public {
+                        self.sync_selected_viewer_host();
+                    }
                 }
                 UiEvent::PublicIpFailed(_error) => {
                     self.public_ip_error = Some("Public IPv4 lookup failed".to_owned());
@@ -1450,6 +1462,26 @@ impl HostUi {
             ViewerUrlMode::Lan => local_ipv4().map(|address| address.to_string()),
             ViewerUrlMode::Public => self.public_ipv4.clone(),
             ViewerUrlMode::Custom => custom_viewer_host(&self.custom_viewer_host),
+        }
+    }
+
+    fn sync_selected_viewer_host(&mut self) {
+        let Some(host) = self.selected_viewer_host() else {
+            return;
+        };
+        self.config.advertise_host = Some(host.clone());
+        if self.last_sent_media_candidate_host.as_deref() == Some(host.as_str()) {
+            return;
+        }
+        if let Ok(slot) = self.control_slot.lock()
+            && let Some(sender) = slot.as_ref()
+            && sender
+                .send(server::ServerCommand::UpdateMediaCandidateHost(
+                    host.clone(),
+                ))
+                .is_ok()
+        {
+            self.last_sent_media_candidate_host = Some(host);
         }
     }
 
@@ -1722,9 +1754,7 @@ fn initial_viewer_url_state(config: &AppConfig) -> (ViewerUrlMode, String, Optio
     let mode = match configured_host {
         Some(host) if host == "127.0.0.1" => ViewerUrlMode::Local,
         Some(host) if local_host.as_deref() == Some(host) => ViewerUrlMode::Lan,
-        Some(host) if config.bind == "public" && host.parse::<std::net::Ipv4Addr>().is_ok() => {
-            ViewerUrlMode::Public
-        }
+        Some(host) if host.parse::<std::net::Ipv4Addr>().is_ok() => ViewerUrlMode::Public,
         Some(_) => ViewerUrlMode::Custom,
         None => match config.bind.as_str() {
             "localhost" | "loopback" => ViewerUrlMode::Local,
@@ -1771,6 +1801,12 @@ fn server_bootstrap_config(config: &AppConfig) -> AppConfig {
     bootstrap.source.native_id = None;
     bootstrap.audio_mode = "off".to_owned();
     bootstrap
+}
+
+fn configure_shared_port(config: &mut AppConfig, port: u16) {
+    config.http_port = port;
+    config.media_ports.first = port;
+    config.media_ports.last = port;
 }
 
 fn replace_sources_for_kind(
@@ -2548,7 +2584,7 @@ impl eframe::App for HostUi {
                     (
                         ViewerUrlMode::Public,
                         "Public",
-                        "Use the discovered public IPv4 address. Port forwarding may be required.",
+                        "Use the discovered public IPv4 address for both the link and WebRTC. Forward the selected port for TCP and UDP.",
                     ),
                     (
                         ViewerUrlMode::Custom,
@@ -2561,17 +2597,21 @@ impl eframe::App for HostUi {
                         .on_hover_text(tooltip);
                     if response.clicked() {
                         self.viewer_url_mode = mode;
+                        self.sync_selected_viewer_host();
                     }
                 }
             });
             if self.viewer_url_mode == ViewerUrlMode::Custom {
                 ui.horizontal(|ui| {
                     ui.label("Custom domain");
-                    ui.add(
+                    let response = ui.add(
                         egui::TextEdit::singleline(&mut self.custom_viewer_host)
                             .desired_width(260.0)
                             .hint_text("example.com"),
                     );
+                    if response.lost_focus() {
+                        self.sync_selected_viewer_host();
+                    }
                 });
             } else if self.viewer_url_mode == ViewerUrlMode::Public && self.public_ipv4.is_none() {
                 let message = self
@@ -2584,7 +2624,9 @@ impl eframe::App for HostUi {
                 .num_columns(2)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
-                    ui.label("HTTP port");
+                    ui.label("Port").on_hover_text(
+                        "The viewer uses this port for HTTP/WebSocket over TCP and WebRTC media over UDP. Forward both protocols for WAN viewers.",
+                    );
                     ui.horizontal(|ui| {
                         let port_editable = matches!(
                             self.status,
@@ -2615,7 +2657,7 @@ impl eframe::App for HostUi {
                                 );
                             } else if ui.button("Apply port").clicked() {
                                 let port = port_value.expect("validated port input");
-                                self.config.http_port = port;
+                                configure_shared_port(&mut self.config, port);
                                 self.port_input = port.to_string();
                                 let _ = self.command_tx.send(UiCommand::StartServer(Box::new(
                                     server_bootstrap_config(&self.config),
@@ -3272,6 +3314,17 @@ mod tests {
     }
 
     #[test]
+    fn native_ui_port_is_shared_by_tcp_and_udp() {
+        let mut config = AppConfig::default();
+
+        configure_shared_port(&mut config, 8475);
+
+        assert_eq!(config.http_port, 8475);
+        assert_eq!(config.media_ports.first, 8475);
+        assert_eq!(config.media_ports.last, 8475);
+    }
+
+    #[test]
     fn custom_viewer_host_accepts_a_host_without_a_url_scheme() {
         assert_eq!(
             custom_viewer_host("stream.example.com"),
@@ -3302,6 +3355,17 @@ mod tests {
         assert_eq!(mode, ViewerUrlMode::Public);
         assert!(custom_host.is_empty());
         assert!(public_ipv4.is_none());
+    }
+
+    #[test]
+    fn explicit_non_lan_ipv4_restores_public_share_mode() {
+        let mut config = AppConfig::default();
+        config.advertise_host = Some("203.0.113.7".to_owned());
+
+        let (mode, _, public_ipv4) = initial_viewer_url_state(&config);
+
+        assert_eq!(mode, ViewerUrlMode::Public);
+        assert_eq!(public_ipv4.as_deref(), Some("203.0.113.7"));
     }
 
     #[test]
