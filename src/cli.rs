@@ -102,9 +102,13 @@ pub fn validate(args: ValidateArgs, json_output: bool) -> Result<()> {
     config.apply_args(args.config)?;
     config.validate()?;
     let ffmpeg = encoder::find_ffmpeg();
-    let source_result = capture::list_sources();
-    let source_error = source_result.as_ref().err().map(ToString::to_string);
-    let sources = source_result.unwrap_or_default();
+    let (sources, source_error) = if config.source.kind == "test" {
+        (Vec::new(), None)
+    } else {
+        let source_result = capture::list_sources();
+        let source_error = source_result.as_ref().err().map(ToString::to_string);
+        (source_result.unwrap_or_default(), source_error)
+    };
     let source_available = config.source.kind == "test"
         || (config.source.kind == "window"
             && config
