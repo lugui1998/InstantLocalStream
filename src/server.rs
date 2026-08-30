@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Command;
 use std::sync::{
-    Arc, Mutex as StdMutex, OnceLock,
+    Arc, Mutex as StdMutex, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,7 +47,6 @@ use crate::audio::AudioPipeline;
 use crate::config::AppConfig;
 use crate::media::{CaptureSettings, MediaPipeline};
 #[cfg(windows)]
-use crate::shared_capture::WindowCaptureRestartError;
 use crate::shared_capture::{SharedCapture, SourceFrame};
 use crate::udp_mux::UdpMux;
 #[cfg(windows)]
@@ -63,17 +62,28 @@ pub enum ServerCommand {
     StopStream {
         result: Option<oneshot::Sender<()>>,
     },
+    FinalizeStop,
     Update(CaptureSettings),
     UpdateMaxViewers(usize),
     PreviewSnapshot {
         result: std::sync::mpsc::SyncSender<Option<CapturePreviewSnapshot>>,
     },
     ResetToken(String),
+    RecoverStream {
+        pending: Arc<AtomicBool>,
+    },
     #[cfg(windows)]
     RefreshWindowCapture {
         source_index: usize,
         source_native_id: Option<u64>,
         dimensions: (u32, u32),
+    },
+    #[cfg(windows)]
+    RetryWindowCapture {
+        settings: CaptureSettings,
+        previous_dimensions: (u32, u32),
+        stop_request_revision: u64,
+        attempt: usize,
     },
 }
 
@@ -85,6 +95,20 @@ const WINDOW_RESIZE_SAFETY_SETTLE_TIME: Duration = Duration::from_millis(200);
 const WINDOW_RESIZE_EVENT_QUIET_TIME: Duration = Duration::from_millis(120);
 #[cfg(windows)]
 const WINDOW_RESIZE_FRAME_GRACE: Duration = Duration::from_millis(40);
+#[cfg(windows)]
+const WINDOW_RESIZE_RESTART_ATTEMPTS: usize = 3;
+#[cfg(windows)]
+const WINDOW_RESIZE_RETRY_DELAY: Duration = Duration::from_millis(150);
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+const STREAM_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct RecoveryPendingGuard(Arc<AtomicBool>);
+
+impl Drop for RecoveryPendingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,8 +208,10 @@ pub struct ServerState {
     active_token: Arc<StdMutex<String>>,
     settings_revision: Arc<AtomicU64>,
     media_session_revision: Arc<AtomicU64>,
+    stop_request_revision: Arc<AtomicU64>,
     pub audio: Option<Arc<AudioPipeline>>,
     stream_enabled: Arc<AtomicBool>,
+    stream_resetting: Arc<AtomicBool>,
     max_viewers: Arc<AtomicUsize>,
     settings: Arc<StdMutex<CaptureSettings>>,
     viewer_metrics: Arc<StdMutex<HashMap<String, ViewerMetrics>>>,
@@ -379,6 +405,7 @@ struct GroupFactory {
     host_codecs: Arc<HashSet<String>>,
     stream_enabled: Arc<AtomicBool>,
     tasks: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    pipelines: Arc<StdMutex<Vec<Weak<MediaPipeline>>>>,
 }
 
 impl GroupFactory {
@@ -406,6 +433,10 @@ impl GroupFactory {
             .current()
             .context("shared capture is not running")?;
         let media = Arc::new(MediaPipeline::with_codec(codec)?);
+        if let Ok(mut pipelines) = self.pipelines.lock() {
+            pipelines.retain(|pipeline| pipeline.strong_count() > 0);
+            pipelines.push(Arc::downgrade(&media));
+        }
         let source_dimensions = shared_capture.source_dimensions();
         let source_pixel_format = shared_capture.source_pixel_format();
         let source_fps = shared_capture.source_fps();
@@ -445,6 +476,18 @@ impl GroupFactory {
             .lock()
             .map(|mut tasks| std::mem::take(&mut *tasks))
             .unwrap_or_default()
+    }
+
+    fn request_stop_all(&self) {
+        if let Ok(mut pipelines) = self.pipelines.lock() {
+            pipelines.retain(|pipeline| {
+                let Some(pipeline) = pipeline.upgrade() else {
+                    return false;
+                };
+                pipeline.request_stop();
+                true
+            });
+        }
     }
 }
 
@@ -926,17 +969,13 @@ impl TranscodeGroups {
         }
     }
 
-    fn deactivate(&self) {
-        for group in self.groups.iter() {
-            if let Some(media) = group.media() {
-                media.deactivate();
-            }
-        }
-    }
-
-    fn stop(&self) {
+    /// Removes every encoder from the live group slots as one short topology
+    /// transaction. The returned pipelines are no longer reachable through
+    /// this group set, so slow process teardown can safely happen elsewhere
+    /// without stopping media installed by a later restart attempt.
+    fn detach_all_media(&self) -> Vec<Arc<MediaPipeline>> {
         let Ok(_lifecycle) = self.lifecycle_lock.lock() else {
-            return;
+            return Vec::new();
         };
         let mut stopped_media = Vec::new();
         for group in self.groups.iter() {
@@ -949,8 +988,12 @@ impl TranscodeGroups {
                 *lifecycle = GroupLifecycle::Stopped;
             }
         }
-        for media in stopped_media {
-            media.stop();
+        stopped_media
+    }
+
+    fn request_stop(&self) {
+        if let Some(factory) = &self.factory {
+            factory.request_stop_all();
         }
     }
 
@@ -1974,6 +2017,7 @@ pub async fn run_with_control_readiness(
         host_codecs: Arc::new(discover_host_codecs(&ffmpeg.command, initial_codec)),
         stream_enabled: Arc::clone(&stream_enabled),
         tasks: Arc::new(StdMutex::new(Vec::new())),
+        pipelines: Arc::new(StdMutex::new(Vec::new())),
     });
     // Always allocate the four lightweight group slots.  The configured group
     // count is a live budget, not a startup-only topology decision.
@@ -1996,8 +2040,10 @@ pub async fn run_with_control_readiness(
         active_token: Arc::new(StdMutex::new(config.token.clone())),
         settings_revision: Arc::new(AtomicU64::new(0)),
         media_session_revision: Arc::new(AtomicU64::new(0)),
+        stop_request_revision: Arc::new(AtomicU64::new(0)),
         audio: audio.clone(),
         stream_enabled: Arc::clone(&stream_enabled),
+        stream_resetting: Arc::new(AtomicBool::new(false)),
         max_viewers: Arc::new(AtomicUsize::new(config.max_viewers.max(1))),
         settings: Arc::clone(&settings_slot),
         viewer_metrics: Arc::clone(&viewer_metrics),
@@ -2022,11 +2068,31 @@ pub async fn run_with_control_readiness(
     // Feed both UI commands and internal resize refreshes through one queue so
     // capture replacement cannot race Stop/Start or a settings update.
     let (serialized_control_tx, mut serialized_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (urgent_stop_tx, mut urgent_stop_rx) = tokio::sync::mpsc::unbounded_channel();
     let forwarded_control_tx = serialized_control_tx.clone();
     let control_forward_task = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
-            if forwarded_control_tx.send(command).is_err() {
+            let sent = match command {
+                ServerCommand::StopStream { result } => urgent_stop_tx.send(result).is_ok(),
+                command => forwarded_control_tx.send(command).is_ok(),
+            };
+            if !sent {
                 break;
+            }
+        }
+    });
+    let stop_state = state.clone();
+    let stop_finalize_tx = serialized_control_tx.clone();
+    let urgent_stop_task = tokio::spawn(async move {
+        while let Some(result) = urgent_stop_rx.recv().await {
+            stop_state.stream_resetting.store(false, Ordering::Release);
+            stop_state
+                .stop_request_revision
+                .fetch_add(1, Ordering::AcqRel);
+            request_stream_stop(&stop_state);
+            let _ = stop_finalize_tx.send(ServerCommand::FinalizeStop);
+            if let Some(result) = result {
+                let _ = result.send(());
             }
         }
     });
@@ -2035,12 +2101,28 @@ pub async fn run_with_control_readiness(
         state.clone(),
         serialized_control_tx.clone(),
     ));
+    let stream_recovery_task = tokio::spawn(stream_health_monitor(
+        state.clone(),
+        serialized_control_tx.clone(),
+    ));
+    #[cfg(windows)]
+    let window_retry_tx = serialized_control_tx.clone();
     drop(serialized_control_tx);
     let control_state = state.clone();
     let control_task = tokio::spawn(async move {
         while let Some(command) = serialized_control_rx.recv().await {
             match command {
                 ServerCommand::StartStream { settings, result } => {
+                    control_state
+                        .stream_resetting
+                        .store(false, Ordering::Release);
+                    // A user Start supersedes any delayed automatic window
+                    // resize retry just as decisively as an explicit Stop.
+                    // Reuse the host-command revision so stale retry commands
+                    // cannot tear down the newly requested stream.
+                    control_state
+                        .stop_request_revision
+                        .fetch_add(1, Ordering::AcqRel);
                     if let Err(error) = apply_capture_settings(&control_state, settings.clone()) {
                         warn!(%error, "could not apply stream settings");
                         if let Some(result) = result {
@@ -2082,24 +2164,22 @@ pub async fn run_with_control_readiness(
                     }
                 }
                 ServerCommand::StopStream { result } => {
-                    if !control_state.stream_enabled.swap(false, Ordering::AcqRel) {
-                        if let Some(result) = result {
-                            let _ = result.send(());
-                        }
-                        continue;
-                    }
                     control_state
-                        .media_session_revision
+                        .stream_resetting
+                        .store(false, Ordering::Release);
+                    control_state
+                        .stop_request_revision
                         .fetch_add(1, Ordering::AcqRel);
-                    control_state.groups.deactivate();
-                    if let Some(audio) = &control_state.audio {
-                        audio.deactivate();
-                    }
+                    request_stream_stop(&control_state);
                     stop_stream_resources(&control_state).await;
                     broadcast_status(&control_state);
                     if let Some(result) = result {
                         let _ = result.send(());
                     }
+                }
+                ServerCommand::FinalizeStop => {
+                    stop_stream_resources(&control_state).await;
+                    broadcast_status(&control_state);
                 }
                 ServerCommand::Update(settings) => {
                     if let Err(error) = apply_capture_settings(&control_state, settings) {
@@ -2132,20 +2212,159 @@ pub async fn run_with_control_readiness(
                 ServerCommand::ResetToken(token) => {
                     control_state.reset_token(token);
                 }
+                ServerCommand::RecoverStream { pending } => {
+                    let _pending_guard = RecoveryPendingGuard(pending);
+                    if !control_state.stream_enabled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let stop_request_revision =
+                        control_state.stop_request_revision.load(Ordering::Acquire);
+                    let Some(reason) = stream_failure(&control_state) else {
+                        // A resize replacement may have completed before this
+                        // queued health event reached the serialized worker.
+                        continue;
+                    };
+                    warn!(%reason, "stream pipeline failed; restarting media graph");
+                    let settings = match control_state.settings.lock() {
+                        Ok(settings) => settings.clone(),
+                        Err(_) => {
+                            warn!("could not recover stream: capture settings lock poisoned");
+                            continue;
+                        }
+                    };
+                    // Recovery is an internal Stop -> Start. Publish the cold
+                    // state first so viewers tear down the failed peer before
+                    // the replacement graph can accept a new offer.
+                    control_state
+                        .stream_resetting
+                        .store(true, Ordering::Release);
+                    request_stream_stop(&control_state);
+                    broadcast_status(&control_state);
+                    stop_stream_resources(&control_state).await;
+                    if control_state.stop_request_revision.load(Ordering::Acquire)
+                        != stop_request_revision
+                    {
+                        broadcast_status(&control_state);
+                        continue;
+                    }
+                    let recovery = (|| -> Result<()> {
+                        let capture =
+                            Arc::new(SharedCapture::start(&ffmpeg.command, settings.clone())?);
+                        control_state.shared_capture.install(capture)?;
+                        control_state.groups.start_primary()?;
+                        Ok(())
+                    })();
+                    if control_state.stop_request_revision.load(Ordering::Acquire)
+                        != stop_request_revision
+                    {
+                        stop_stream_resources(&control_state).await;
+                        broadcast_status(&control_state);
+                        continue;
+                    }
+                    match recovery {
+                        Ok(()) => {
+                            control_state
+                                .stream_resetting
+                                .store(false, Ordering::Release);
+                            control_state.stream_enabled.store(true, Ordering::Release);
+                            if control_state.stop_request_revision.load(Ordering::Acquire)
+                                != stop_request_revision
+                            {
+                                stop_stream_resources(&control_state).await;
+                                broadcast_status(&control_state);
+                                continue;
+                            }
+                            control_state
+                                .media_session_revision
+                                .fetch_add(1, Ordering::AcqRel);
+                            control_state.groups.activate();
+                            if let Some(audio) = &control_state.audio {
+                                audio.activate();
+                            }
+                            if control_state.stop_request_revision.load(Ordering::Acquire)
+                                != stop_request_revision
+                            {
+                                stop_stream_resources(&control_state).await;
+                                broadcast_status(&control_state);
+                                continue;
+                            }
+                            // Match manual Start: the new authoritative media
+                            // session revision causes one clean re-offer.
+                            broadcast_status(&control_state);
+                            info!(%reason, "stream pipeline recovered");
+                        }
+                        Err(error) => {
+                            stop_stream_resources(&control_state).await;
+                            if control_state.stop_request_revision.load(Ordering::Acquire)
+                                != stop_request_revision
+                            {
+                                broadcast_status(&control_state);
+                                continue;
+                            }
+                            control_state
+                                .stream_resetting
+                                .store(false, Ordering::Release);
+                            control_state.stream_enabled.store(false, Ordering::Release);
+                            control_state
+                                .media_session_revision
+                                .fetch_add(1, Ordering::AcqRel);
+                            broadcast_status(&control_state);
+                            warn!(%error, %reason, "automatic stream recovery failed");
+                            if let Some(callback) = &control_state.stream_failure_callback {
+                                callback(format!(
+                                    "stream stopped after automatic recovery failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 #[cfg(windows)]
                 ServerCommand::RefreshWindowCapture {
                     source_index,
                     source_native_id,
                     dimensions,
                 } => {
-                    if let Err(error) = refresh_window_capture_dimensions(
+                    match prepare_window_capture_restart(
                         &control_state,
                         source_index,
                         source_native_id,
                         dimensions,
                     ) {
-                        warn!(%error, "could not refresh resized window capture");
+                        Ok(Some((settings, previous_dimensions, stop_request_revision))) => {
+                            execute_window_capture_restart_attempt(
+                                &control_state,
+                                &ffmpeg.command,
+                                &window_retry_tx,
+                                settings,
+                                previous_dimensions,
+                                stop_request_revision,
+                                1,
+                            )
+                            .await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error, "could not prepare resized window capture restart");
+                        }
                     }
+                }
+                #[cfg(windows)]
+                ServerCommand::RetryWindowCapture {
+                    settings,
+                    previous_dimensions,
+                    stop_request_revision,
+                    attempt,
+                } => {
+                    execute_window_capture_restart_attempt(
+                        &control_state,
+                        &ffmpeg.command,
+                        &window_retry_tx,
+                        settings,
+                        previous_dimensions,
+                        stop_request_revision,
+                        attempt,
+                    )
+                    .await;
                 }
             }
         }
@@ -2184,7 +2403,9 @@ pub async fn run_with_control_readiness(
 
     let _ = socket_io.close().await;
     control_forward_task.abort();
+    urgent_stop_task.abort();
     control_task.abort();
+    stream_recovery_task.abort();
     #[cfg(windows)]
     window_resize_task.abort();
     for adaptive_task in adaptive_tasks {
@@ -2209,13 +2430,61 @@ pub async fn run_with_control_readiness(
     Ok(())
 }
 
-async fn stop_stream_resources(state: &ServerState) {
-    state.groups.stop();
-    if let Some(capture) = state.shared_capture.take() {
-        let _ = capture.stop();
+fn request_stream_stop(state: &ServerState) {
+    if state.stream_enabled.swap(false, Ordering::AcqRel) {
+        state.media_session_revision.fetch_add(1, Ordering::AcqRel);
     }
-    for media_task in state.groups.take_tasks() {
-        let _ = media_task.await;
+    state.groups.request_stop();
+    if let Some(capture) = state.shared_capture.current() {
+        capture.request_stop();
+    }
+    if let Some(audio) = &state.audio {
+        audio.deactivate();
+    }
+}
+
+async fn stop_stream_resources(state: &ServerState) {
+    request_stream_stop(state);
+
+    // Cleanup APIs can enter driver or pipe waits. Run them off the async
+    // control worker and bound the whole teardown; the urgent phase above has
+    // already invalidated capture generations and signalled FFmpeg killers.
+    // Detach group slots synchronously first. A cleanup task that outlives the
+    // deadline then owns only old pipelines and cannot stop a newly installed
+    // encoder graph.
+    let detached_media = state.groups.detach_all_media();
+    let groups_cleanup = tokio::task::spawn_blocking(move || {
+        for media in detached_media {
+            media.stop();
+        }
+    });
+    let capture_cleanup = state.shared_capture.take().map(|capture| {
+        capture.request_stop();
+        tokio::task::spawn_blocking(move || {
+            let _ = capture.stop();
+        })
+    });
+    let mut media_tasks = state.groups.take_tasks();
+    let cleanup = async {
+        let _ = groups_cleanup.await;
+        if let Some(capture_cleanup) = capture_cleanup {
+            let _ = capture_cleanup.await;
+        }
+        for task in &mut media_tasks {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(STREAM_CLEANUP_TIMEOUT, cleanup)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_ms = STREAM_CLEANUP_TIMEOUT.as_millis(),
+            "stream cleanup exceeded its deadline; abandoning stuck teardown tasks"
+        );
+        for task in media_tasks {
+            task.abort();
+        }
     }
 }
 
@@ -2368,17 +2637,21 @@ fn observe_window_resize(
         index: settings.source_index,
         native_id: settings.source_native_id,
     };
+    // A maximize can invalidate the old WGC frame pool before its callback
+    // publishes the new content dimensions. Querying the capture item itself
+    // keeps resize recovery independent from that potentially stalled pool.
+    let observed_dimensions = crate::window_capture::WindowCapture::dimensions_for(
+        settings.source_index,
+        settings.source_native_id,
+    )
+    .unwrap_or_else(|_| capture.observed_source_dimensions());
     let dimensions = if event_settled {
-        debouncer.observe_settled(
-            source,
-            capture.source_dimensions(),
-            capture.observed_source_dimensions(),
-        )
+        debouncer.observe_settled(source, capture.source_dimensions(), observed_dimensions)
     } else {
         debouncer.observe(
             source,
             capture.source_dimensions(),
-            capture.observed_source_dimensions(),
+            observed_dimensions,
             Instant::now(),
         )
     }?;
@@ -2386,14 +2659,14 @@ fn observe_window_resize(
 }
 
 #[cfg(windows)]
-fn refresh_window_capture_dimensions(
+fn prepare_window_capture_restart(
     state: &ServerState,
     source_index: usize,
     source_native_id: Option<u64>,
     requested_dimensions: (u32, u32),
-) -> Result<()> {
+) -> Result<Option<(CaptureSettings, (u32, u32), u64)>> {
     if !state.stream_enabled.load(Ordering::Acquire) {
-        return Ok(());
+        return Ok(None);
     }
     let settings = state
         .settings
@@ -2404,124 +2677,181 @@ fn refresh_window_capture_dimensions(
         || settings.source_index != source_index
         || settings.source_native_id != source_native_id
     {
-        return Ok(());
+        return Ok(None);
     }
     if source_native_id.is_some_and(crate::capture::native_window_is_minimized) {
-        return Ok(());
+        return Ok(None);
     }
-    let shared_capture = state
+    let current_capture = state
         .shared_capture
         .current()
         .context("shared capture is unavailable during window resize")?;
-    let previous_dimensions = shared_capture.source_dimensions();
-    if previous_dimensions == requested_dimensions
-        || shared_capture.observed_source_dimensions() != requested_dimensions
-    {
-        return Ok(());
+    let previous_dimensions = current_capture.source_dimensions();
+    if previous_dimensions == requested_dimensions {
+        return Ok(None);
+    }
+    // Reject stale queued resize commands, but do not require the old capture
+    // callback to have observed the new size: that callback may have stopped
+    // precisely because its frame pool no longer matches the maximized window.
+    match crate::window_capture::WindowCapture::dimensions_for(
+        settings.source_index,
+        settings.source_native_id,
+    ) {
+        Ok(live_dimensions) if live_dimensions != requested_dimensions => return Ok(None),
+        Err(_) if current_capture.observed_source_dimensions() != requested_dimensions => {
+            return Ok(None);
+        }
+        _ => {}
     }
 
-    match shared_capture.restart_for_window_resize(&settings) {
-        Ok(()) => {}
-        Err(WindowCaptureRestartError::Preflight(error)) => {
-            return Err(
-                error.context("window resize preflight failed; kept the previous capture running")
-            );
-        }
-        Err(WindowCaptureRestartError::Restart(error)) => {
-            return restore_window_capture_after_failed_resize(
-                state,
-                &shared_capture,
-                &settings,
-                previous_dimensions,
-                error,
-                "window resize capture refresh failed",
-            );
-        }
+    Ok(Some((
+        settings,
+        previous_dimensions,
+        state.stop_request_revision.load(Ordering::Acquire),
+    )))
+}
+
+#[cfg(windows)]
+async fn execute_window_capture_restart_attempt(
+    state: &ServerState,
+    ffmpeg_command: &str,
+    retry_tx: &tokio::sync::mpsc::UnboundedSender<ServerCommand>,
+    settings: CaptureSettings,
+    previous_dimensions: (u32, u32),
+    stop_request_revision: u64,
+    attempt: usize,
+) {
+    let result = restart_window_capture_graph_once(
+        state,
+        ffmpeg_command,
+        &settings,
+        previous_dimensions,
+        stop_request_revision,
+        attempt,
+    )
+    .await;
+    let Err(error) = result else {
+        return;
+    };
+    if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
+        return;
     }
-    let refreshed_dimensions = shared_capture.source_dimensions();
-    if refreshed_dimensions == previous_dimensions {
-        return Ok(());
-    }
-    if let Err(error) = state.groups.reconfigure_and_restart(settings.clone()) {
-        return restore_window_capture_after_failed_resize(
-            state,
-            &shared_capture,
-            &settings,
-            previous_dimensions,
-            error,
-            "window resize encoder replacement failed",
+    if attempt < WINDOW_RESIZE_RESTART_ATTEMPTS {
+        warn!(
+            attempt,
+            max_attempts = WINDOW_RESIZE_RESTART_ATTEMPTS,
+            %error,
+            "fresh window capture did not start after resize; scheduling retry"
         );
+        let retry_tx = retry_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WINDOW_RESIZE_RETRY_DELAY * attempt as u32).await;
+            let _ = retry_tx.send(ServerCommand::RetryWindowCapture {
+                settings,
+                previous_dimensions,
+                stop_request_revision,
+                attempt: attempt + 1,
+            });
+        });
+        return;
     }
 
+    state.stream_resetting.store(false, Ordering::Release);
+    broadcast_status(state);
+    warn!(%error, "window resize failed after rebuilding the complete media graph");
+    if let Some(callback) = &state.stream_failure_callback {
+        callback(format!(
+            "stream stopped because the resized window could not start a fresh capture: {error}"
+        ));
+    }
+}
+
+#[cfg(windows)]
+async fn restart_window_capture_graph_once(
+    state: &ServerState,
+    ffmpeg_command: &str,
+    settings: &CaptureSettings,
+    previous_dimensions: (u32, u32),
+    stop_request_revision: u64,
+    attempt: usize,
+) -> Result<()> {
+    if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
+        return Ok(());
+    }
+
+    // Match the known-good manual Stop/Start behavior. Reusing a capture bus
+    // after a large compositor resize leaves some WGC drivers permanently
+    // wedged even when their frame pool is replaced. Tear down the complete
+    // media graph and create a new SharedCapture with fresh synchronization,
+    // WGC, and encoder state instead.
+    //
+    // Publish the stopped generation before teardown. This makes every
+    // viewer discard its old peer and wait, just as it does after a manual
+    // Stop. Without this transition the client can receive a group restart
+    // and a session revision together, race two offers, and remain attached
+    // to the retired encoder graph.
+    state.stream_resetting.store(true, Ordering::Release);
+    request_stream_stop(state);
+    broadcast_status(state);
+    stop_stream_resources(state).await;
+    if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
+        broadcast_status(state);
+        return Ok(());
+    }
+
+    let startup = (|| -> Result<(u32, u32)> {
+        let capture = Arc::new(SharedCapture::start(ffmpeg_command, settings.clone())?);
+        let dimensions = capture.source_dimensions();
+        state.shared_capture.install(capture)?;
+        state.groups.start_primary()?;
+        Ok(dimensions)
+    })();
+    let refreshed_dimensions = match startup {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            // If the host pressed Stop, its queued FinalizeStop owns cleanup.
+            // Returning now keeps the control queue available for that Stop
+            // and the subsequent user-requested Start.
+            if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
+                return Ok(());
+            }
+            stop_stream_resources(state).await;
+            return Err(error.context("fresh capture attempt after window resize failed"));
+        }
+    };
+    if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
+        return Ok(());
+    }
+    state.stream_resetting.store(false, Ordering::Release);
+    state.stream_enabled.store(true, Ordering::Release);
+    state.groups.activate();
+    if let Some(audio) = &state.audio {
+        audio.activate();
+    }
+    if state.stop_request_revision.load(Ordering::Acquire) != stop_request_revision {
+        return Ok(());
+    }
     info!(
         previous_width = previous_dimensions.0,
         previous_height = previous_dimensions.1,
         width = refreshed_dimensions.0,
         height = refreshed_dimensions.1,
-        "window resize refreshed the live capture format"
+        attempt,
+        "window resize rebuilt the complete live media graph"
     );
     publish_window_resize_restart(state, "window resized");
     Ok(())
 }
 
 #[cfg(windows)]
-fn restore_window_capture_after_failed_resize(
-    state: &ServerState,
-    shared_capture: &SharedCapture,
-    settings: &CaptureSettings,
-    previous_dimensions: (u32, u32),
-    original_error: anyhow::Error,
-    failure_context: &str,
-) -> Result<()> {
-    if let Err(restore_error) =
-        shared_capture.restart_with_output_dimensions(settings, previous_dimensions)
-    {
-        stop_stream_after_resize_failure(state, failure_context);
-        return Err(original_error.context(format!(
-            "{failure_context}; restoring the previous capture canvas also failed: {restore_error}"
-        )));
-    }
-    if let Err(restore_error) = state.groups.reconfigure_and_restart(settings.clone()) {
-        stop_stream_after_resize_failure(state, failure_context);
-        return Err(original_error.context(format!(
-            "{failure_context}; the previous capture canvas returned, but rebuilding its encoders failed: {restore_error}"
-        )));
-    }
-    publish_window_resize_restart(state, "window resize failed; previous format restored");
-    Err(original_error.context(format!(
-        "{failure_context}; restored the previous capture format"
-    )))
-}
-
-#[cfg(windows)]
 fn publish_window_resize_restart(state: &ServerState, reason: &str) {
-    // Unlike the transient assignment event, this revision is retained in
-    // authoritative status. A viewer that reconnects after missing the event
-    // will still discover that its old media graph must be renegotiated.
+    // Mirror a manual Start after the stopped state published above. The
+    // authoritative session revision is sufficient to make current clients
+    // negotiate once; a simultaneous group.restart event would request a
+    // second offer against the same newly-created graph.
     state.media_session_revision.fetch_add(1, Ordering::AcqRel);
-    restart_viewer_sessions(state, reason);
+    info!(%reason, "publishing restarted window stream session");
     broadcast_status(state);
-}
-
-#[cfg(windows)]
-fn stop_stream_after_resize_failure(state: &ServerState, reason: &str) {
-    warn!(%reason, "window resize rollback failed; stopping the media graph");
-    state.stream_enabled.store(false, Ordering::Release);
-    state.groups.deactivate();
-    if let Some(audio) = &state.audio {
-        audio.deactivate();
-    }
-    state.groups.stop();
-    if let Some(capture) = state.shared_capture.take() {
-        let _ = capture.stop();
-    }
-    state.media_session_revision.fetch_add(1, Ordering::AcqRel);
-    broadcast_status(state);
-    if let Some(callback) = &state.stream_failure_callback {
-        callback(format!(
-            "stream stopped because the resized window could not restore its previous video format: {reason}"
-        ));
-    }
 }
 
 fn apply_capture_settings(state: &ServerState, settings: CaptureSettings) -> Result<()> {
@@ -2708,6 +3038,68 @@ fn restart_viewer_sessions(state: &ServerState, reason: &str) {
         let assignment = state.groups.assignment_for(&client_id);
         let payload = authoritative_assignment_payload(state, assignment.group_id, reason, true);
         socket.emit("group.assignment", &payload).ok();
+    }
+}
+
+fn stream_failure(state: &ServerState) -> Option<String> {
+    let capture = state.shared_capture.current();
+    let capture_failure = match capture.as_ref() {
+        Some(capture) => capture.failure().or_else(|| {
+            let frame = capture.latest_frame_snapshot()?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            let age = now.saturating_sub(u128::from(frame.captured_at_unix_nanos));
+            (age > STREAM_STALL_TIMEOUT.as_nanos()).then(|| {
+                format!(
+                    "capture produced no frame for more than {} seconds",
+                    STREAM_STALL_TIMEOUT.as_secs()
+                )
+            })
+        }),
+        None => Some("shared capture is unavailable".to_owned()),
+    };
+    capture_failure.or_else(|| {
+        state
+            .groups
+            .active_group_ids()
+            .into_iter()
+            .find_map(|group_id| {
+                let media = state.groups.media_by_id(group_id)?;
+                media.failure().or_else(|| {
+                    (media.status() == "stopped")
+                        .then(|| format!("encoder group {group_id} stopped producing video"))
+                })
+            })
+    })
+}
+
+async fn stream_health_monitor(
+    state: ServerState,
+    control_tx: tokio::sync::mpsc::UnboundedSender<ServerCommand>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let recovery_pending = Arc::new(AtomicBool::new(false));
+    loop {
+        interval.tick().await;
+        if !state.stream_enabled.load(Ordering::Acquire) {
+            continue;
+        }
+        if stream_failure(&state).is_some()
+            && recovery_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            && control_tx
+                .send(ServerCommand::RecoverStream {
+                    pending: Arc::clone(&recovery_pending),
+                })
+                .is_err()
+        {
+            recovery_pending.store(false, Ordering::Release);
+            break;
+        }
     }
 }
 
@@ -2954,6 +3346,8 @@ fn network_probe_payload() -> Bytes {
 }
 
 fn status_snapshot(state: &ServerState) -> serde_json::Value {
+    let stream_enabled = state.stream_enabled.load(Ordering::Acquire);
+    let stream_resetting = state.stream_resetting.load(Ordering::Acquire);
     let viewers = state
         .connected_connections
         .lock()
@@ -2969,8 +3363,15 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         .map(|media| media.codec_name().to_owned())
         .unwrap_or_else(|| state.groups.group(0).codec());
     json!({
-        "status": primary_media.as_ref().map(|media| media.status()).unwrap_or("stopped"),
-        "stream_enabled": state.stream_enabled.load(Ordering::Acquire),
+        "status": if stream_resetting {
+            "resetting"
+        } else if stream_enabled {
+            primary_media.as_ref().map(|media| media.status()).unwrap_or("stopped")
+        } else {
+            "stopped"
+        },
+        "stream_enabled": stream_enabled,
+        "stream_resetting": stream_resetting,
         "media_session_revision": state.media_session_revision.load(Ordering::Acquire),
         "viewers": viewers,
         "bind": state.config.bind,
@@ -3720,8 +4121,10 @@ mod tests {
             active_token,
             settings_revision: Arc::new(AtomicU64::new(0)),
             media_session_revision: Arc::new(AtomicU64::new(0)),
+            stop_request_revision: Arc::new(AtomicU64::new(0)),
             audio: None,
             stream_enabled: Arc::new(AtomicBool::new(false)),
+            stream_resetting: Arc::new(AtomicBool::new(false)),
             max_viewers: Arc::new(AtomicUsize::new(8)),
             settings: Arc::new(StdMutex::new(settings)),
             viewer_metrics: Arc::new(StdMutex::new(HashMap::new())),
@@ -3768,6 +4171,24 @@ mod tests {
         assert_eq!(status["settings_revision"], 7);
         assert_eq!(status["media_session_revision"], 3);
         assert_eq!(status["group"]["bitrate_bps"], status["bitrate_bps"]);
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_has_a_distinct_resetting_status() {
+        let state = test_state();
+        state.stream_resetting.store(true, Ordering::Release);
+
+        let resetting = status_snapshot(&state);
+
+        assert_eq!(resetting["status"], "resetting");
+        assert_eq!(resetting["stream_enabled"], false);
+        assert_eq!(resetting["stream_resetting"], true);
+
+        state.stream_resetting.store(false, Ordering::Release);
+        let stopped = status_snapshot(&state);
+
+        assert_eq!(stopped["status"], "stopped");
+        assert_eq!(stopped["stream_resetting"], false);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3838,7 +4259,7 @@ mod tests {
                 result: Some(stop_tx),
             })
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), stop_rx)
+        tokio::time::timeout(Duration::from_secs(2), stop_rx)
             .await
             .expect("stream stop timed out")
             .expect("server dropped the stream-stop result");
@@ -3876,7 +4297,7 @@ mod tests {
                 result: Some(second_stop_tx),
             })
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), second_stop_rx)
+        tokio::time::timeout(Duration::from_secs(2), second_stop_rx)
             .await
             .expect("second stream stop timed out")
             .expect("server dropped the second stream-stop result");
@@ -4291,34 +4712,41 @@ mod tests {
         assert!(debounce.candidate.is_none());
     }
 
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn terminal_resize_failure_stops_stream_and_notifies_the_native_host() {
-        let mut state = test_state();
-        state.stream_enabled.store(true, Ordering::Release);
-        let (failure_tx, failure_rx) = std::sync::mpsc::channel();
-        state.stream_failure_callback = Some(Arc::new(move |message| {
-            let _ = failure_tx.send(message);
-        }));
-
-        stop_stream_after_resize_failure(&state, "encoder rollback failed");
-
-        assert!(!state.stream_enabled.load(Ordering::Acquire));
-        assert_eq!(state.media_session_revision.load(Ordering::Acquire), 1);
-        assert!(
-            failure_rx
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .contains("encoder rollback failed")
-        );
-    }
-
     #[test]
     fn capture_slot_is_empty_until_a_capture_is_installed() {
         let slot = CaptureSlot::default();
         assert!(slot.current().is_none());
         assert!(slot.take().is_none());
         assert!(slot.current().is_none());
+    }
+
+    #[test]
+    fn detached_group_cleanup_cannot_remove_replacement_media() {
+        let settings = CaptureSettings::from_config(&AppConfig::default());
+        let old_media = Arc::new(MediaPipeline::with_codec("vp8").unwrap());
+        let groups = TranscodeGroups::new(vec![TranscodeGroup::active(
+            0,
+            Arc::clone(&old_media),
+            settings,
+        )]);
+
+        let detached = groups.detach_all_media();
+        assert_eq!(detached.len(), 1);
+        assert!(groups.media_by_id(0).is_none());
+
+        let replacement = Arc::new(MediaPipeline::with_codec("vp8").unwrap());
+        *groups.group(0).media.lock().unwrap() = Some(Arc::clone(&replacement));
+        *groups.group(0).lifecycle.lock().unwrap() = GroupLifecycle::Active;
+        for old in detached {
+            old.stop();
+        }
+
+        assert!(Arc::ptr_eq(
+            &groups
+                .media_by_id(0)
+                .expect("replacement remains installed"),
+            &replacement
+        ));
     }
 
     #[test]

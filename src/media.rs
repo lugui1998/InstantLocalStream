@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
@@ -474,6 +474,7 @@ pub struct MediaPipeline {
     stale_encoded_frames: Arc<AtomicU64>,
     encoder_backlog_restarts: Arc<AtomicU64>,
     readiness: Arc<(Mutex<EncoderReadiness>, Condvar)>,
+    encoder_children: Arc<Mutex<Vec<Weak<Mutex<Child>>>>>,
     codec: VideoCodec,
 }
 
@@ -499,6 +500,7 @@ impl MediaPipeline {
             stale_encoded_frames: Arc::new(AtomicU64::new(0)),
             encoder_backlog_restarts: Arc::new(AtomicU64::new(0)),
             readiness: Arc::new((Mutex::new(EncoderReadiness::Pending), Condvar::new())),
+            encoder_children: Arc::new(Mutex::new(Vec::new())),
             codec: VideoCodec::parse(codec)?,
         })
     }
@@ -600,19 +602,32 @@ impl MediaPipeline {
         self.codec.payload_type()
     }
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.request_stop();
         if let Ok(subscribers) = self.subscribers.lock() {
             for track in subscribers.values() {
                 track.close();
             }
         }
     }
+
+    /// Signals encoder threads and their FFmpeg killer without taking any
+    /// subscriber locks. Used by the urgent Stop path before bounded cleanup.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(mut children) = self.encoder_children.lock() {
+            children.retain(|child| {
+                let Some(child) = child.upgrade() else {
+                    return false;
+                };
+                if let Ok(mut child) = child.try_lock() {
+                    let _ = child.kill();
+                }
+                true
+            });
+        }
+    }
     pub fn activate(&self) {
         self.active.store(true, Ordering::Release);
-    }
-
-    pub fn deactivate(&self) {
-        self.active.store(false, Ordering::Release);
     }
 
     pub fn reconfigure(&self, settings: CaptureSettings) {
@@ -830,6 +845,10 @@ impl MediaPipeline {
             .take()
             .context("FFmpeg did not expose stdout")?;
         let child_control = Arc::new(Mutex::new(child));
+        if let Ok(mut children) = self.encoder_children.lock() {
+            children.retain(|child| child.strong_count() > 0);
+            children.push(Arc::downgrade(&child_control));
+        }
         let (killer, done) = self.spawn_child_killer(Arc::clone(&child_control), revision);
         let stop = Arc::clone(&self.stop);
         let capture_revision = Arc::clone(&self.capture_revision);

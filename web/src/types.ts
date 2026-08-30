@@ -1,6 +1,7 @@
 export interface StreamStatus {
   status?: string
   stream_enabled?: boolean
+  stream_resetting?: boolean
   viewers?: number
   max_viewers?: number
   media_error?: string | null

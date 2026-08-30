@@ -29,6 +29,8 @@ const MAX_CACHED_PREVIEWS: usize = 64;
 const SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SOURCE_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 const LIVE_PREVIEW_RETRY_DELAY: Duration = Duration::from_secs(2);
+const STREAM_START_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_STOP_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WINDOW_WIDTH: f32 = 950.0;
 const SOURCE_CARD_WIDTH: f32 = 280.0;
 const SOURCE_CARD_HEIGHT: f32 = 210.0;
@@ -471,6 +473,14 @@ impl HostUi {
                         .source
                         .native_id
                         .is_some_and(capture::native_window_exists);
+                    if kind == "window" {
+                        retain_temporarily_unenumerated_windows(
+                            &mut sources,
+                            &self.sources,
+                            self.display_non_window_elements,
+                            capture::native_window_exists,
+                        );
+                    }
                     retain_selected_native_source(
                         &mut sources,
                         &self.sources,
@@ -951,6 +961,10 @@ impl HostUi {
                 egui::ScrollArea::horizontal()
                     .id_salt("source-carousel")
                     .auto_shrink([false, true])
+                    // Reserve the scrollbar track. Toggling it only when the
+                    // last card crosses the viewport by a subpixel changes
+                    // the available height and can oscillate every frame.
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -958,6 +972,9 @@ impl HostUi {
                             // use that same explicit gap between cards.
                             ui.spacing_mut().item_spacing.x = 0.0;
                             for (source_position, source) in sources.into_iter().enumerate() {
+                                if source_position > 0 {
+                                    ui.add_space(SOURCE_CAROUSEL_GAP);
+                                }
                                 let key = PreviewKey::for_source(&source);
                                 let selected = self.source_selected
                                     && source_matches_selection(
@@ -1107,7 +1124,6 @@ impl HostUi {
                                         ));
                                     }
                                 }
-                                ui.add_space(SOURCE_CAROUSEL_GAP);
                             }
                         });
                     });
@@ -1879,6 +1895,35 @@ fn retain_selected_native_source(
         .find(|source| source.native_id == Some(native_id))
     {
         sources.push(previous.clone());
+    }
+}
+
+fn retain_temporarily_unenumerated_windows(
+    sources: &mut Vec<CaptureSourceInfo>,
+    previous_sources: &[CaptureSourceInfo],
+    display_non_window_elements: bool,
+    mut native_window_is_available: impl FnMut(u64) -> bool,
+) {
+    let mut present = sources
+        .iter()
+        .filter_map(|source| source.native_id)
+        .collect::<HashSet<_>>();
+    for previous in previous_sources {
+        if previous.kind != "window" {
+            continue;
+        }
+        let Some(native_id) = previous.native_id else {
+            continue;
+        };
+        if present.contains(&native_id)
+            || !native_window_is_available(native_id)
+            || (!display_non_window_elements
+                && capture::native_window_is_non_window_element(native_id))
+        {
+            continue;
+        }
+        sources.push(previous.clone());
+        present.insert(native_id);
     }
 }
 
@@ -2738,19 +2783,38 @@ fn worker_loop(
                         ));
                         continue;
                     }
-                    match result_rx.blocking_recv() {
-                        Ok(Ok(())) => {
-                            let _ = event_tx.send(UiEvent::StreamStarted);
-                        }
-                        Ok(Err(error)) => {
-                            let _ = event_tx.send(UiEvent::StreamFailed(format!(
-                                "could not start stream: {error}"
-                            )));
-                        }
-                        Err(_) => {
-                            let _ = event_tx.send(UiEvent::StreamFailed(
-                                "viewer server stopped before starting the stream".to_owned(),
-                            ));
+                    let mut result_rx = result_rx;
+                    let deadline = Instant::now() + STREAM_START_ACK_TIMEOUT;
+                    loop {
+                        match result_rx.try_recv() {
+                            Ok(Ok(())) => {
+                                let _ = event_tx.send(UiEvent::StreamStarted);
+                                break;
+                            }
+                            Ok(Err(error)) => {
+                                let _ = event_tx.send(UiEvent::StreamFailed(format!(
+                                    "could not start stream: {error}"
+                                )));
+                                break;
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                let _ = event_tx.send(UiEvent::StreamFailed(
+                                    "viewer server stopped before starting the stream".to_owned(),
+                                ));
+                                break;
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                                if Instant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                                let _ = event_tx.send(UiEvent::StreamFailed(format!(
+                                    "stream start exceeded {} seconds",
+                                    STREAM_START_ACK_TIMEOUT.as_secs()
+                                )));
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -2772,12 +2836,36 @@ fn worker_loop(
                         let _ = event_tx.send(UiEvent::Failed(
                             "viewer server stopped before stopping the stream".to_owned(),
                         ));
-                    } else if result_rx.blocking_recv().is_ok() {
-                        let _ = event_tx.send(UiEvent::StreamStopped);
                     } else {
-                        let _ = event_tx.send(UiEvent::StreamFailed(
-                            "viewer server stopped before acknowledging stream stop".to_owned(),
-                        ));
+                        let mut result_rx = result_rx;
+                        let deadline = Instant::now() + STREAM_STOP_ACK_TIMEOUT;
+                        loop {
+                            match result_rx.try_recv() {
+                                Ok(()) => {
+                                    let _ = event_tx.send(UiEvent::StreamStopped);
+                                    break;
+                                }
+                                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                    let _ = event_tx.send(UiEvent::StreamFailed(
+                                        "viewer server stopped before acknowledging stream stop"
+                                            .to_owned(),
+                                    ));
+                                    break;
+                                }
+                                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                                    if Instant::now() < deadline =>
+                                {
+                                    thread::sleep(Duration::from_millis(20));
+                                }
+                                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                                    let _ = event_tx.send(UiEvent::StreamFailed(format!(
+                                        "stream stop exceeded {} seconds; capture termination was forced",
+                                        STREAM_STOP_ACK_TIMEOUT.as_secs()
+                                    )));
+                                    break;
+                                }
+                            }
+                        }
                     }
                 } else {
                     let _ =
@@ -3130,6 +3218,36 @@ mod tests {
             Some(42),
             true,
             false,
+        );
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].native_id, Some(42));
+    }
+
+    #[test]
+    fn temporarily_unenumerated_windows_remain_in_the_carousel() {
+        let retained = CaptureSourceInfo {
+            kind: "window".to_owned(),
+            index: 3,
+            native_id: Some(42),
+            width: 800,
+            height: 600,
+            fps: Some(60),
+            pid: Some(100),
+            name: "Background window".to_owned(),
+        };
+        let closed = CaptureSourceInfo {
+            native_id: Some(99),
+            name: "Closed window".to_owned(),
+            ..retained.clone()
+        };
+        let mut refreshed = Vec::new();
+
+        retain_temporarily_unenumerated_windows(
+            &mut refreshed,
+            &[retained, closed],
+            true,
+            |native_id| native_id == 42,
         );
 
         assert_eq!(refreshed.len(), 1);

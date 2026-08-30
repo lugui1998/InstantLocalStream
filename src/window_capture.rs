@@ -22,7 +22,6 @@ mod imp {
         Graphics::{
             Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
             DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
-            SizeInt32,
         },
         Win32::{
             Foundation::{HMODULE, HWND, LPARAM, POINT, WPARAM},
@@ -45,9 +44,9 @@ mod imp {
             UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             UI::WindowsAndMessaging::{
                 CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
-                GetAncestor, GetCursorPos, GetMessageW, GetWindowRect, IsWindow, MSG, OBJID_WINDOW,
-                PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WM_QUIT,
-                WindowFromPoint,
+                GetAncestor, GetCursorPos, GetMessageW, GetWindowRect, IsIconic, IsWindow, MSG,
+                OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WINEVENT_OUTOFCONTEXT,
+                WM_QUIT, WindowFromPoint,
             },
         },
         core::{Error as WindowsError, IInspectable, Interface, Ref, factory},
@@ -65,6 +64,12 @@ mod imp {
         /// Packed four-channel pixels. Live WGC frames remain BGRA for FFmpeg;
         /// one-shot thumbnail helpers return sampled RGBA.
         pub pixels: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    pub enum WindowCaptureUpdate {
+        Frame(WindowFrame),
+        Resized((u32, u32)),
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +240,7 @@ mod imp {
     #[derive(Default)]
     struct FrameState {
         latest: Option<WindowFrame>,
+        pending_resize: Option<(u32, u32)>,
         failure: Option<String>,
         closed: bool,
     }
@@ -257,6 +263,33 @@ mod imp {
         frame_pool_size: Option<(u32, u32)>,
     }
 
+    enum FramePoolReadback {
+        Frame(WindowFrame),
+        Resize((u32, u32)),
+        Skipped,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum FrameArrivalAction {
+        ReadPixels,
+        Resize((u32, u32)),
+        SkipPixels,
+    }
+
+    fn frame_arrival_action(
+        frame_pool_size: Option<(u32, u32)>,
+        content_dimensions: (u32, u32),
+        read_pixels: bool,
+    ) -> FrameArrivalAction {
+        if frame_pool_size.is_some_and(|size| size != content_dimensions) {
+            FrameArrivalAction::Resize(content_dimensions)
+        } else if read_pixels {
+            FrameArrivalAction::ReadPixels
+        } else {
+            FrameArrivalAction::SkipPixels
+        }
+    }
+
     impl FrameMailbox {
         fn publish(&self, frame: WindowFrame) {
             if let Ok(mut state) = self.state.lock()
@@ -267,10 +300,20 @@ mod imp {
             }
         }
 
+        fn request_resize(&self, dimensions: (u32, u32)) {
+            if let Ok(mut state) = self.state.lock()
+                && !state.closed
+            {
+                state.pending_resize = Some(dimensions);
+                self.ready.notify_all();
+            }
+        }
+
         fn fail(&self, error: impl Into<String>) {
             if let Ok(mut state) = self.state.lock()
                 && !state.closed
             {
+                state.pending_resize = None;
                 state.failure = Some(error.into());
                 self.ready.notify_all();
             }
@@ -278,6 +321,7 @@ mod imp {
 
         fn close(&self) {
             if let Ok(mut state) = self.state.lock() {
+                state.pending_resize = None;
                 state.closed = true;
                 self.ready.notify_all();
             }
@@ -353,7 +397,10 @@ mod imp {
                 ready: Condvar::new(),
             });
             let callback_mailbox = Arc::clone(&mailbox);
-            let readback_state = Arc::new(Mutex::new(LiveReadbackState::default()));
+            let readback_state = Arc::new(Mutex::new(LiveReadbackState {
+                frame_pool_size: Some(dimensions),
+                ..LiveReadbackState::default()
+            }));
             let callback_readback_state = Arc::clone(&readback_state);
             let frame_arrived_token =
                 frame_pool.FrameArrived(&TypedEventHandler::<
@@ -364,25 +411,24 @@ mod imp {
                         callback_mailbox.fail("window capture readback lock poisoned");
                         return Ok(());
                     };
-                    if !should_readback(
+                    let read_pixels = should_readback(
                         &mut readback_state.next_readback,
                         Instant::now(),
                         frame_interval,
-                    ) {
-                        if let Err(error) = discard_frame(frame_pool) {
-                            callback_mailbox.fail(error.to_string());
-                        }
-                        return Ok(());
-                    }
+                    );
                     match frame_from_pool(
                         frame_pool,
                         &d3d_device,
                         &d3d_context,
                         dimensions,
                         &mut readback_state,
+                        read_pixels,
                     ) {
-                        Ok(Some(frame)) => callback_mailbox.publish(frame),
-                        Ok(None) => {}
+                        Ok(FramePoolReadback::Frame(frame)) => callback_mailbox.publish(frame),
+                        Ok(FramePoolReadback::Resize(dimensions)) => {
+                            callback_mailbox.request_resize(dimensions)
+                        }
+                        Ok(FramePoolReadback::Skipped) => {}
                         Err(error) => callback_mailbox.fail(error.to_string()),
                     }
                     Ok(())
@@ -435,36 +481,59 @@ mod imp {
                 .unwrap_or(true)
         }
 
-        /// Returns the newest frame available before `timeout`, dropping stale
-        /// frames by retaining only one mailbox slot.
-        pub fn next_frame(&self, timeout: Duration) -> Result<Option<WindowFrame>> {
-            let mut state = self
-                .mailbox
-                .state
+        pub fn is_minimized(&self) -> bool {
+            unsafe { IsIconic(HWND(self.target_root as *mut c_void)).as_bool() }
+        }
+
+        pub fn current_dimensions(&self) -> Result<(u32, u32)> {
+            let runtime = self
+                .runtime
                 .lock()
-                .map_err(|_| anyhow::anyhow!("window capture frame lock poisoned"))?;
-            if let Some(frame) = state.latest.take() {
-                return Ok(Some(frame));
+                .map_err(|_| anyhow::anyhow!("window capture runtime lock poisoned"))?;
+            let runtime = runtime
+                .as_ref()
+                .context("window capture runtime is closed")?;
+            item_dimensions(&runtime.item)
+        }
+
+        /// Returns the newest frame or native size change available before
+        /// `timeout`, dropping stale frames by retaining one mailbox slot.
+        pub fn next_update(&self, timeout: Duration) -> Result<Option<WindowCaptureUpdate>> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let mut state = self
+                    .mailbox
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("window capture frame lock poisoned"))?;
+                if let Some(failure) = &state.failure {
+                    bail!("Windows Graphics Capture failed: {failure}");
+                }
+                if state.closed {
+                    return Ok(None);
+                }
+                if let Some(dimensions) = state.pending_resize.take() {
+                    // Do not call frame-pool Recreate in place. Some drivers
+                    // can block it indefinitely after a maximize. The owner
+                    // reports the dimensions so the server can rebuild the
+                    // complete capture session on a fresh pool instead.
+                    return Ok(Some(WindowCaptureUpdate::Resized(dimensions)));
+                }
+                if let Some(frame) = state.latest.take() {
+                    return Ok(Some(WindowCaptureUpdate::Frame(frame)));
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                let (next, _) = self
+                    .mailbox
+                    .ready
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| anyhow::anyhow!("window capture frame lock poisoned"))?;
+                state = next;
+                drop(state);
             }
-            if let Some(failure) = &state.failure {
-                bail!("Windows Graphics Capture failed: {failure}");
-            }
-            if state.closed {
-                return Ok(None);
-            }
-            let (next, _) = self
-                .mailbox
-                .ready
-                .wait_timeout(state, timeout)
-                .map_err(|_| anyhow::anyhow!("window capture frame lock poisoned"))?;
-            state = next;
-            if let Some(frame) = state.latest.take() {
-                return Ok(Some(frame));
-            }
-            if let Some(failure) = &state.failure {
-                bail!("Windows Graphics Capture failed: {failure}");
-            }
-            Ok(None)
         }
 
         /// Enables WGC's cursor overlay only when the OS reports that the
@@ -771,11 +840,6 @@ mod imp {
         }
     }
 
-    fn discard_frame(frame_pool: Ref<'_, Direct3D11CaptureFramePool>) -> windows::core::Result<()> {
-        let frame_pool = frame_pool.as_ref().ok_or(WindowsError::empty())?;
-        frame_pool.TryGetNextFrame()?.Close()
-    }
-
     fn staging_texture(
         d3d_device: &ID3D11Device,
         source_desc: &D3D11_TEXTURE2D_DESC,
@@ -818,112 +882,113 @@ mod imp {
         d3d_context: &ID3D11DeviceContext,
         output_dimensions: (u32, u32),
         readback_state: &mut LiveReadbackState,
-    ) -> windows::core::Result<Option<WindowFrame>> {
+        read_pixels: bool,
+    ) -> windows::core::Result<FramePoolReadback> {
         let frame_pool = frame_pool.as_ref().ok_or(WindowsError::empty())?;
         let frame = frame_pool.TryGetNextFrame()?;
-        let content_size = frame.ContentSize()?;
-        let content_width = u32::try_from(content_size.Width).map_err(|_| WindowsError::empty())?;
-        let content_height =
-            u32::try_from(content_size.Height).map_err(|_| WindowsError::empty())?;
-        if content_width == 0 || content_height == 0 {
-            frame.Close()?;
-            return Err(WindowsError::empty());
-        }
-        let content_dimensions = (content_width, content_height);
-        if readback_state
-            .frame_pool_size
-            .is_some_and(|size| size != content_dimensions)
-        {
-            frame.Close()?;
-            let dxgi_device: IDXGIDevice = d3d_device.cast()?;
-            let direct3d_device = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)? }
-                .cast::<IDirect3DDevice>()?;
-            frame_pool.Recreate(
-                &direct3d_device,
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                2,
-                SizeInt32 {
-                    Width: content_size.Width,
-                    Height: content_size.Height,
-                },
-            )?;
-            readback_state.frame_pool_size = Some(content_dimensions);
-            readback_state.staging = None;
-            // Do not publish the final frame from the old compositor surface.
-            // The next frame arrives from the newly sized pool.
-            return Ok(None);
-        }
-        readback_state.frame_pool_size = Some(content_dimensions);
-        let surface = frame.Surface()?;
-        let access = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
-        let source_texture = unsafe { access.GetInterface::<ID3D11Texture2D>()? };
-        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe {
-            source_texture.GetDesc(&mut source_desc);
-        }
-        let width = source_desc.Width;
-        let height = source_desc.Height;
-        if width == 0 || height == 0 {
-            frame.Close()?;
-            return Err(WindowsError::empty());
-        }
-        let staging = staging_texture(d3d_device, &source_desc, &mut readback_state.staging)?;
-        let region = D3D11_BOX {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-            front: 0,
-            back: 1,
-        };
-        unsafe {
-            d3d_context.CopySubresourceRegion(
-                Some(&staging.cast()?),
-                0,
-                0,
-                0,
-                0,
-                Some(&source_texture.cast()?),
-                0,
-                Some(&region),
-            );
-        }
-        let resource: ID3D11Resource = staging.cast()?;
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            d3d_context.Map(Some(&resource), 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-        }
-        let mut source_pixels = vec![0_u8; (width as usize) * (height as usize) * 4];
-        let source = mapped.pData.cast::<u8>();
-        unsafe {
-            for row in 0..height as usize {
-                let source_row = std::slice::from_raw_parts(
-                    source.add(row * mapped.RowPitch as usize),
-                    width as usize * 4,
-                );
-                let destination_row =
-                    &mut source_pixels[row * width as usize * 4..(row + 1) * width as usize * 4];
-                destination_row.copy_from_slice(source_row);
+        // Close every acquired frame even when a fallible Direct3D operation
+        // fails. Retaining either of the pool's two buffers can starve future
+        // arrivals and make capture shutdown appear to hang.
+        let result = (|| {
+            let content_size = frame.ContentSize()?;
+            let content_width =
+                u32::try_from(content_size.Width).map_err(|_| WindowsError::empty())?;
+            let content_height =
+                u32::try_from(content_size.Height).map_err(|_| WindowsError::empty())?;
+            if content_width == 0 || content_height == 0 {
+                return Err(WindowsError::empty());
             }
+            let content_dimensions = (content_width, content_height);
+            match frame_arrival_action(
+                readback_state.frame_pool_size,
+                content_dimensions,
+                read_pixels,
+            ) {
+                FrameArrivalAction::Resize(dimensions) => {
+                    // Always observe resize metadata, even when pixel readback
+                    // is throttled. Maximizing may produce only this callback.
+                    return Ok(FramePoolReadback::Resize(dimensions));
+                }
+                FrameArrivalAction::SkipPixels => {
+                    readback_state.frame_pool_size = Some(content_dimensions);
+                    return Ok(FramePoolReadback::Skipped);
+                }
+                FrameArrivalAction::ReadPixels => {}
+            }
+            readback_state.frame_pool_size = Some(content_dimensions);
+            let surface = frame.Surface()?;
+            let access = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
+            let source_texture = unsafe { access.GetInterface::<ID3D11Texture2D>()? };
+            let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe {
+                source_texture.GetDesc(&mut source_desc);
+            }
+            let width = source_desc.Width;
+            let height = source_desc.Height;
+            if width == 0 || height == 0 {
+                return Err(WindowsError::empty());
+            }
+            let staging = staging_texture(d3d_device, &source_desc, &mut readback_state.staging)?;
+            let region = D3D11_BOX {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+                front: 0,
+                back: 1,
+            };
+            unsafe {
+                d3d_context.CopySubresourceRegion(
+                    Some(&staging.cast()?),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(&source_texture.cast()?),
+                    0,
+                    Some(&region),
+                );
+            }
+            let resource: ID3D11Resource = staging.cast()?;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe {
+                d3d_context.Map(Some(&resource), 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            }
+            let mut source_pixels = vec![0_u8; (width as usize) * (height as usize) * 4];
+            let source = mapped.pData.cast::<u8>();
+            unsafe {
+                for row in 0..height as usize {
+                    let source_row = std::slice::from_raw_parts(
+                        source.add(row * mapped.RowPitch as usize),
+                        width as usize * 4,
+                    );
+                    let destination_row = &mut source_pixels
+                        [row * width as usize * 4..(row + 1) * width as usize * 4];
+                    destination_row.copy_from_slice(source_row);
+                }
+                d3d_context.Unmap(Some(&resource), 0);
+            }
+            let (output_width, output_height) = output_dimensions;
+            let pixels = if (width, height) == output_dimensions {
+                source_pixels
+            } else {
+                resize_bgra(&source_pixels, width, height, output_width, output_height)
+                    .ok_or(WindowsError::empty())?
+            };
+            Ok(FramePoolReadback::Frame(WindowFrame {
+                source_width: content_width,
+                source_height: content_height,
+                width: output_width,
+                height: output_height,
+                pixels,
+            }))
+        })();
+        let close_result = frame.Close();
+        match (result, close_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(readback), Ok(())) => Ok(readback),
         }
-        unsafe {
-            d3d_context.Unmap(Some(&resource), 0);
-        }
-        frame.Close()?;
-        let (output_width, output_height) = output_dimensions;
-        let pixels = if (width, height) == output_dimensions {
-            source_pixels
-        } else {
-            resize_bgra(&source_pixels, width, height, output_width, output_height)
-                .ok_or(WindowsError::empty())?
-        };
-        Ok(Some(WindowFrame {
-            source_width: content_width,
-            source_height: content_height,
-            width: output_width,
-            height: output_height,
-            pixels,
-        }))
     }
 
     /// Resizes a packed BGRA frame into the dimensions negotiated for the
@@ -1083,6 +1148,18 @@ mod imp {
         }
 
         #[test]
+        fn throttled_arrival_still_requests_a_frame_pool_resize() {
+            assert_eq!(
+                frame_arrival_action(Some((800, 600)), (1920, 1080), false),
+                FrameArrivalAction::Resize((1920, 1080))
+            );
+            assert_eq!(
+                frame_arrival_action(Some((1920, 1080)), (1920, 1080), false),
+                FrameArrivalAction::SkipPixels
+            );
+        }
+
+        #[test]
         fn staging_reuse_requires_unchanged_dimensions() {
             assert!(can_reuse_staging(Some((1920, 1080)), 1920, 1080));
             assert!(!can_reuse_staging(Some((1920, 1080)), 1280, 720));
@@ -1111,6 +1188,7 @@ mod imp {
                 state: Mutex::new(FrameState::default()),
                 ready: Condvar::new(),
             };
+            mailbox.request_resize((1920, 1080));
             mailbox.close();
             mailbox.publish(WindowFrame {
                 source_width: 1,
@@ -1123,6 +1201,7 @@ mod imp {
 
             let state = mailbox.state.lock().unwrap();
             assert!(state.closed);
+            assert!(state.pending_resize.is_none());
             assert!(state.latest.is_none());
             assert!(state.failure.is_none());
         }
@@ -1131,8 +1210,8 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    WindowCapture, WindowResizeEvent, WindowResizeWatcher, capture_monitor_preview_frame,
-    capture_preview_frame, cursor_position_for,
+    WindowCapture, WindowCaptureUpdate, WindowResizeEvent, WindowResizeWatcher,
+    capture_monitor_preview_frame, capture_preview_frame, cursor_position_for,
 };
 
 #[cfg(not(windows))]

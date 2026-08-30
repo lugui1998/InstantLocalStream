@@ -102,6 +102,13 @@ pub struct ConfigArgs {
         help = "Capture source: monitor:0, window:2, or test:0"
     )]
     pub source: String,
+    #[arg(
+        long,
+        env = "ILS_SOURCE_NATIVE_ID",
+        hide = true,
+        help = "Stable native window identity used with a window source"
+    )]
+    pub source_native_id: Option<u64>,
     #[arg(long, default_value_t = true, env = "ILS_DRAW_MOUSE")]
     pub draw_mouse: bool,
     #[arg(long, default_value = "auto", env = "ILS_CODEC")]
@@ -212,6 +219,10 @@ impl AppConfig {
         }
         self.max_viewers = args.max_viewers;
         self.source = parse_source(&args.source)?;
+        if args.source_native_id.is_some() && self.source.kind != "window" {
+            bail!("--source-native-id can only be used with a window source");
+        }
+        self.source.native_id = args.source_native_id;
         self.draw_mouse = args.draw_mouse;
         self.codec = args.codec;
         let explicit_dimensions = args.width.is_some() || args.height.is_some();
@@ -668,6 +679,7 @@ mod tests {
                 token: None,
                 max_viewers: 8,
                 source: "monitor:0".to_owned(),
+                source_native_id: None,
                 draw_mouse: true,
                 codec: "vp8".to_owned(),
                 quality: None,
