@@ -40,6 +40,12 @@ jobs:
         with:
           node-version: 22
 
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt
+          rustup default "$RUST_VERSION"
+
       - name: Verify tag and manifest versions
         shell: bash
         run: |
@@ -57,6 +63,14 @@ jobs:
           test -s packaging/THIRD_PARTY_LICENSES-NPM.txt
           test -s packaging/RELEASE_NOTES_v1.0.0.md
           ! grep -Eiq 'must be recorded|before publishing|placeholder|TODO' THIRD_PARTY_NOTICES.md
+
+      - name: Verify formatting and frontend tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          npm ci --prefix web
+          npm --prefix web test
 
   windows:
     name: Build Windows x86-64
@@ -249,6 +263,8 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/build-web.sh
+          npm --prefix web test
+          cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked
           ffmpeg_path="$(find ffmpeg-download/extracted -type f -path '*/bin/ffmpeg' -print -quit)"
           ffmpeg_license="$(find ffmpeg-download/extracted -type f -name LICENSE.txt -print -quit)"
@@ -306,7 +322,7 @@ jobs:
           jq -e '.ok == true and .ffmpeg.available == true and .ffmpeg.command == "embedded FFmpeg"' <<<"$validation"
 
   release:
-    name: Create draft GitHub release
+    name: Publish GitHub release
     needs:
       - windows
       - linux-smoke
@@ -337,7 +353,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release windows-package
-          cp release-windows/Instant-Local-Stream-windows-x86_64.exe windows-package/
+          cp release-windows/Instant-Local-Stream-windows-x86_64.exe windows-package/Instant-Local-Stream.exe
           cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt windows-package/
           cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt windows-package/FFMPEG-LICENSE.txt
           cp THIRD_PARTY_NOTICES.md windows-package/THIRD_PARTY_NOTICES.md
@@ -349,6 +365,20 @@ jobs:
             cd windows-package
             zip -9 -r ../release/Instant-Local-Stream-windows-x86_64.zip .
           )
+          expected_windows_files=(
+            FFMPEG-LICENSE.txt
+            FFMPEG_SOURCE_OFFER.md
+            Instant-Local-Stream-windows-x86_64.ffmpeg.txt
+            Instant-Local-Stream.exe
+            LICENSE
+            THIRD_PARTY_LICENSES-NPM.txt
+            THIRD_PARTY_LICENSES-RUST.txt
+            THIRD_PARTY_NOTICES.md
+          )
+          test "$(unzip -Z1 release/Instant-Local-Stream-windows-x86_64.zip | wc -l)" -eq "${#expected_windows_files[@]}"
+          for expected in "${expected_windows_files[@]}"; do
+            unzip -Z1 release/Instant-Local-Stream-windows-x86_64.zip | grep -Fxq "$expected"
+          done
           cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt release/
           cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt release/
           cp release-linux/Instant-Local-Stream-linux-x86_64.AppImage release/
@@ -419,3 +449,4 @@ jobs:
               --notes-file packaging/RELEASE_NOTES_v1.0.0.md \
               --title "Instant Local Stream $GITHUB_REF_NAME"
           fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
