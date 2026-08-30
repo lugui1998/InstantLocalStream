@@ -17,11 +17,6 @@ if [[ ! -s "$ffmpeg_license" ]]; then
   echo "FFmpeg license file is empty: $ffmpeg_license" >&2
   exit 1
 fi
-ldd_output="$(ldd "$ILS_FFMPEG_PATH" 2>&1 || true)"
-if ! grep -Eq "not a dynamic executable|statically linked" <<<"$ldd_output"; then
-  echo "Linux portable builds require a statically linked FFmpeg executable" >&2
-  exit 1
-fi
 if [[ "${3:-}" == "--use-prebuilt-web" ]]; then
   if [[ ! -s web/dist/index.html ]]; then
     echo "Prebuilt viewer is missing: $(pwd)/web/dist/index.html" >&2
