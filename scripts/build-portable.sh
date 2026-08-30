@@ -51,7 +51,22 @@ cp packaging/FFMPEG_SOURCE_OFFER.md "$license_dir/FFMPEG_SOURCE_OFFER.md"
 cp "$ffmpeg_license" "$license_dir/FFMPEG-LICENSE.txt"
 
 if command -v appimagetool >/dev/null 2>&1 && command -v linuxdeploy >/dev/null 2>&1; then
-  APPIMAGE_EXTRACT_AND_RUN=1 linuxdeploy --appdir "$appdir"
+  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists libpipewire-0.3; then
+    echo "PipeWire development files are required to build the portable AppImage." >&2
+    exit 1
+  fi
+  pipewire_library="$(pkg-config --variable=libdir libpipewire-0.3)/libpipewire-0.3.so.0"
+  if [[ ! -s "$pipewire_library" ]]; then
+    echo "PipeWire runtime library was not found: $pipewire_library" >&2
+    exit 1
+  fi
+  # linuxdeploy's standard exclusion list assumes PipeWire is installed on the
+  # target system. Force-deploy it because this executable links to it at startup.
+  APPIMAGE_EXTRACT_AND_RUN=1 linuxdeploy --appdir "$appdir" --library "$pipewire_library"
+  if [[ ! -s "$appdir/usr/lib/libpipewire-0.3.so.0" ]]; then
+    echo "linuxdeploy did not bundle the required PipeWire runtime library." >&2
+    exit 1
+  fi
   runtime_args=()
   if [[ -n "${APPIMAGETOOL_RUNTIME_FILE:-}" ]]; then
     runtime_args=(--runtime-file "$APPIMAGETOOL_RUNTIME_FILE")

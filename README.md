@@ -23,7 +23,7 @@ chmod +x Instant-Local-Stream-linux-x86_64.AppImage
 ./Instant-Local-Stream-linux-x86_64.AppImage
 ```
 
-Linux screen capture uses X11. Wayland support depends on your desktop, portal, and capture permissions.
+Linux screen capture uses X11. Wayland support depends on your desktop, portal, and capture permissions. Audio capture requires a working host PipeWire service and its SPA modules.
 
 
 ## How it works

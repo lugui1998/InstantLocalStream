@@ -32,6 +32,8 @@ provided as separate release assets.
   show a warning on first launch.
 - Linux screen capture targets X11. Wayland behavior depends on the desktop,
   portal, and capture permissions.
+- Linux audio capture requires a working host PipeWire service and its SPA
+  modules.
 - LAN and public viewer links use HTTP and contain a bearer token. Use a trusted
   network or a secure reverse proxy, and do not publish the token link.
 - Public sharing requires forwarding the selected port to the host for both TCP
