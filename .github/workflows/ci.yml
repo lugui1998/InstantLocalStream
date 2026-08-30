@@ -125,7 +125,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
+            libasound2-dev libclang-dev libdbus-1-dev libegl-dev libgbm-dev \
             libpipewire-0.3-dev libssl-dev libudev-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxcb1-dev libxkbcommon-dev libxrandr-dev pkg-config
@@ -136,5 +136,5 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
 
-      - name: Check Linux build
-        run: cargo check --locked
+      - name: Build Linux
+        run: cargo build --locked
