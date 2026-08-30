@@ -3381,6 +3381,17 @@ mod tests {
     }
 
     #[test]
+    fn native_ui_port_is_shared_by_tcp_and_udp() {
+        let mut config = AppConfig::default();
+
+        configure_shared_port(&mut config, 8475);
+
+        assert_eq!(config.http_port, 8475);
+        assert_eq!(config.media_ports.first, 8475);
+        assert_eq!(config.media_ports.last, 8475);
+    }
+
+    #[test]
     fn custom_viewer_host_accepts_a_host_without_a_url_scheme() {
         assert_eq!(
             custom_viewer_host("stream.example.com"),
