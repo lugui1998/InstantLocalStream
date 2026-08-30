@@ -46,7 +46,6 @@ use webrtc::peer_connection::{
 use crate::audio::AudioPipeline;
 use crate::config::{AppConfig, MAX_AUTOMATIC_BITRATE_BPS, automatic_bitrate_floor};
 use crate::media::{CaptureSettings, MediaPipeline};
-#[cfg(windows)]
 use crate::shared_capture::{SharedCapture, SourceFrame};
 use crate::udp_mux::UdpMux;
 #[cfg(windows)]

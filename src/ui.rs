@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
