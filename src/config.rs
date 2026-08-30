@@ -725,21 +725,13 @@ mod tests {
 
     #[test]
     fn test_pattern_defaults_to_audio_off() {
-        let cli = Cli::try_parse_from([
-            "instant-local-stream",
-            "start",
-            "--source",
-            "test:0",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["instant-local-stream", "start", "--source", "test:0"]).unwrap();
         let Command::Start(start) = cli.command.unwrap() else {
             panic!("expected the start command");
         };
 
-        assert_eq!(
-            AppConfig::from_cli(Some(start)).unwrap().audio_mode,
-            "off"
-        );
+        assert_eq!(AppConfig::from_cli(Some(start)).unwrap().audio_mode, "off");
     }
 
     #[test]
