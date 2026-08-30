@@ -79,7 +79,7 @@ pub struct ConfigArgs {
         help = "Use the same numeric port for HTTP/TCP and WebRTC/UDP"
     )]
     pub port: Option<u16>,
-    #[arg(long, default_value = "lan", env = "ILS_BIND")]
+    #[arg(long, default_value = "localhost", env = "ILS_BIND")]
     pub bind: String,
     #[arg(long, default_value_t = 8080, env = "ILS_HTTP_PORT")]
     pub http_port: u16,
@@ -88,7 +88,7 @@ pub struct ConfigArgs {
     #[arg(
         long,
         env = "ILS_ADVERTISE_HOST",
-        help = "Host or IPv4 address used in the copied viewer URL"
+        help = "Hostname or IP address used in the copied viewer URL"
     )]
     pub advertise_host: Option<String>,
     #[arg(long, env = "ILS_TOKEN")]
@@ -159,7 +159,7 @@ pub struct ConfigArgs {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            bind: "lan".to_owned(),
+            bind: "localhost".to_owned(),
             http_port: 8080,
             media_ports: PortRange {
                 first: 40_000,
@@ -187,11 +187,8 @@ impl Default for AppConfig {
             adaptive_fps_ceiling: "source".to_owned(),
             max_quality_groups: "2".to_owned(),
             latency_preference: "low".to_owned(),
-            audio_mode: "system".to_owned(),
-            excluded_audio_processes: DEFAULT_AUDIO_EXCLUSIONS
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
+            audio_mode: "off".to_owned(),
+            excluded_audio_processes: Vec::new(),
             json: false,
         }
     }
@@ -257,13 +254,7 @@ impl AppConfig {
         self.adaptive_fps_ceiling = args.adaptive_fps_ceiling;
         self.max_quality_groups = args.max_quality_groups;
         self.latency_preference = args.latency_preference;
-        self.audio_mode = args.audio.unwrap_or_else(|| {
-            if self.source.kind == "test" {
-                "off".to_owned()
-            } else {
-                "system".to_owned()
-            }
-        });
+        self.audio_mode = args.audio.unwrap_or_else(|| "off".to_owned());
         if !args.exclude_audio_process.is_empty() {
             self.excluded_audio_processes = args.exclude_audio_process;
         }
@@ -481,7 +472,23 @@ impl AppConfig {
     }
 
     pub fn viewer_url_for_host(&self, host: &str) -> String {
-        format!("http://{}:{}/{}", host, self.http_port, self.token)
+        format!(
+            "http://{}:{}/{}",
+            viewer_url_host(host),
+            self.http_port,
+            self.token
+        )
+    }
+}
+
+/// Formats a host for use in a URL authority. IPv6 literals require brackets
+/// when paired with a port, while hostnames and pre-bracketed IPv6 literals
+/// can be used as supplied.
+fn viewer_url_host(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
     }
 }
 
@@ -590,6 +597,8 @@ pub fn parse_source(value: &str) -> Result<SourceSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{Cli, Command};
+    use clap::Parser;
 
     #[test]
     fn generated_tokens_are_twelve_ascii_alphanumeric_characters() {
@@ -604,13 +613,17 @@ mod tests {
         assert_eq!(config.media_ports.first, config.media_ports.last);
         assert_eq!(config.codec, "auto");
         assert_eq!(config.bitrate, 14_000_000);
+        assert_eq!(config.bind, "localhost");
+        assert_eq!(config.audio_mode, "off");
     }
 
     #[test]
     fn viewer_url_for_host_always_uses_http_and_the_supplied_host() {
-        let mut config = AppConfig::default();
-        config.http_port = 9000;
-        config.token = "Ab12Cd34Ef56".to_owned();
+        let config = AppConfig {
+            http_port: 9000,
+            token: "Ab12Cd34Ef56".to_owned(),
+            ..Default::default()
+        };
 
         assert_eq!(
             config.viewer_url_for_host("stream.example.com"),
@@ -619,16 +632,81 @@ mod tests {
     }
 
     #[test]
+    fn viewer_url_for_host_brackets_ipv6_literals() {
+        let config = AppConfig {
+            http_port: 9000,
+            token: "Ab12Cd34Ef56".to_owned(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.viewer_url_for_host("2001:db8::1"),
+            "http://[2001:db8::1]:9000/Ab12Cd34Ef56"
+        );
+        assert_eq!(
+            config.viewer_url_for_host("[2001:db8::1]"),
+            "http://[2001:db8::1]:9000/Ab12Cd34Ef56"
+        );
+    }
+
+    #[test]
+    fn cli_defaults_to_loopback_with_audio_disabled() {
+        let cli = Cli::try_parse_from(["instant-local-stream", "start"]).unwrap();
+        let Command::Start(start) = cli.command.unwrap() else {
+            panic!("expected the start command");
+        };
+
+        let config = AppConfig::from_cli(Some(start)).unwrap();
+        assert_eq!(config.bind, "localhost");
+        assert_eq!(config.audio_mode, "off");
+        assert!(config.excluded_audio_processes.is_empty());
+    }
+
+    #[test]
+    fn cli_preserves_explicit_audio_modes() {
+        let system =
+            Cli::try_parse_from(["instant-local-stream", "start", "--audio", "system"]).unwrap();
+        let Command::Start(system) = system.command.unwrap() else {
+            panic!("expected the start command");
+        };
+        assert_eq!(
+            AppConfig::from_cli(Some(system)).unwrap().audio_mode,
+            "system"
+        );
+
+        let window = Cli::try_parse_from([
+            "instant-local-stream",
+            "start",
+            "--source",
+            "window:0",
+            "--audio",
+            "window",
+        ])
+        .unwrap();
+        let Command::Start(window) = window.command.unwrap() else {
+            panic!("expected the start command");
+        };
+        assert_eq!(
+            AppConfig::from_cli(Some(window)).unwrap().audio_mode,
+            "window"
+        );
+    }
+
+    #[test]
     fn h264_is_an_available_initial_codec() {
-        let mut config = AppConfig::default();
-        config.codec = "h264".to_owned();
+        let config = AppConfig {
+            codec: "h264".to_owned(),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn capture_fps_is_bounded_for_timing_retention() {
-        let mut config = AppConfig::default();
-        config.fps = 240;
+        let mut config = AppConfig {
+            fps: 240,
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
         config.fps = 241;
         assert!(config.validate().is_err());

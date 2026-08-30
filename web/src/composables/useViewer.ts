@@ -1,8 +1,8 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { io, type Socket } from 'socket.io-client'
 import type { AuthoritativeStreamSettings, FrameTimingAcknowledgement, GroupAssignment, PingAcknowledgement, PlaybackMetricPoint, RenderedFrameTiming, SessionReady, StreamStatus, ViewerBootstrap, ViewerStats, ViewerVideoCapability, WebRtcAnswer } from '@/types'
+import { retryDelayFor } from '@/viewerUtils'
 
-const retryDelays = [1_000, 2_000, 5_000, 10_000, 20_000, 30_000]
 const bootstrapProbeTimeoutMs = 5_000
 const bootstrapProbeMaxBytes = 1_024 * 1_024
 const bootstrapAssignmentTimeoutMs = 1_500
@@ -134,6 +134,7 @@ export function useViewer() {
   const group = ref<GroupAssignment | null>(null)
   const negotiatedCodec = ref<string | null>(null)
   const bootstrapProgress = ref<BootstrapProgress | null>(null)
+  const mediaStatus = ref<string | null>(null)
   let socket: Socket | null = null
   let peer: RTCPeerConnection | null = null
   let statsTimer: number | null = null
@@ -175,6 +176,9 @@ export function useViewer() {
   let startupNoMediaChecks = 0
   let lastFrameTimingRequestAt = 0
   let lastHostFrameTimingAt = 0
+  let videoElement: HTMLVideoElement | null = null
+  let statsFailures = 0
+  let statsNextAllowedAt = 0
   let hostFrameTimingExpiryTimer: number | null = null
   let authoritativeSettingsRevision = -1
   // These values describe the m-lines in the current offer, not merely the
@@ -567,8 +571,22 @@ export function useViewer() {
 
   async function updateStats() {
     if (!peer) return
+    if (performance.now() < statsNextAllowedAt) return
     const current = peer
-    const reports = await current.getStats()
+    let reports: RTCStatsReport
+    try {
+      reports = await current.getStats()
+      statsFailures = 0
+      statsNextAllowedAt = 0
+      if (mediaStatus.value?.startsWith('Statistics temporarily unavailable')) mediaStatus.value = null
+    } catch {
+      if (peer !== current || stopping) return
+      statsFailures += 1
+      const retryAfterMs = retryDelayFor(statsFailures - 1)
+      statsNextAllowedAt = performance.now() + retryAfterMs
+      mediaStatus.value = `Statistics temporarily unavailable; retrying in ${Math.round(retryAfterMs / 1_000)} seconds.`
+      return
+    }
     if (peer !== current) return
     let candidateRtt: number | null = null
     let fallbackCandidateRtt: number | null = null
@@ -623,7 +641,7 @@ export function useViewer() {
         }
       }
     })
-    const renderedQuality = document.querySelector<HTMLVideoElement>('video')?.getVideoPlaybackQuality?.()
+    const renderedQuality = videoElement?.getVideoPlaybackQuality?.()
     if (renderedQuality && typeof renderedQuality.droppedVideoFrames === 'number') {
       dropped = renderedQuality.droppedVideoFrames
     }
@@ -931,6 +949,8 @@ export function useViewer() {
     frameTimingUncertaintyMs.value = null
     lastFrameTimingRequestAt = 0
     lastHostFrameTimingAt = 0
+    statsFailures = 0
+    statsNextAllowedAt = 0
   }
 
   function scheduleReconnect(reason: string, immediate = false) {
@@ -940,7 +960,7 @@ export function useViewer() {
     }
     if (awaitingCodecFallback || reconnectTimer !== null || negotiating) return
     connection.value = reason
-    const delay = immediate ? 0 : retryDelays[Math.min(reconnectAttempt++, retryDelays.length - 1)] + Math.round(Math.random() * 250)
+    const delay = immediate ? 0 : retryDelayFor(reconnectAttempt++) + Math.round(Math.random() * 250)
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null
       startWebRtc().catch(handleWebRtcFailure)
@@ -1057,12 +1077,26 @@ export function useViewer() {
     }
   }
 
-  function unmute() {
-    const element = document.querySelector<HTMLVideoElement>('video')
+  async function unmute() {
+    const element = videoElement
     if (element && status.value.audio_enabled && videoStream.value?.getAudioTracks().length) {
       element.muted = false
-      void element.play()
+      try {
+        await element.play()
+        mediaStatus.value = null
+      } catch {
+        element.muted = true
+        mediaStatus.value = 'Audio playback was blocked. Select “Enable audio” and allow playback in your browser.'
+      }
     }
+  }
+
+  function setVideoElement(element: HTMLVideoElement | null) {
+    videoElement = element
+  }
+
+  function reportPlaybackError() {
+    mediaStatus.value = 'Video playback was blocked by the browser. Select the stream controls to start playback.'
   }
 
   function seekToLiveEdge(video: HTMLVideoElement) {
@@ -1116,5 +1150,5 @@ export function useViewer() {
   }
 
   onBeforeUnmount(stop)
-  return { videoStream, status, connection, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, unmute, seekToLiveEdge, noteVideoFrameRendered, ping }
+  return { videoStream, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, unmute, setVideoElement, reportPlaybackError, seekToLiveEdge, noteVideoFrameRendered, ping }
 }

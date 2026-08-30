@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -34,7 +34,7 @@ use socketioxide::{
     extract::{AckSender, Data, Extension, SocketRef, State as SocketState},
     socket::DisconnectReason,
 };
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -226,6 +226,16 @@ pub struct ServerState {
     client_connections: Arc<StdMutex<std::collections::HashMap<String, Uuid>>>,
     connection_bindings: Arc<StdMutex<HashMap<Uuid, ConnectionMediaBinding>>>,
     client_sockets: Arc<StdMutex<std::collections::HashMap<String, SocketRef>>>,
+    /// Serializes SDP negotiation for a viewer. Without this, two overlapping
+    /// offers can both replace the same client mapping and orphan one peer.
+    offer_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+    /// Invalidates offers that were already being negotiated when a sharing
+    /// token was rotated.
+    session_generation: Arc<AtomicU64>,
+    /// A reset takes the exclusive side of this gate. Offers retain a shared
+    /// guard until their peer is committed, so a reset cannot miss an offer
+    /// that is between its final authorization check and map insertion.
+    session_gate: Arc<RwLock<()>>,
     stream_failure_callback: Option<StreamFailureCallback>,
 }
 
@@ -241,6 +251,7 @@ impl ServerState {
         if let Ok(mut active_token) = self.active_token.lock() {
             *active_token = token;
         }
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -308,6 +319,9 @@ struct MetricSample {
     freeze_count: u64,
     visibility_state: String,
 }
+
+const MAX_METRIC_SAMPLES_PER_VIEWER: usize = 32;
+const MIN_VIEWER_METRIC_INTERVAL: Duration = Duration::from_millis(250);
 
 // Browser `droppedVideoFrames` often includes intentional latest-frame and
 // catch-up drops.  Treat it as a downgrade signal only when it is extreme over
@@ -704,6 +718,16 @@ impl TranscodeGroups {
         self.activate_group(assignment.group_id)
     }
 
+    fn codec_for_client(&self, client_id: &str) -> Option<String> {
+        let group_id = self
+            .assignments
+            .lock()
+            .ok()?
+            .get(client_id)
+            .map(|assignment| assignment.group_id)?;
+        Some(self.group(group_id).codec())
+    }
+
     fn media_by_id(&self, group_id: usize) -> Option<Arc<MediaPipeline>> {
         self.group(group_id).media()
     }
@@ -821,7 +845,6 @@ impl TranscodeGroups {
             .store(requested_budget, Ordering::Release);
         let result = GroupReconfiguration {
             topology_changed: previous_budget != requested_budget,
-            ..GroupReconfiguration::default()
         };
         for group in self.groups.iter() {
             let profile = group_settings(&settings, group.id);
@@ -1285,16 +1308,12 @@ impl TranscodeGroups {
             }
         }
 
-        let next_higher_id = self
-            .active_group_ids()
-            .into_iter()
-            .filter(|group_id| {
-                *group_id < assignment.group_id
-                    && self
-                        .group_codec(*group_id)
-                        .eq_ignore_ascii_case(&current_codec)
-            })
-            .next_back()?;
+        let next_higher_id = self.active_group_ids().into_iter().rfind(|group_id| {
+            *group_id < assignment.group_id
+                && self
+                    .group_codec(*group_id)
+                    .eq_ignore_ascii_case(&current_codec)
+        })?;
         let next_higher = self.group_settings(next_higher_id);
         let headroom_samples = window
             .iter()
@@ -1890,10 +1909,15 @@ impl PeerConnectionEventHandler for PeerHandler {
                 }
             }
         }
-        if state == RTCPeerConnectionState::Disconnected
-            && let Ok(mut connected) = self.connected_connections.lock()
-        {
-            connected.remove(&self.connection_id);
+        let disconnected = if state == RTCPeerConnectionState::Disconnected {
+            self.connected_connections
+                .lock()
+                .map(|mut connected| connected.remove(&self.connection_id))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if disconnected {
             broadcast_status(&self.state);
         }
         if matches!(
@@ -1951,6 +1975,11 @@ pub async fn run_with_control_readiness(
     stream_failure_callback: Option<StreamFailureCallback>,
 ) -> Result<()> {
     let addr = config.http_addr()?;
+    // Bind the public listener before any background work is started. This is
+    // the most common fallible startup step; doing it first prevents a port
+    // collision from leaving audio or control tasks alive.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener_addr = listener.local_addr()?;
     #[cfg(windows)]
     if config.source.kind == "window" {
         crate::window_capture::WindowCapture::dimensions_for(
@@ -2033,9 +2062,6 @@ pub async fn run_with_control_readiness(
         Some(Arc::clone(&group_factory)),
     ));
     groups.active_budget.store(group_budget, Ordering::Release);
-    let audio_task = audio
-        .as_ref()
-        .map(|audio| Arc::clone(audio).spawn(initial_settings.clone()));
     let viewer_metrics = Arc::new(StdMutex::new(HashMap::new()));
     let state = ServerState {
         config: Arc::new(config.clone()),
@@ -2058,8 +2084,30 @@ pub async fn run_with_control_readiness(
         client_connections: Arc::new(StdMutex::new(std::collections::HashMap::new())),
         connection_bindings: Arc::new(StdMutex::new(HashMap::new())),
         client_sockets: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+        offer_locks: Arc::new(StdMutex::new(HashMap::new())),
+        session_generation: Arc::new(AtomicU64::new(0)),
+        session_gate: Arc::new(RwLock::new(())),
         stream_failure_callback,
     };
+    // Persist readiness before spawning background tasks so a write failure
+    // cannot orphan any of them. The listener and UDP mux clean up on drop.
+    crate::runtime::write(&crate::runtime::RuntimeStatus {
+        pid: std::process::id(),
+        http_port: config.http_port,
+        media_port: config.media_ports.first,
+        // The runtime record is discoverable process metadata, not a secret
+        // store. Keep the URL shape useful without persisting the bearer token.
+        viewer_url: redacted_viewer_url(&config),
+        source: config
+            .source
+            .native_id
+            .map(|native_id| format!("{}:{native_id}", config.source.kind))
+            .unwrap_or_else(|| format!("{}:{}", config.source.kind, config.source.index)),
+        codec: display_codec_name(initial_codec).to_owned(),
+    })?;
+    let audio_task = audio
+        .as_ref()
+        .map(|audio| Arc::clone(audio).spawn(initial_settings.clone()));
     // Both controllers remain available for live Manual <-> Auto changes.
     // Each loop reads the current settings before it acts, so inactive modes
     // are idle rather than retaining the behavior selected at server startup.
@@ -2223,7 +2271,7 @@ pub async fn run_with_control_readiness(
                     let _ = result.try_send(snapshot);
                 }
                 ServerCommand::ResetToken(token) => {
-                    control_state.reset_token(token);
+                    reset_token_and_revoke(&control_state, token).await;
                 }
                 ServerCommand::RecoverStream { pending } => {
                     let _pending_guard = RecoveryPendingGuard(pending);
@@ -2398,20 +2446,7 @@ pub async fn run_with_control_readiness(
         .build_layer();
     socket_io.ns("/", control_connect);
     let app = router(state.clone()).layer(socket_layer);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    crate::runtime::write(&crate::runtime::RuntimeStatus {
-        pid: std::process::id(),
-        http_port: config.http_port,
-        media_port: config.media_ports.first,
-        viewer_url: config.viewer_url(),
-        source: config
-            .source
-            .native_id
-            .map(|native_id| format!("{}:{native_id}", config.source.kind))
-            .unwrap_or_else(|| format!("{}:{}", config.source.kind, config.source.index)),
-        codec: display_codec_name(initial_codec).to_owned(),
-    })?;
-    info!(address = %listener.local_addr()?, viewer_url = %config.viewer_url(), "viewer server listening");
+    info!(address = %listener_addr, viewer_url = %redacted_viewer_url(&config), "viewer server listening");
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
@@ -2449,6 +2484,13 @@ pub async fn run_with_control_readiness(
     serve_result?;
     drop(state);
     Ok(())
+}
+
+fn redacted_viewer_url(config: &AppConfig) -> String {
+    let url = config.viewer_url();
+    url.rsplit_once('/')
+        .map(|(origin, _)| format!("{origin}/<token>"))
+        .unwrap_or_else(|| "<redacted>".to_owned())
 }
 
 fn request_stream_stop(state: &ServerState) {
@@ -2554,17 +2596,15 @@ async fn window_resize_monitor(
                 );
                 if let Some((source, dimensions)) =
                     observe_window_resize(&state, &mut debouncer, true)
-                {
-                    if control_tx
+                    && control_tx
                         .send(ServerCommand::RefreshWindowCapture {
                             source_index: source.index,
                             source_native_id: source.native_id,
                             dimensions,
                         })
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
             }
             _ = safety_interval.tick() => {
@@ -2576,17 +2616,15 @@ async fn window_resize_monitor(
                 );
                 if let Some((source, dimensions)) =
                     observe_window_resize(&state, &mut debouncer, false)
-                {
-                    if control_tx
+                    && control_tx
                         .send(ServerCommand::RefreshWindowCapture {
                             source_index: source.index,
                             source_native_id: source.native_id,
                             dimensions,
                         })
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
             }
         }
@@ -2680,12 +2718,15 @@ fn observe_window_resize(
 }
 
 #[cfg(windows)]
+type WindowCaptureRestart = (CaptureSettings, (u32, u32), u64);
+
+#[cfg(windows)]
 fn prepare_window_capture_restart(
     state: &ServerState,
     source_index: usize,
     source_native_id: Option<u64>,
     requested_dimensions: (u32, u32),
-) -> Result<Option<(CaptureSettings, (u32, u32), u64)>> {
+) -> Result<Option<WindowCaptureRestart>> {
     if !state.stream_enabled.load(Ordering::Acquire) {
         return Ok(None);
     }
@@ -2764,7 +2805,7 @@ async fn execute_window_capture_restart_attempt(
     // retry is therefore the only component that can recover after Windows
     // makes the capture item available again.
     let delay = window_resize_retry_delay(attempt);
-    if attempt <= WINDOW_RESIZE_RESTART_ATTEMPTS || attempt % 10 == 0 {
+    if attempt <= WINDOW_RESIZE_RESTART_ATTEMPTS || attempt.is_multiple_of(10) {
         warn!(
             attempt,
             quick_attempts = WINDOW_RESIZE_RESTART_ATTEMPTS,
@@ -3220,10 +3261,15 @@ async fn adaptive_loop(state: ServerState) {
         if target == current || (target as f64 - current as f64).abs() < current as f64 * 0.05 {
             continue;
         }
-        if let Ok(mut settings) = state.settings.lock() {
+        let changed = if let Ok(mut settings) = state.settings.lock() {
             settings.bitrate = target;
             let _ = state.groups.reconfigure(settings.clone(), false);
             last_change = now;
+            true
+        } else {
+            false
+        };
+        if changed {
             broadcast_status(&state);
         }
     }
@@ -3286,6 +3332,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/{token}/api/probe", get(connection_probe))
         .route("/{token}/api/session", post(session))
         .route("/{token}/api/offer", post(offer))
+        .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
 }
 
@@ -3523,6 +3570,35 @@ async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+fn offer_supports_h264_level_31(sdp: &str) -> bool {
+    let h264_payloads = sdp
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("a=rtpmap:"))
+        .filter_map(|mapping| mapping.split_once(' '))
+        .filter(|(_, encoding)| {
+            encoding
+                .split('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("H264"))
+        })
+        .map(|(payload, _)| payload.trim())
+        .collect::<HashSet<_>>();
+
+    sdp.lines()
+        .filter_map(|line| line.trim().strip_prefix("a=fmtp:"))
+        .filter_map(|format| format.split_once(' '))
+        .filter(|(payload, _)| h264_payloads.contains(payload.trim()))
+        .flat_map(|(_, parameters)| parameters.split(';'))
+        .filter_map(|parameter| parameter.trim().split_once('='))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("profile-level-id"))
+        .map(|(_, value)| value.trim().to_ascii_lowercase())
+        .any(|profile_level_id| {
+            profile_level_id.len() == 6
+                && profile_level_id.starts_with("42e0")
+                && u8::from_str_radix(&profile_level_id[4..], 16).is_ok_and(|level| level >= 0x1f)
+        })
+}
+
 async fn offer(
     Path(token): Path<String>,
     State(state): State<ServerState>,
@@ -3544,11 +3620,48 @@ async fn offer(
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .ok_or_else(|| internal_error("offer is missing a valid clientId"))?
         .to_owned();
+    let _offer_guard = lock_offer(&state, &client_id).await;
+    let _session_guard = Arc::clone(&state.session_gate).read_owned().await;
+    // An offer may wait behind a previous negotiation while its sharing token
+    // is rotated. Revalidate after acquiring the per-client gate.
+    if !state.token_matches(&token) {
+        return Err((StatusCode::NOT_FOUND, "invalid token".to_owned()));
+    }
+    if !state.stream_enabled.load(Ordering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream is stopped".to_owned(),
+        ));
+    }
+    let session_generation = state.session_generation.load(Ordering::Acquire);
     let offer: RTCSessionDescription = serde_json::from_value(request).map_err(internal_error)?;
-    close_client_connection(&state, &client_id).await;
-    let media = state.groups.media_for(&client_id).map_err(internal_error)?;
     let remote_ufrag = crate::udp_mux::ice_ufrag(&offer.sdp)
         .ok_or_else(|| internal_error("offer does not contain an ICE username fragment"))?;
+    let has_control_socket = state
+        .client_sockets
+        .lock()
+        .map(|sockets| sockets.contains_key(&client_id))
+        .unwrap_or(false);
+    if !has_control_socket {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "offer requires an authenticated control session".to_owned(),
+        ));
+    }
+    let assigned_codec = state
+        .groups
+        .codec_for_client(&client_id)
+        .ok_or_else(|| internal_error("control session has no media assignment"))?;
+    if assigned_codec == "h264" && !offer_supports_h264_level_31(&offer.sdp) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "offer does not support constrained-baseline H.264 level 3.1".to_owned(),
+        ));
+    }
+
+    // Validate stateless inputs before replacing a working connection, then
+    // reserve bounded capacity before activating or subscribing to media.
+    close_client_connection(&state, &client_id).await;
     let connection_id = Uuid::new_v4();
     {
         let connections = state.connections.lock().await;
@@ -3563,6 +3676,21 @@ async fn offer(
             ));
         }
         pending.insert(connection_id);
+    }
+
+    let media = match state.groups.media_for(&client_id) {
+        Ok(media) => media,
+        Err(error) => {
+            remove_pending(&state, connection_id);
+            return Err(internal_error(error));
+        }
+    };
+    if media.codec_name() == "H.264" && !offer_supports_h264_level_31(&offer.sdp) {
+        remove_pending(&state, connection_id);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "offer does not support constrained-baseline H.264 level 3.1".to_owned(),
+        ));
     }
 
     let media_track = match media.subscribe(connection_id) {
@@ -3695,6 +3823,12 @@ async fn offer(
         .await
         .context("WebRTC did not produce a local description")
         .map_err(internal_error)?;
+    if state.session_generation.load(Ordering::Acquire) != session_generation
+        || !state.token_matches(&token)
+    {
+        let _ = peer_connection.close().await;
+        return Err((StatusCode::UNAUTHORIZED, "session was revoked".to_owned()));
+    }
     state
         .connections
         .lock()
@@ -3702,6 +3836,29 @@ async fn offer(
         .insert(connection_id, peer_connection);
     reservation.commit();
     Ok(Json(local_description))
+}
+
+async fn lock_offer(state: &ServerState, client_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let gate = state
+        .offer_locks
+        .lock()
+        .map(|mut locks| {
+            // A client identifier must not become permanent map state. Retain
+            // only gates that are currently held or awaited, then reuse the
+            // requested live gate or install a weak reference to a new one.
+            locks.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = locks.get(client_id).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(Mutex::new(()));
+                locks.insert(client_id.to_owned(), Arc::downgrade(&gate));
+                gate
+            }
+        })
+        // A poisoned lock only follows a panic in server code. Preserve offer
+        // availability rather than turning it into a permanent outage.
+        .unwrap_or_else(|_| Arc::new(Mutex::new(())));
+    gate.lock_owned().await
 }
 
 fn remove_pending(state: &ServerState, connection_id: Uuid) {
@@ -3778,6 +3935,84 @@ async fn close_client_connection(state: &ServerState, client_id: &str) {
     broadcast_status(state);
 }
 
+/// Revokes every stateful capability associated with the previous sharing
+/// token. In-flight offers observe `session_generation` and clean their own
+/// reservations before they can commit.
+async fn reset_token_and_revoke(state: &ServerState, token: String) {
+    let _session_guard = Arc::clone(&state.session_gate).write_owned().await;
+    state.reset_token(token);
+    revoke_all_sessions_locked(state).await;
+}
+
+async fn revoke_all_sessions_locked(state: &ServerState) {
+    let sockets = state
+        .client_sockets
+        .lock()
+        .map(|mut sockets| sockets.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut client_ids = sockets
+        .iter()
+        .map(|(client_id, _)| client_id.clone())
+        .collect::<HashSet<_>>();
+    for (_, socket) in sockets {
+        let _ = socket.disconnect();
+    }
+
+    let client_connections = state
+        .client_connections
+        .lock()
+        .map(|mut clients| clients.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    client_ids.extend(
+        client_connections
+            .iter()
+            .map(|(client_id, _)| client_id.clone()),
+    );
+    let connection_ids = client_connections
+        .into_iter()
+        .map(|(_, connection_id)| connection_id)
+        .collect::<HashSet<_>>();
+    let bindings = state
+        .connection_bindings
+        .lock()
+        .map(|mut bindings| bindings.drain().collect::<HashMap<_, _>>())
+        .unwrap_or_default();
+    let pending = state
+        .pending_connections
+        .lock()
+        .map(|mut pending| pending.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let connections = {
+        let mut connections = state.connections.lock().await;
+        connections.drain().collect::<HashMap<_, _>>()
+    };
+
+    for (connection_id, connection) in connections {
+        let _ = connection.close().await;
+        state.udp_mux.unregister(connection_id);
+    }
+    for (connection_id, binding) in bindings {
+        binding.media.unsubscribe(connection_id);
+        if let Some(audio) = binding.audio {
+            audio.unsubscribe(connection_id);
+        }
+        state.udp_mux.unregister(connection_id);
+    }
+    for connection_id in connection_ids.into_iter().chain(pending) {
+        state.udp_mux.unregister(connection_id);
+    }
+    if let Ok(mut connected) = state.connected_connections.lock() {
+        connected.clear();
+    }
+    if let Ok(mut metrics) = state.viewer_metrics.lock() {
+        metrics.clear();
+    }
+    for client_id in client_ids {
+        state.groups.remove_client(&client_id);
+    }
+    broadcast_status(state);
+}
+
 impl Drop for OfferReservation {
     fn drop(&mut self) {
         if self.committed {
@@ -3804,6 +4039,10 @@ async fn control_connect(
     Data(auth): Data<SocketAuth>,
     SocketState(state): SocketState<ServerState>,
 ) {
+    // Serialize authentication and registration with token revocation. Without
+    // this read guard, a socket that validated the old token immediately before
+    // reset could insert itself after the revocation cleanup had drained maps.
+    let _session_guard = Arc::clone(&state.session_gate).read_owned().await;
     let client_id = auth.client_id.trim();
     if !state.token_matches(&auth.token) || client_id.is_empty() || client_id.len() > 128 {
         warn!("rejecting invalid control socket authentication");
@@ -3811,12 +4050,25 @@ async fn control_connect(
         return;
     }
     let client_id = client_id.to_owned();
+    let previous = match state.client_sockets.lock() {
+        Ok(mut sockets) => {
+            if !sockets.contains_key(&client_id)
+                && sockets.len() >= state.max_viewers.load(Ordering::Acquire).max(1)
+            {
+                warn!(%client_id, "rejecting control socket above viewer limit");
+                drop(sockets);
+                let _ = socket.disconnect();
+                return;
+            }
+            sockets.insert(client_id.clone(), socket.clone())
+        }
+        Err(_) => {
+            warn!(%client_id, "rejecting control socket because session state is unavailable");
+            let _ = socket.disconnect();
+            return;
+        }
+    };
     state.groups.ensure_client(&client_id);
-    let previous = state
-        .client_sockets
-        .lock()
-        .ok()
-        .and_then(|mut sockets| sockets.insert(client_id.clone(), socket.clone()));
     if let Some(previous) = previous {
         let _ = previous.disconnect();
     }
@@ -3970,7 +4222,9 @@ async fn handle_viewer_stats(
     SocketState(state): SocketState<ServerState>,
 ) {
     if is_current_socket(&state, &identity.client_id, &socket) {
-        let metrics = update_viewer_metrics(&state, &identity.client_id, &stats);
+        let Some(metrics) = update_viewer_metrics(&state, &identity.client_id, &stats) else {
+            return;
+        };
         if let Some(assignment) = state.groups.observe(&identity.client_id, &metrics) {
             let payload = authoritative_assignment_payload(
                 &state,
@@ -4022,6 +4276,10 @@ async fn handle_control_disconnect(
     _reason: DisconnectReason,
 ) {
     if take_current_socket(&state, &identity.client_id, &socket) {
+        // Removing the socket first makes a queued offer fail authentication;
+        // the per-client gate then waits for any offer already in progress so
+        // its peer and assignment are cleaned up before disconnect returns.
+        let _offer_guard = lock_offer(&state, &identity.client_id).await;
         close_client_connection(&state, &identity.client_id).await;
         state.groups.remove_client(&identity.client_id);
         if let Ok(mut metrics) = state.viewer_metrics.lock() {
@@ -4058,13 +4316,38 @@ fn update_viewer_metrics(
     state: &ServerState,
     client_id: &str,
     value: &ViewerStats,
-) -> ViewerMetrics {
+) -> Option<ViewerMetrics> {
+    update_viewer_metrics_at(state, client_id, value, Instant::now())
+}
+
+fn update_viewer_metrics_at(
+    state: &ServerState,
+    client_id: &str,
+    value: &ViewerStats,
+    now: Instant,
+) -> Option<ViewerMetrics> {
+    let rtt_ms = finite_metric(value.rtt_ms, 0.0, 60_000.0);
+    let jitter_ms = finite_metric(value.jitter_ms, 0.0, 60_000.0);
+    let loss_rate = finite_metric(value.loss_rate, 0.0, 1.0);
+    let bitrate_bps = finite_metric(value.bitrate_bps, 0.0, 10_000_000_000.0);
+    let available_incoming_bitrate_bps = value
+        .available_incoming_bitrate_bps
+        .map(|value| finite_metric(value, 0.0, 10_000_000_000.0));
+    let visibility_state = match value.visibility_state.as_str() {
+        "visible" | "hidden" => value.visibility_state.clone(),
+        _ => "unknown".to_owned(),
+    };
     let previous = state
         .viewer_metrics
         .lock()
         .ok()
         .and_then(|metrics| metrics.get(client_id).cloned());
-    let now = Instant::now();
+    if previous
+        .as_ref()
+        .is_some_and(|metrics| now.duration_since(metrics.updated_at) < MIN_VIEWER_METRIC_INTERVAL)
+    {
+        return None;
+    }
     let frames_dropped = previous
         .as_ref()
         .map(|metrics| {
@@ -4088,20 +4371,23 @@ fn update_viewer_metrics(
     samples.retain(|sample| now.duration_since(sample.captured_at) <= Duration::from_secs(15));
     samples.push_back(MetricSample {
         captured_at: now,
-        rtt_ms: value.rtt_ms,
-        jitter_ms: value.jitter_ms,
-        loss_rate: value.loss_rate,
-        bitrate_bps: value.bitrate_bps,
-        available_incoming_bitrate_bps: value.available_incoming_bitrate_bps,
+        rtt_ms,
+        jitter_ms,
+        loss_rate,
+        bitrate_bps,
+        available_incoming_bitrate_bps,
         frames_dropped,
         freeze_count,
-        visibility_state: value.visibility_state.clone(),
+        visibility_state,
     });
+    while samples.len() > MAX_METRIC_SAMPLES_PER_VIEWER {
+        samples.pop_front();
+    }
     let metric = ViewerMetrics {
-        rtt_ms: value.rtt_ms,
-        jitter_ms: value.jitter_ms,
-        loss_rate: value.loss_rate,
-        bitrate_bps: value.bitrate_bps,
+        rtt_ms,
+        jitter_ms,
+        loss_rate,
+        bitrate_bps,
         reported_frames_dropped: value.frames_dropped,
         reported_freeze_count: value.freeze_count,
         updated_at: now,
@@ -4110,7 +4396,15 @@ fn update_viewer_metrics(
     if let Ok(mut metrics) = state.viewer_metrics.lock() {
         metrics.insert(client_id.to_owned(), metric.clone());
     }
-    metric
+    Some(metric)
+}
+
+fn finite_metric(value: f64, minimum: f64, maximum: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        minimum
+    }
 }
 
 fn is_current_socket(state: &ServerState, client_id: &str, socket: &SocketRef) -> bool {
@@ -4189,6 +4483,9 @@ mod tests {
             client_connections: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             connection_bindings: Arc::new(StdMutex::new(HashMap::new())),
             client_sockets: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            offer_locks: Arc::new(StdMutex::new(HashMap::new())),
+            session_generation: Arc::new(AtomicU64::new(0)),
+            session_gate: Arc::new(RwLock::new(())),
             stream_failure_callback: None,
         }
     }
@@ -4244,6 +4541,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_reset_revokes_session_state() {
+        let state = test_state();
+        let connection_id = Uuid::new_v4();
+        let pending_id = Uuid::new_v4();
+        state
+            .client_connections
+            .lock()
+            .unwrap()
+            .insert("viewer".to_owned(), connection_id);
+        state
+            .connected_connections
+            .lock()
+            .unwrap()
+            .insert(connection_id);
+        state.pending_connections.lock().unwrap().insert(pending_id);
+
+        reset_token_and_revoke(&state, "replacement-token".to_owned()).await;
+
+        assert!(state.token_matches("replacement-token"));
+        assert!(!state.token_matches("test-token"));
+        assert!(state.client_connections.lock().unwrap().is_empty());
+        assert!(state.connected_connections.lock().unwrap().is_empty());
+        assert!(state.pending_connections.lock().unwrap().is_empty());
+        assert_eq!(state.session_generation.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_offers_for_one_client_share_a_gate() {
+        let state = test_state();
+        let first = lock_offer(&state, "viewer").await;
+        let waiting_state = state.clone();
+        let mut waiting = tokio::spawn(async move {
+            let _second = lock_offer(&waiting_state, "viewer").await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("second offer did not acquire the gate")
+            .expect("second offer task failed");
+
+        let other = lock_offer(&state, "other-viewer").await;
+        let locks = state.offer_locks.lock().unwrap();
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key("other-viewer"));
+        drop(locks);
+        drop(other);
+    }
+
+    #[tokio::test]
     async fn explicit_public_ip_becomes_the_media_candidate() {
         let state = test_state();
         let candidate = update_media_candidate(&state, "203.0.113.7").await.unwrap();
@@ -4257,9 +4609,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ui_bootstrap_can_switch_to_an_explicit_test_pattern() {
-        let mut bootstrap = AppConfig::default();
-        bootstrap.bind = "127.0.0.1".to_owned();
-        bootstrap.http_port = 0;
+        let mut bootstrap = AppConfig {
+            bind: "127.0.0.1".to_owned(),
+            http_port: 0,
+            ..Default::default()
+        };
         bootstrap.media_ports.first = 0;
         bootstrap.media_ports.last = 0;
         bootstrap.source.kind = "test".to_owned();
@@ -4608,6 +4962,23 @@ mod tests {
     }
 
     #[test]
+    fn h264_offer_must_receive_constrained_baseline_level_31() {
+        let offer = |profile_level_id: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 108\r\na=rtpmap:108 H264/90000\r\na=fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}\r\n"
+            )
+        };
+
+        assert!(offer_supports_h264_level_31(&offer("42e01f")));
+        assert!(offer_supports_h264_level_31(&offer("42e02a")));
+        assert!(!offer_supports_h264_level_31(&offer("42e01e")));
+        assert!(!offer_supports_h264_level_31(&offer("4d001f")));
+        assert!(!offer_supports_h264_level_31(
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n"
+        ));
+    }
+
+    #[test]
     fn changing_monitor_or_cursor_restarts_shared_capture_but_bitrate_does_not() {
         let original = CaptureSettings::from_config(&AppConfig::default());
         let mut different_monitor = original.clone();
@@ -4881,5 +5252,36 @@ mod tests {
         settings.bitrate_mode = "fixed".to_owned();
         assert!(!uses_group_adaptation(&settings));
         assert!(!uses_single_group_bitrate_adaptation(&settings));
+    }
+
+    #[tokio::test]
+    async fn viewer_metrics_are_normalized_and_count_bounded() {
+        let state = test_state();
+        let started_at = Instant::now();
+        for index in 0..(MAX_METRIC_SAMPLES_PER_VIEWER + 5) {
+            let _ = update_viewer_metrics_at(
+                &state,
+                "viewer",
+                &ViewerStats {
+                    rtt_ms: f64::INFINITY,
+                    jitter_ms: -10.0,
+                    loss_rate: 2.0,
+                    bitrate_bps: 1_000_000.0,
+                    available_incoming_bitrate_bps: Some(f64::NAN),
+                    frames_dropped: index as u64,
+                    freeze_count: 0,
+                    visibility_state: "unexpected".to_owned(),
+                },
+                started_at + MIN_VIEWER_METRIC_INTERVAL * index as u32,
+            );
+        }
+
+        let metrics = state.viewer_metrics.lock().unwrap();
+        let metric = metrics.get("viewer").unwrap();
+        assert_eq!(metric.samples.len(), MAX_METRIC_SAMPLES_PER_VIEWER);
+        assert_eq!(metric.rtt_ms, 0.0);
+        assert_eq!(metric.jitter_ms, 0.0);
+        assert_eq!(metric.loss_rate, 1.0);
+        assert_eq!(metric.samples.back().unwrap().visibility_state, "unknown");
     }
 }

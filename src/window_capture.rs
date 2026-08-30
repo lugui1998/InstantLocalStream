@@ -738,9 +738,11 @@ mod imp {
         let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
         let hwnd = selected_hwnd(index, native_id)?;
         let target_root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let target_root = (!target_root.0.is_null())
-            .then_some(target_root)
-            .unwrap_or(hwnd);
+        let target_root = if !target_root.0.is_null() {
+            target_root
+        } else {
+            hwnd
+        };
         let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
         let item = unsafe { interop.CreateForWindow::<GraphicsCaptureItem>(hwnd)? };
         Ok((item, target_root))
@@ -771,9 +773,11 @@ mod imp {
     pub fn cursor_position_for(index: usize, native_id: Option<u64>) -> Option<(i32, i32)> {
         let hwnd = selected_hwnd(index, native_id).ok()?;
         let target_root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let target_root = (!target_root.0.is_null())
-            .then_some(target_root)
-            .unwrap_or(hwnd);
+        let target_root = if !target_root.0.is_null() {
+            target_root
+        } else {
+            hwnd
+        };
         let point = cursor_point_for_target(target_root.0 as usize)?;
         if let Ok(window) = crate::capture::selected_window(index, native_id) {
             return Some((point.x - window.x().ok()?, point.y - window.y().ok()?));

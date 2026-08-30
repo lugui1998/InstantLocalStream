@@ -1,9 +1,16 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { BootstrapProgress } from '@/composables/useViewer'
 import type { RenderedFrameTiming } from '@/types'
+import { playbackRateFor } from '@/viewerUtils'
 
-const emit = defineEmits<{ unmute: []; 'live-edge': [video: HTMLVideoElement]; 'frame-rendered': [timing?: RenderedFrameTiming] }>()
+const emit = defineEmits<{
+  unmute: []
+  'live-edge': [video: HTMLVideoElement]
+  'frame-rendered': [timing?: RenderedFrameTiming]
+  'video-element': [video: HTMLVideoElement | null]
+  'playback-error': []
+}>()
 const video = ref<HTMLVideoElement | null>(null)
 
 const props = defineProps<{
@@ -14,6 +21,26 @@ const props = defineProps<{
 }>()
 let frameCallback = 0
 let renderedVideoSize = ''
+const hasLiveAudio = ref(false)
+let observedStream: MediaStream | null = null
+
+function refreshLiveAudio() {
+  hasLiveAudio.value = props.audioEnabled
+    && observedStream?.getAudioTracks().some(track => track.readyState === 'live') === true
+}
+
+function observeStream(stream: MediaStream | null) {
+  if (observedStream === stream) {
+    refreshLiveAudio()
+    return
+  }
+  observedStream?.removeEventListener('addtrack', refreshLiveAudio)
+  observedStream?.removeEventListener('removetrack', refreshLiveAudio)
+  observedStream = stream
+  observedStream?.addEventListener('addtrack', refreshLiveAudio)
+  observedStream?.addEventListener('removetrack', refreshLiveAudio)
+  refreshLiveAudio()
+}
 
 function refreshVideoDimensions() {
   const element = video.value
@@ -30,14 +57,6 @@ function refreshVideoDimensions() {
   element.style.aspectRatio = `${element.videoWidth} / ${element.videoHeight}`
 }
 
-function playbackRateFor(delayMs: number | null) {
-  if (delayMs === null || delayMs < 100) return 1
-  if (delayMs >= 1_000) return 1.2
-  if (delayMs >= 500) return 1.12
-  if (delayMs >= 250) return 1.08
-  return 1.04
-}
-
 function applyCatchUpRate() {
   const element = video.value
   if (!element) return
@@ -49,8 +68,11 @@ function applyCatchUpRate() {
 }
 
 function requestUnmute() {
-  const hasLiveAudio = props.stream?.getAudioTracks().some(track => track.readyState === 'live')
-  if (props.audioEnabled && hasLiveAudio) emit('unmute')
+  if (hasLiveAudio.value) emit('unmute')
+}
+
+function reportPlayFailure() {
+  emit('playback-error')
 }
 
 type WebRtcFrameMetadata = VideoFrameCallbackMetadata & {
@@ -88,6 +110,7 @@ function followLiveEdge(_now: number, metadata: WebRtcFrameMetadata) {
 }
 
 watch([video, () => props.stream], ([element, stream]) => {
+  observeStream(stream)
   if (element) {
     // A rebuilt peer may now carry audio.  Stay muted at attachment time so
     // autoplay remains reliable, but do not disable native controls: once an
@@ -96,6 +119,7 @@ watch([video, () => props.stream], ([element, stream]) => {
     element.srcObject = stream
     renderedVideoSize = ''
     if (stream) refreshVideoDimensions()
+    if (stream) void element.play().catch(reportPlayFailure)
     if (frameCallback && 'cancelVideoFrameCallback' in element) {
       element.cancelVideoFrameCallback(frameCallback)
       frameCallback = 0
@@ -111,14 +135,19 @@ watch([video, () => props.stream], ([element, stream]) => {
   }
 }, { immediate: true })
 
+watch(() => props.audioEnabled, refreshLiveAudio)
 watch(() => props.catchUpDelayMs, applyCatchUpRate, { immediate: true })
 
 onBeforeUnmount(() => {
+  observeStream(null)
   if (video.value && frameCallback && 'cancelVideoFrameCallback' in video.value) {
     video.value.cancelVideoFrameCallback(frameCallback)
   }
   if (video.value) video.value.playbackRate = 1
+  emit('video-element', null)
 })
+
+onMounted(() => emit('video-element', video.value))
 </script>
 
 <template>
@@ -135,9 +164,13 @@ onBeforeUnmount(() => {
       playsinline
       controls
       @click="requestUnmute"
+      @error="reportPlayFailure"
       @loadeddata="emit('frame-rendered')"
       @loadedmetadata="refreshVideoDimensions(); video && emit('live-edge', video)"
       @resize="refreshVideoDimensions"
     />
+    <button v-if="hasLiveAudio" class="audio-enable" type="button" @click="requestUnmute">
+      Enable audio
+    </button>
   </section>
 </template>

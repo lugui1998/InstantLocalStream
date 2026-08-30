@@ -1348,7 +1348,6 @@ impl HostUi {
             ui.label(format!(
                 "Test pattern · {pattern_width} × {pattern_height} · {pattern_fps} FPS"
             ));
-            return;
         }
     }
 
@@ -1482,6 +1481,26 @@ impl HostUi {
                 .is_ok()
         {
             self.last_sent_media_candidate_host = Some(host);
+        }
+    }
+
+    fn select_viewer_url_mode(&mut self, mode: ViewerUrlMode) {
+        if !share_endpoint_editable(&self.status) {
+            return;
+        }
+        let desired_bind = bind_for_viewer_url_mode(mode);
+        let restart_required = self.status.server_alive() && self.config.bind != desired_bind;
+        self.viewer_url_mode = mode;
+        self.config.bind = desired_bind.to_owned();
+        self.sync_selected_viewer_host();
+        if restart_required {
+            let _ =
+                self.command_tx
+                    .send(UiCommand::StartServer(Box::new(server_bootstrap_config(
+                        &self.config,
+                    ))));
+            self.status = HostStatus::StartingServer;
+            self.last_sent_media_candidate_host = None;
         }
     }
 
@@ -1752,7 +1771,7 @@ fn initial_viewer_url_state(config: &AppConfig) -> (ViewerUrlMode, String, Optio
     let configured_host = config.advertise_host.as_deref();
     let local_host = local_ipv4().map(|address| address.to_string());
     let mode = match configured_host {
-        Some(host) if host == "127.0.0.1" => ViewerUrlMode::Local,
+        Some("127.0.0.1") => ViewerUrlMode::Local,
         Some(host) if local_host.as_deref() == Some(host) => ViewerUrlMode::Lan,
         Some(host) if host.parse::<std::net::Ipv4Addr>().is_ok() => ViewerUrlMode::Public,
         Some(_) => ViewerUrlMode::Custom,
@@ -1764,7 +1783,7 @@ fn initial_viewer_url_state(config: &AppConfig) -> (ViewerUrlMode, String, Optio
     };
     let custom_host = if mode == ViewerUrlMode::Custom {
         configured_host
-            .or_else(|| match config.bind.as_str() {
+            .or(match config.bind.as_str() {
                 "localhost" | "loopback" | "lan" | "public" | "all" => None,
                 _ => Some(config.bind.as_str()),
             })
@@ -1774,11 +1793,22 @@ fn initial_viewer_url_state(config: &AppConfig) -> (ViewerUrlMode, String, Optio
         String::new()
     };
     let public_ipv4 = (mode == ViewerUrlMode::Public)
-        .then(|| configured_host)
+        .then_some(configured_host)
         .flatten()
         .filter(|host| host.parse::<std::net::Ipv4Addr>().is_ok())
         .map(str::to_owned);
     (mode, custom_host, public_ipv4)
+}
+
+fn bind_for_viewer_url_mode(mode: ViewerUrlMode) -> &'static str {
+    match mode {
+        ViewerUrlMode::Local => "localhost",
+        ViewerUrlMode::Lan | ViewerUrlMode::Public | ViewerUrlMode::Custom => "lan",
+    }
+}
+
+fn share_endpoint_editable(status: &HostStatus) -> bool {
+    !status.stream_active()
 }
 
 fn custom_viewer_host(value: &str) -> Option<String> {
@@ -2570,6 +2600,7 @@ impl eframe::App for HostUi {
                 });
             ui.horizontal(|ui| {
                 ui.label("Share URL host");
+                let share_endpoint_editable = share_endpoint_editable(&self.status);
                 for (mode, label, tooltip) in [
                     (
                         ViewerUrlMode::Local,
@@ -2593,23 +2624,40 @@ impl eframe::App for HostUi {
                     ),
                 ] {
                     let response = ui
-                        .selectable_label(self.viewer_url_mode == mode, label)
-                        .on_hover_text(tooltip);
+                        .add_enabled_ui(share_endpoint_editable, |ui| {
+                            ui.selectable_label(self.viewer_url_mode == mode, label)
+                        })
+                        .inner;
+                    let response = if share_endpoint_editable {
+                        response.on_hover_text(tooltip)
+                    } else {
+                        response.on_disabled_hover_text(
+                            "Stop the stream before changing how the viewer is shared.",
+                        )
+                    };
                     if response.clicked() {
-                        self.viewer_url_mode = mode;
-                        self.sync_selected_viewer_host();
+                        self.select_viewer_url_mode(mode);
                     }
                 }
             });
             if self.viewer_url_mode == ViewerUrlMode::Custom {
                 ui.horizontal(|ui| {
                     ui.label("Custom domain");
-                    let response = ui.add(
+                    let share_endpoint_editable = share_endpoint_editable(&self.status);
+                    let response = ui.add_enabled(
+                        share_endpoint_editable,
                         egui::TextEdit::singleline(&mut self.custom_viewer_host)
                             .desired_width(260.0)
                             .hint_text("example.com"),
                     );
-                    if response.lost_focus() {
+                    let response = if share_endpoint_editable {
+                        response
+                    } else {
+                        response.on_disabled_hover_text(
+                            "Stop the stream before changing the custom viewer host.",
+                        )
+                    };
+                    if share_endpoint_editable && response.lost_focus() {
                         self.sync_selected_viewer_host();
                     }
                 });
@@ -2644,26 +2692,27 @@ impl eframe::App for HostUi {
                             self.port_input.retain(|character| character.is_ascii_digit());
                         }
                         let port_value = self.port_input_value();
-                        if port_value.is_none() {
+                        if let Some(port) = port_value {
+                            if port != self.config.http_port {
+                                if self.status.stream_active() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(210, 170, 80),
+                                        "Stop the stream before applying the new port.",
+                                    );
+                                } else if ui.button("Apply port").clicked() {
+                                    configure_shared_port(&mut self.config, port);
+                                    self.port_input = port.to_string();
+                                    let _ = self.command_tx.send(UiCommand::StartServer(Box::new(
+                                        server_bootstrap_config(&self.config),
+                                    )));
+                                    self.status = HostStatus::StartingServer;
+                                }
+                            }
+                        } else {
                             ui.colored_label(
                                 egui::Color32::from_rgb(210, 170, 80),
                                 "Enter a port from 1 to 65535.",
                             );
-                        } else if port_value != Some(self.config.http_port) {
-                            if self.status.stream_active() {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(210, 170, 80),
-                                    "Stop the stream before applying the new port.",
-                                );
-                            } else if ui.button("Apply port").clicked() {
-                                let port = port_value.expect("validated port input");
-                                configure_shared_port(&mut self.config, port);
-                                self.port_input = port.to_string();
-                                let _ = self.command_tx.send(UiCommand::StartServer(Box::new(
-                                    server_bootstrap_config(&self.config),
-                                )));
-                                self.status = HostStatus::StartingServer;
-                            }
                         }
                     });
                     ui.end_row();
@@ -2694,15 +2743,13 @@ impl eframe::App for HostUi {
             && self.last_sent_max_viewers != Some(self.config.max_viewers)
             && let Ok(slot) = self.control_slot.lock()
             && let Some(sender) = slot.as_ref()
-        {
-            if sender
+            && sender
                 .send(server::ServerCommand::UpdateMaxViewers(
                     self.config.max_viewers,
                 ))
                 .is_ok()
-            {
-                self.last_sent_max_viewers = Some(self.config.max_viewers);
-            }
+        {
+            self.last_sent_max_viewers = Some(self.config.max_viewers);
         }
     }
 
@@ -3187,14 +3234,14 @@ mod tests {
             "monitor",
             0,
             None,
-            &[monitor.clone()]
+            std::slice::from_ref(&monitor)
         ));
         assert!(!source_selection_is_valid(
             true,
             "monitor",
             1,
             None,
-            &[monitor.clone()]
+            std::slice::from_ref(&monitor)
         ));
         assert!(source_selection_is_valid(
             true,
@@ -3347,20 +3394,41 @@ mod tests {
     }
 
     #[test]
-    fn default_share_settings_choose_public_mode() {
+    fn default_share_settings_choose_local_mode() {
         let config = AppConfig::default();
 
         let (mode, custom_host, public_ipv4) = initial_viewer_url_state(&config);
 
-        assert_eq!(mode, ViewerUrlMode::Public);
+        assert_eq!(mode, ViewerUrlMode::Local);
         assert!(custom_host.is_empty());
         assert!(public_ipv4.is_none());
     }
 
     #[test]
+    fn non_local_share_modes_require_an_all_interface_bind() {
+        assert_eq!(bind_for_viewer_url_mode(ViewerUrlMode::Local), "localhost");
+        assert_eq!(bind_for_viewer_url_mode(ViewerUrlMode::Lan), "lan");
+        assert_eq!(bind_for_viewer_url_mode(ViewerUrlMode::Public), "lan");
+        assert_eq!(bind_for_viewer_url_mode(ViewerUrlMode::Custom), "lan");
+    }
+
+    #[test]
+    fn share_endpoint_is_locked_for_the_entire_stream_lifecycle() {
+        assert!(share_endpoint_editable(&HostStatus::Ready));
+        assert!(share_endpoint_editable(&HostStatus::StreamFailed(
+            "capture failed".to_owned()
+        )));
+        assert!(!share_endpoint_editable(&HostStatus::StartingStream));
+        assert!(!share_endpoint_editable(&HostStatus::Running));
+        assert!(!share_endpoint_editable(&HostStatus::StoppingStream));
+    }
+
+    #[test]
     fn explicit_non_lan_ipv4_restores_public_share_mode() {
-        let mut config = AppConfig::default();
-        config.advertise_host = Some("203.0.113.7".to_owned());
+        let config = AppConfig {
+            advertise_host: Some("203.0.113.7".to_owned()),
+            ..Default::default()
+        };
 
         let (mode, _, public_ipv4) = initial_viewer_url_state(&config);
 

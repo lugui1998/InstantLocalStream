@@ -3,7 +3,10 @@ use std::fmt;
 use std::io;
 use std::io::IoSliceMut;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -19,14 +22,26 @@ struct Datagram {
 }
 
 struct EndpointState {
-    queue: Mutex<VecDeque<Datagram>>,
+    queue: Mutex<EndpointQueue>,
     waker: AtomicWaker,
+    dropped_packets: AtomicUsize,
+}
+
+struct EndpointQueue {
+    datagrams: VecDeque<Datagram>,
+    bytes: usize,
 }
 
 struct Route {
     endpoint: Arc<EndpointState>,
     remote_addr: Mutex<Option<SocketAddr>>,
 }
+
+// Keep media latency bounded when a peer stops reading briefly.  Dropping the
+// oldest queued media gives a recovered peer the most current packet instead
+// of making it play through a stale backlog.
+const MAX_QUEUED_PACKETS: usize = 64;
+const MAX_QUEUED_BYTES: usize = 512 * 1024;
 
 pub struct UdpMux {
     socket: Arc<UdpSocket>,
@@ -106,8 +121,12 @@ impl UdpMux {
     ) -> Arc<dyn AsyncUdpSocket> {
         let route = Arc::new(Route {
             endpoint: Arc::new(EndpointState {
-                queue: Mutex::new(VecDeque::new()),
+                queue: Mutex::new(EndpointQueue {
+                    datagrams: VecDeque::new(),
+                    bytes: 0,
+                }),
                 waker: AtomicWaker::new(),
+                dropped_packets: AtomicUsize::new(0),
             }),
             remote_addr: Mutex::new(None),
         });
@@ -137,7 +156,11 @@ impl UdpMux {
             if let Some(remote_addr) = route.remote_addr.lock().ok().and_then(|addr| *addr)
                 && let Ok(mut addresses) = self.by_remote_addr.lock()
             {
-                addresses.remove(&remote_addr);
+                // Do not let an older route remove a newer route that has
+                // since claimed the same address.
+                if addresses.get(&remote_addr) == Some(&connection_id) {
+                    addresses.remove(&remote_addr);
+                }
             }
             route.endpoint.waker.wake();
         }
@@ -184,44 +207,98 @@ impl UdpMux {
                 );
                 continue;
             };
-            let route = mux
-                .routes
-                .lock()
-                .ok()
-                .and_then(|routes| routes.get(&connection_id).cloned());
-            let Some(route) = route else {
-                continue;
-            };
-            if let Ok(mut address) = route.remote_addr.lock() {
-                *address = Some(remote_addr);
-            }
-            if let Ok(mut addresses) = mux.by_remote_addr.lock() {
-                addresses.insert(remote_addr, connection_id);
-            }
-            if let Ok(mut queue) = route.endpoint.queue.lock() {
-                queue.push_back(Datagram {
-                    data: Bytes::copy_from_slice(packet),
-                    remote_addr,
-                });
-            }
-            route.endpoint.waker.wake();
+            mux.route_packet(connection_id, packet, remote_addr);
         }
     }
 
+    fn route_packet(&self, connection_id: Uuid, packet: &[u8], remote_addr: SocketAddr) {
+        // Keep the route registered until its learned-address update commits.
+        // Otherwise unregister could remove it between lookup and insertion,
+        // leaving a stale address entry behind.
+        let Ok(routes) = self.routes.lock() else {
+            return;
+        };
+        let Some(route) = routes.get(&connection_id) else {
+            return;
+        };
+
+        let old_addr = route.remote_addr.lock().ok().and_then(|mut address| {
+            let previous = *address;
+            *address = Some(remote_addr);
+            previous
+        });
+        if let Ok(mut addresses) = self.by_remote_addr.lock() {
+            if let Some(old_addr) = old_addr
+                && old_addr != remote_addr
+                && addresses.get(&old_addr) == Some(&connection_id)
+            {
+                addresses.remove(&old_addr);
+            }
+            addresses.insert(remote_addr, connection_id);
+        }
+        route.endpoint.enqueue(packet, remote_addr);
+        drop(routes);
+    }
+
     fn identify_packet(&self, packet: &[u8], remote_addr: SocketAddr) -> Option<Uuid> {
+        // A STUN USERNAME is the only authenticated-ish routing hint available
+        // to this mux before ICE consumes the packet. Prefer it to a learned
+        // address so ICE restarts and NAT rebinding reach the intended peer.
+        // Never fall back to an address for malformed or unknown STUN packets.
+        if let Some(username) = stun_username(packet) {
+            let ufrags = self.by_remote_ufrag.lock().ok()?;
+            let connection_id = ufrags.iter().find_map(|(ufrag, connection_id)| {
+                username
+                    .split(':')
+                    .any(|part| part == ufrag)
+                    .then_some(*connection_id)
+            });
+            // A request with an unknown username must never inherit an older
+            // address route. It belongs to another ICE generation or peer.
+            return connection_id;
+        }
+        // Binding success/error responses do not carry USERNAME. Once an
+        // authenticated request has learned the peer's address, route those
+        // responses by that exact address so ICE connectivity checks can
+        // complete. Requests and malformed STUN packets remain fail-closed.
+        if is_stun_packet(packet) && !is_stun_response(packet) {
+            return None;
+        }
         if let Ok(addresses) = self.by_remote_addr.lock()
             && let Some(connection_id) = addresses.get(&remote_addr)
         {
             return Some(*connection_id);
         }
-        let username = stun_username(packet)?;
-        let ufrags = self.by_remote_ufrag.lock().ok()?;
-        ufrags.iter().find_map(|(ufrag, connection_id)| {
-            username
-                .split(':')
-                .any(|part| part == ufrag)
-                .then_some(*connection_id)
-        })
+        None
+    }
+}
+
+impl EndpointState {
+    fn enqueue(&self, packet: &[u8], remote_addr: SocketAddr) {
+        let packet_len = packet.len();
+        let Ok(mut queue) = self.queue.lock() else {
+            return;
+        };
+        if packet_len > MAX_QUEUED_BYTES {
+            self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        while queue.datagrams.len() >= MAX_QUEUED_PACKETS
+            || queue.bytes.saturating_add(packet_len) > MAX_QUEUED_BYTES
+        {
+            let Some(dropped) = queue.datagrams.pop_front() else {
+                break;
+            };
+            queue.bytes -= dropped.data.len();
+            self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        }
+        queue.bytes += packet_len;
+        queue.datagrams.push_back(Datagram {
+            data: Bytes::copy_from_slice(packet),
+            remote_addr,
+        });
+        drop(queue);
+        self.waker.wake();
     }
 }
 
@@ -275,7 +352,8 @@ impl AsyncUdpSocket for UdpMuxEndpoint {
                 return Poll::Ready(Err(io::Error::other("UDP mux queue lock poisoned")));
             }
         };
-        if let Some(datagram) = queue.pop_front() {
+        if let Some(datagram) = queue.datagrams.pop_front() {
+            queue.bytes -= datagram.data.len();
             let length = datagram.data.len().min(bufs[0].len());
             bufs[0][..length].copy_from_slice(&datagram.data[..length]);
             meta[0].addr = datagram.remote_addr;
@@ -284,7 +362,7 @@ impl AsyncUdpSocket for UdpMuxEndpoint {
             return Poll::Ready(Ok(1));
         }
         self.state.waker.register(cx.waker());
-        if queue.is_empty() {
+        if queue.datagrams.is_empty() {
             Poll::Pending
         } else {
             cx.waker().wake_by_ref();
@@ -302,7 +380,7 @@ impl AsyncUdpSocket for UdpMuxEndpoint {
 }
 
 fn stun_username(packet: &[u8]) -> Option<String> {
-    if packet.len() < 20 || packet[4..8] != [0x21, 0x12, 0xa4, 0x42] {
+    if !is_stun_packet(packet) {
         return None;
     }
     let message_length = u16::from_be_bytes([packet[2], packet[3]]) as usize;
@@ -325,6 +403,23 @@ fn stun_username(packet: &[u8]) -> Option<String> {
         offset = value_start + ((attribute_length + 3) & !3);
     }
     None
+}
+
+fn is_stun_packet(packet: &[u8]) -> bool {
+    packet.len() >= 20 && packet[4..8] == [0x21, 0x12, 0xa4, 0x42]
+}
+
+fn is_stun_response(packet: &[u8]) -> bool {
+    if !is_stun_packet(packet) {
+        return false;
+    }
+    let message_length = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if 20_usize.saturating_add(message_length) > packet.len() {
+        return false;
+    }
+    let message_type = u16::from_be_bytes([packet[0], packet[1]]);
+    let class = ((message_type >> 4) & 0x1) | ((message_type >> 7) & 0x2);
+    class >= 2
 }
 
 #[cfg(test)]
@@ -370,5 +465,142 @@ mod tests {
         let endpoint = mux.endpoint(Uuid::new_v4(), "viewer".to_owned());
 
         assert_eq!(endpoint.local_addr().unwrap(), public_candidate);
+    }
+
+    fn stun_packet(username: &str) -> Vec<u8> {
+        let username = username.as_bytes();
+        let padded_len = (username.len() + 3) & !3;
+        let mut packet = vec![0_u8; 20];
+        packet[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        packet[2..4].copy_from_slice(&((4 + padded_len) as u16).to_be_bytes());
+        packet.extend_from_slice(&0x0006_u16.to_be_bytes());
+        packet.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        packet.extend_from_slice(username);
+        packet.resize(20 + 4 + padded_len, 0);
+        packet
+    }
+
+    fn stun_success_response() -> Vec<u8> {
+        let mut packet = vec![0_u8; 20];
+        packet[..2].copy_from_slice(&0x0101_u16.to_be_bytes());
+        packet[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        packet
+    }
+
+    #[test]
+    fn endpoint_queue_is_bounded_and_drops_oldest_packets() {
+        let state = EndpointState {
+            queue: Mutex::new(EndpointQueue {
+                datagrams: VecDeque::new(),
+                bytes: 0,
+            }),
+            waker: AtomicWaker::new(),
+            dropped_packets: AtomicUsize::new(0),
+        };
+        let remote_addr = "127.0.0.1:9000".parse().unwrap();
+        for value in 0..=MAX_QUEUED_PACKETS {
+            state.enqueue(&[value as u8], remote_addr);
+        }
+        let queue = state.queue.lock().unwrap();
+        assert_eq!(queue.datagrams.len(), MAX_QUEUED_PACKETS);
+        assert_eq!(queue.datagrams.front().unwrap().data[0], 1);
+        assert_eq!(state.dropped_packets.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn endpoint_queue_is_bounded_by_bytes() {
+        let state = EndpointState {
+            queue: Mutex::new(EndpointQueue {
+                datagrams: VecDeque::new(),
+                bytes: 0,
+            }),
+            waker: AtomicWaker::new(),
+            dropped_packets: AtomicUsize::new(0),
+        };
+        let remote_addr = "127.0.0.1:9000".parse().unwrap();
+        let packet = vec![0_u8; MAX_QUEUED_BYTES / 2];
+        state.enqueue(&packet, remote_addr);
+        state.enqueue(&packet, remote_addr);
+        state.enqueue(&packet, remote_addr);
+
+        let queue = state.queue.lock().unwrap();
+        assert_eq!(queue.datagrams.len(), 2);
+        assert_eq!(queue.bytes, MAX_QUEUED_BYTES);
+        assert_eq!(state.dropped_packets.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stun_route_replaces_a_changed_remote_address() {
+        let bind_address = "127.0.0.1:0".parse().unwrap();
+        let mux = UdpMux::bind(bind_address, bind_address).unwrap();
+        let id = Uuid::new_v4();
+        let _endpoint = mux.endpoint(id, "viewer".to_owned());
+        let old_addr = "127.0.0.1:9001".parse().unwrap();
+        let new_addr = "127.0.0.1:9002".parse().unwrap();
+
+        mux.route_packet(id, &stun_packet("server:viewer"), old_addr);
+        mux.route_packet(id, &stun_packet("server:viewer"), new_addr);
+
+        let addresses = mux.by_remote_addr.lock().unwrap();
+        assert_eq!(addresses.get(&new_addr), Some(&id));
+        assert!(!addresses.contains_key(&old_addr));
+    }
+
+    #[tokio::test]
+    async fn unregistering_an_old_route_keeps_a_new_same_address_route() {
+        let bind_address = "127.0.0.1:0".parse().unwrap();
+        let mux = UdpMux::bind(bind_address, bind_address).unwrap();
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+        let _old_endpoint = mux.endpoint(old_id, "old".to_owned());
+        let _new_endpoint = mux.endpoint(new_id, "new".to_owned());
+        let addr = "127.0.0.1:9003".parse().unwrap();
+
+        mux.route_packet(old_id, &stun_packet("server:old"), addr);
+        mux.route_packet(new_id, &stun_packet("server:new"), addr);
+        mux.unregister(old_id);
+
+        assert_eq!(mux.by_remote_addr.lock().unwrap().get(&addr), Some(&new_id));
+    }
+
+    #[tokio::test]
+    async fn stun_routing_overrides_a_stale_address_mapping() {
+        let bind_address = "127.0.0.1:0".parse().unwrap();
+        let mux = UdpMux::bind(bind_address, bind_address).unwrap();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let _first_endpoint = mux.endpoint(first_id, "first".to_owned());
+        let _second_endpoint = mux.endpoint(second_id, "second".to_owned());
+        let addr = "127.0.0.1:9004".parse().unwrap();
+
+        mux.route_packet(first_id, &stun_packet("server:first"), addr);
+        assert_eq!(
+            mux.identify_packet(&stun_packet("server:second"), addr),
+            Some(second_id)
+        );
+        assert_eq!(mux.identify_packet(&[0x80, 0x60], addr), Some(first_id));
+    }
+
+    #[tokio::test]
+    async fn stun_responses_use_the_address_learned_from_a_valid_request() {
+        let bind_address = "127.0.0.1:0".parse().unwrap();
+        let mux = UdpMux::bind(bind_address, bind_address).unwrap();
+        let id = Uuid::new_v4();
+        let _endpoint = mux.endpoint(id, "viewer".to_owned());
+        let addr = "127.0.0.1:9005".parse().unwrap();
+
+        let request = stun_packet("server:viewer");
+        assert_eq!(mux.identify_packet(&request, addr), Some(id));
+        mux.route_packet(id, &request, addr);
+        assert_eq!(
+            mux.identify_packet(&stun_success_response(), addr),
+            Some(id)
+        );
+
+        // An unknown request cannot reuse the learned route.
+        assert_eq!(
+            mux.identify_packet(&stun_packet("server:other"), addr),
+            None
+        );
     }
 }

@@ -7,6 +7,7 @@ import { useViewer } from '@/composables/useViewer'
 const {
   videoStream,
   status,
+  mediaStatus,
   rttMs,
   jitterMs,
   bitrateBps,
@@ -33,6 +34,8 @@ const {
   quality,
   start,
   unmute,
+  setVideoElement,
+  reportPlaybackError,
   seekToLiveEdge,
   noteVideoFrameRendered,
 } = useViewer()
@@ -48,7 +51,7 @@ function formatDelay() {
     const receiver = receiveToDisplayDelayMs.value === null
       ? ''
       : ` / receiver ${Math.round(receiveToDisplayDelayMs.value)} ms`
-    const processing = receiver || frameProcessingDelayMs.value === null
+    const processing = frameProcessingDelayMs.value === null
       ? ''
       : ` / processing ${Math.round(frameProcessingDelayMs.value)} ms`
     const prefix = frameDelayMode.value === 'host-correlated' ? '' : '~'
@@ -132,7 +135,9 @@ onMounted(start)
 
 <template>
   <main>
-    <StreamVideo :stream="videoStream" :audio-enabled="status.audio_enabled === true" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
+    <StreamVideo :stream="videoStream" :audio-enabled="status.audio_enabled === true" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @video-element="setVideoElement" @playback-error="reportPlaybackError" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
+
+    <p v-if="mediaStatus" class="media-status" role="status" aria-live="polite">{{ mediaStatus }}</p>
 
     <section class="data-grid" aria-label="Live stream metrics">
       <div class="data-cell">

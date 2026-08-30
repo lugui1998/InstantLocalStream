@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
+            libpipewire-0.3-dev libssl-dev libudev-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb1-dev libxkbcommon-dev libxrandr-dev pkg-config
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install viewer dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Test viewer
+        working-directory: web
+        run: npm test
+
+      - name: Build viewer
+        working-directory: web
+        run: npm run build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --locked

@@ -11,6 +11,9 @@ const CLOUDFLARE_UPLOAD_ENDPOINT: &str = "https://speed.cloudflare.com/__up";
 const INITIAL_UPLOAD_PROBE_SIZES: &[usize] = &[1 << 20, 4 << 20, 16 << 20, 64 << 20];
 const UPLOAD_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_UPLOAD_PROBE_SIZE: usize = 128 << 20;
+const MAX_UPLOAD_PROBE_BYTES: usize = 256 << 20;
+const MAX_UPLOAD_PROBE_DURATION: Duration = Duration::from_secs(45);
 
 type UploadProgressCallback = Arc<Mutex<Box<dyn FnMut(UploadSpeedTestProgress) + Send>>>;
 
@@ -33,9 +36,18 @@ pub fn measure_cloudflare_upload_bps_with_progress(
         .context("create upload speed test client")?;
     let progress_callback: UploadProgressCallback = Arc::new(Mutex::new(Box::new(on_progress)));
     let mut size = INITIAL_UPLOAD_PROBE_SIZES[0];
+    let test_started = Instant::now();
+    let mut attempted_bytes = 0_usize;
     let mut previous_upload_bps = None;
     let mut largest_measurement = None;
     loop {
+        if size > MAX_UPLOAD_PROBE_SIZE
+            || attempted_bytes.saturating_add(size) > MAX_UPLOAD_PROBE_BYTES
+            || test_started.elapsed() >= MAX_UPLOAD_PROBE_DURATION
+        {
+            break;
+        }
+        attempted_bytes = attempted_bytes.saturating_add(size);
         let started = Instant::now();
         let request = client
             .post(CLOUDFLARE_UPLOAD_ENDPOINT)
@@ -87,13 +99,13 @@ fn next_upload_probe_size(size: usize) -> Option<usize> {
     if let Some(index) = INITIAL_UPLOAD_PROBE_SIZES
         .iter()
         .position(|probe| *probe == size)
+        && let Some(next_size) = INITIAL_UPLOAD_PROBE_SIZES.get(index + 1)
     {
-        if let Some(next_size) = INITIAL_UPLOAD_PROBE_SIZES.get(index + 1) {
-            return Some(*next_size);
-        }
+        return Some(*next_size);
     }
 
     size.checked_mul(2)
+        .filter(|next_size| *next_size <= MAX_UPLOAD_PROBE_SIZE)
 }
 
 /// Converts the measured host upload rate into a conservative viewer limit.
@@ -230,7 +242,6 @@ mod tests {
     #[test]
     fn upload_probe_ramp_doubles_after_initial_sizes() {
         assert_eq!(next_upload_probe_size(64 << 20), Some(128 << 20));
-        assert_eq!(next_upload_probe_size(128 << 20), Some(256 << 20));
-        assert_eq!(next_upload_probe_size(256 << 20), Some(512 << 20));
+        assert_eq!(next_upload_probe_size(128 << 20), None);
     }
 }

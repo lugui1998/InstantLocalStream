@@ -41,6 +41,16 @@ const VP9_PAYLOAD_TYPE: u8 = 98;
 // Chrome advertises constrained-baseline packetization-mode=1 as PT 108.
 // Keeping this fixed makes the static sample writer match the answer SDP.
 const H264_PAYLOAD_TYPE: u8 = 108;
+// The shared encoder must fit the level browsers actually offer to receive.
+// Mainstream WebRTC offers commonly use constrained-baseline level 3.1; higher
+// output profiles are rejected instead of negotiating 3.1 and emitting a 4.2
+// bitstream that the receiver never agreed to decode.
+const H264_LEVEL: &str = "3.1";
+const H264_SDP_FMTP_LINE: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+const H264_LEVEL_31_MAX_FRAME_SIZE_MACROBLOCKS: u64 = 3_600;
+const H264_LEVEL_31_MAX_MACROBLOCKS_PER_SECOND: u64 = 108_000;
+const H264_LEVEL_31_MAX_BITRATE_BPS: u32 = 14_000_000;
 const MAX_ENCODED_FRAME_AGE: Duration = Duration::from_millis(250);
 const ENCODER_BACKLOG_RESTART_AGE: Duration = Duration::from_millis(750);
 const ENCODER_BACKLOG_RESTART_FRAMES: u32 = 8;
@@ -161,7 +171,7 @@ impl VideoCodec {
         match self {
             Self::Vp8 => "",
             Self::Vp9 => "profile-id=0",
-            Self::H264 => "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+            Self::H264 => H264_SDP_FMTP_LINE,
         }
     }
 }
@@ -420,14 +430,34 @@ mod tests {
     }
 
     #[test]
-    fn h264_encoder_uses_a_level_compatible_with_the_profile_size() {
+    fn h264_encoder_and_sdp_advertise_the_same_conservative_level() {
         let pipeline = MediaPipeline::with_codec("h264").unwrap();
         let low =
             pipeline.video_encode_args(Some(720), Some("30".to_owned()), "1_000_000".to_owned());
         let high =
             pipeline.video_encode_args(Some(1080), Some("60".to_owned()), "1_000_000".to_owned());
-        assert!(low.windows(2).any(|pair| pair == ["-level:v", "3.1"]));
-        assert!(high.windows(2).any(|pair| pair == ["-level:v", "4.2"]));
+        assert!(low.windows(2).any(|pair| pair == ["-level:v", H264_LEVEL]));
+        assert!(high.windows(2).any(|pair| pair == ["-level:v", H264_LEVEL]));
+        assert!(pipeline.sdp_fmtp_line().contains("profile-level-id=42e01f"));
+    }
+
+    #[test]
+    fn h264_level_31_limits_cover_720p30_but_not_larger_profiles() {
+        assert!(h264_level_31_compatible(1280, 720, 30));
+        assert!(!h264_level_31_compatible(1280, 720, 60));
+        assert!(!h264_level_31_compatible(1920, 1080, 30));
+        assert!(h264_level_31_bitrate_compatible(14_000_000));
+        assert!(!h264_level_31_bitrate_compatible(14_000_001));
+    }
+
+    #[test]
+    fn output_fps_never_upsamples_capture_frames() {
+        let settings = CaptureSettings::from_config(&AppConfig::default());
+        assert_eq!(configured_output_fps(60, &settings).unwrap(), 60);
+
+        let mut faster_output = settings;
+        faster_output.output_fps = Some(60);
+        assert!(configured_output_fps(30, &faster_output).is_err());
     }
 
     #[test]
@@ -785,6 +815,10 @@ impl MediaPipeline {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The encoder needs the source stream metadata, active settings, and revision independently to restart safely."
+    )]
     fn run_shared_source_encoder(
         &self,
         ffmpeg: &str,
@@ -797,11 +831,23 @@ impl MediaPipeline {
     ) -> Result<()> {
         let (width, height) = source_dimensions;
         let frame_size = source_pixel_format_frame_size(source_pixel_format, width, height)?;
-        let output_fps = settings.output_fps.unwrap_or(source_fps).max(1);
-        // Submit raw inputs at the requested output rate. This keeps FFmpeg's
-        // input/output frame mapping one-to-one and prevents a lower profile
-        // from accumulating an invisible raw-frame backlog.
-        let input_fps = source_fps.min(output_fps).max(1);
+        let output_fps = configured_output_fps(source_fps, settings)?;
+        if matches!(self.codec, VideoCodec::H264) {
+            let (output_width, output_height) =
+                output_dimensions(width, height, settings.output_height)?;
+            if !h264_level_31_compatible(output_width, output_height, output_fps) {
+                anyhow::bail!(
+                    "requested H.264 output {output_width}x{output_height} at {output_fps} FPS exceeds constrained-baseline level {H264_LEVEL}"
+                );
+            }
+            if !h264_level_31_bitrate_compatible(settings.bitrate) {
+                anyhow::bail!(
+                    "requested H.264 bitrate {} exceeds constrained-baseline level {H264_LEVEL}'s {} bps limit",
+                    settings.bitrate,
+                    H264_LEVEL_31_MAX_BITRATE_BPS
+                );
+            }
+        }
         let mut args = vec![
             "-hide_banner".to_owned(),
             "-loglevel".to_owned(),
@@ -818,11 +864,9 @@ impl MediaPipeline {
             "-video_size".to_owned(),
             format!("{width}x{height}"),
             "-framerate".to_owned(),
-            input_fps.to_string(),
+            output_fps.to_string(),
             "-i".to_owned(),
             "pipe:0".to_owned(),
-            "-r".to_owned(),
-            output_fps.to_string(),
             "-an".to_owned(),
         ];
         args.extend(self.video_encode_args(
@@ -863,7 +907,7 @@ impl MediaPipeline {
             let writer_timing = timing.clone();
             let writer = scope.spawn(move || -> Result<()> {
                 let mut stdin = stdin;
-                let input_interval = Duration::from_secs_f64(1.0 / input_fps as f64);
+                let input_interval = Duration::from_secs_f64(1.0 / output_fps as f64);
                 let mut next_input_at = Instant::now();
                 while !stop.load(Ordering::Acquire)
                     && capture_revision.load(Ordering::Acquire) == revision
@@ -951,15 +995,6 @@ impl MediaPipeline {
         bitrate: String,
     ) -> Vec<String> {
         let mut args = Vec::new();
-        let h264_fps = group
-            .as_deref()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(60);
-        let h264_level = if output_height.is_none_or(|height| height > 720) || h264_fps > 30 {
-            "4.2"
-        } else {
-            "3.1"
-        };
         if let Some(height) = output_height {
             args.extend(["-vf".to_owned(), format!("scale=-2:{height}")]);
         }
@@ -1032,7 +1067,7 @@ impl MediaPipeline {
                 "-profile:v".to_owned(),
                 "baseline".to_owned(),
                 "-level:v".to_owned(),
-                h264_level.to_owned(),
+                H264_LEVEL.to_owned(),
                 "-pix_fmt".to_owned(),
                 "yuv420p".to_owned(),
                 "-keyint_min".to_owned(),
@@ -1144,7 +1179,7 @@ impl MediaPipeline {
                     bytes = sample.data.len(),
                     "H.264 sample received"
                 );
-            } else if timed_samples % 30 == 0 {
+            } else if timed_samples.is_multiple_of(30) {
                 tracing::debug!(
                     timed_samples,
                     bytes = sample.data.len(),
@@ -1265,8 +1300,64 @@ fn h264_nal_kind(nal: &Bytes) -> H264NalKind {
     }
 }
 
+/// Returns the configured output rate only when each encoded access unit can
+/// correspond to one submitted capture frame.  Allowing FFmpeg to upsample a
+/// rawvideo pipe duplicates output access units, which makes the capture-time
+/// FIFO attribute duplicates to later source frames.
+fn configured_output_fps(source_fps: u32, settings: &CaptureSettings) -> Result<u32> {
+    if source_fps == 0 {
+        anyhow::bail!("source FPS must be greater than zero");
+    }
+    let output_fps = settings.output_fps.unwrap_or(source_fps).max(1);
+    if output_fps > source_fps {
+        anyhow::bail!(
+            "output FPS ({output_fps}) cannot exceed source FPS ({source_fps}); frame duplication would invalidate capture timing"
+        );
+    }
+    Ok(output_fps)
+}
+
+/// Mirrors `scale=-2:<height>` closely enough for conservative H.264 level
+/// validation: preserve aspect ratio and round the calculated width up to an
+/// even value required by yuv420p.
+fn output_dimensions(
+    source_width: u32,
+    source_height: u32,
+    configured_output_height: Option<u32>,
+) -> Result<(u32, u32)> {
+    if source_width == 0 || source_height == 0 {
+        anyhow::bail!("source dimensions must be greater than zero");
+    }
+    let Some(output_height) = configured_output_height else {
+        return Ok((source_width, source_height));
+    };
+    if output_height == 0 {
+        anyhow::bail!("output height must be greater than zero");
+    }
+    let scaled_width = (u64::from(source_width) * u64::from(output_height))
+        .div_ceil(u64::from(source_height))
+        .max(2);
+    let even_width = scaled_width.div_ceil(2) * 2;
+    let width = u32::try_from(even_width).context("scaled output width exceeds u32")?;
+    Ok((width, output_height))
+}
+
+fn h264_level_31_compatible(width: u32, height: u32, fps: u32) -> bool {
+    if width == 0 || height == 0 || fps == 0 {
+        return false;
+    }
+    let macroblocks_per_frame = u64::from(width).div_ceil(16) * u64::from(height).div_ceil(16);
+    macroblocks_per_frame <= H264_LEVEL_31_MAX_FRAME_SIZE_MACROBLOCKS
+        && macroblocks_per_frame.saturating_mul(u64::from(fps))
+            <= H264_LEVEL_31_MAX_MACROBLOCKS_PER_SECOND
+}
+
+fn h264_level_31_bitrate_compatible(bitrate_bps: u32) -> bool {
+    bitrate_bps <= H264_LEVEL_31_MAX_BITRATE_BPS
+}
+
 fn yuv420p_frame_size(width: u32, height: u32) -> Result<usize> {
-    if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+    if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         anyhow::bail!("shared source dimensions must be at least 2x2 and even for yuv420p");
     }
     let pixels = usize::try_from(width)

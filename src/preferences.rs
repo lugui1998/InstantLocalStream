@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, SourceSpec};
+use crate::config::{AppConfig, DEFAULT_AUDIO_EXCLUSIONS, SourceSpec};
+
+const CURRENT_PREFERENCES_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostNetworkTestResult {
@@ -14,6 +16,8 @@ pub struct HostNetworkTestResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserPreferences {
+    #[serde(default)]
+    pub schema_version: u32,
     pub bind: String,
     pub http_port: u16,
     #[serde(default = "default_max_viewers")]
@@ -51,6 +55,7 @@ impl UserPreferences {
         // after relaunch.
         source.native_id = None;
         Self {
+            schema_version: CURRENT_PREFERENCES_VERSION,
             bind: config.bind.clone(),
             http_port: config.http_port,
             max_viewers: config.max_viewers,
@@ -73,7 +78,15 @@ impl UserPreferences {
     }
 
     pub fn apply_to(&self, config: &mut AppConfig) {
-        config.bind = self.bind.clone();
+        // Version 0 predates privacy-safe defaults. Since it cannot distinguish
+        // an explicit choice from the former implicit LAN/system defaults,
+        // migrate once to the safer settings and let the user opt back in.
+        let legacy_defaults = self.schema_version == 0;
+        config.bind = if legacy_defaults && self.bind == "lan" {
+            "localhost".to_owned()
+        } else {
+            self.bind.clone()
+        };
         config.http_port = self.http_port;
         config.max_viewers = self.max_viewers.max(1);
         config.source = self.source.clone();
@@ -91,9 +104,72 @@ impl UserPreferences {
             _ => self.max_quality_groups.clone(),
         };
         config.latency_preference = self.latency_preference.clone();
-        config.audio_mode = self.audio_mode.clone();
-        config.excluded_audio_processes = self.excluded_audio_processes.clone();
+        config.audio_mode = if legacy_defaults && self.audio_mode == "system" {
+            "off".to_owned()
+        } else {
+            self.audio_mode.clone()
+        };
+        let legacy_default_exclusions = self.excluded_audio_processes.len()
+            == DEFAULT_AUDIO_EXCLUSIONS.len()
+            && DEFAULT_AUDIO_EXCLUSIONS.iter().all(|default| {
+                self.excluded_audio_processes
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(default))
+            });
+        config.excluded_audio_processes = if legacy_defaults && legacy_default_exclusions {
+            Vec::new()
+        } else {
+            self.excluded_audio_processes.clone()
+        };
     }
+}
+
+pub fn load() -> Option<UserPreferences> {
+    let bytes = fs::read(path())
+        // Preserve settings written by older releases until the next save
+        // migrates them into the durable per-user configuration directory.
+        .or_else(|_| fs::read(legacy_path()))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub fn save(config: &AppConfig, host_network_test: Option<HostNetworkTestResult>) -> Result<()> {
+    let directory = preferences_directory();
+    fs::create_dir_all(&directory).context("create preferences directory")?;
+    let bytes =
+        serde_json::to_vec_pretty(&UserPreferences::from_config(config, host_network_test))?;
+    fs::write(path(), bytes).context("write user preferences")?;
+    Ok(())
+}
+
+fn preferences_directory() -> PathBuf {
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })
+    };
+    base.unwrap_or_else(std::env::temp_dir)
+        .join("InstantLocalStream")
+}
+
+fn path() -> PathBuf {
+    preferences_directory().join("preferences.json")
+}
+
+fn legacy_path() -> PathBuf {
+    std::env::temp_dir()
+        .join("InstantLocalStream")
+        .join("preferences.json")
 }
 
 #[cfg(test)]
@@ -127,6 +203,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_implicit_network_and_audio_defaults_migrate_to_safe_values() {
+        let config = AppConfig {
+            bind: "lan".to_owned(),
+            audio_mode: "system".to_owned(),
+            excluded_audio_processes: DEFAULT_AUDIO_EXCLUSIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(UserPreferences::from_config(&config, None)).unwrap();
+        value.as_object_mut().unwrap().remove("schema_version");
+        let legacy: UserPreferences = serde_json::from_value(value).unwrap();
+        let mut migrated = config;
+
+        legacy.apply_to(&mut migrated);
+
+        assert_eq!(migrated.bind, "localhost");
+        assert_eq!(migrated.audio_mode, "off");
+        assert!(migrated.excluded_audio_processes.is_empty());
+    }
+
+    #[test]
     fn host_network_test_result_round_trips() {
         let result = HostNetworkTestResult {
             upload_bps: 94_000_000,
@@ -140,26 +239,4 @@ mod tests {
 
         assert_eq!(restored.host_network_test, Some(result));
     }
-}
-
-pub fn load() -> Option<UserPreferences> {
-    let bytes = fs::read(path()).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-pub fn save(config: &AppConfig, host_network_test: Option<HostNetworkTestResult>) -> Result<()> {
-    let directory = preferences_directory();
-    fs::create_dir_all(&directory).context("create preferences directory")?;
-    let bytes =
-        serde_json::to_vec_pretty(&UserPreferences::from_config(config, host_network_test))?;
-    fs::write(path(), bytes).context("write user preferences")?;
-    Ok(())
-}
-
-fn preferences_directory() -> PathBuf {
-    std::env::temp_dir().join("InstantLocalStream")
-}
-
-fn path() -> PathBuf {
-    preferences_directory().join("preferences.json")
 }

@@ -62,7 +62,9 @@ function renderChart() {
   }, data, container)
 }
 
-watch(() => props.samples, renderChart, { deep: true })
+// The composable replaces the sample array for each update, so observing its
+// identity avoids recursively traversing every point on each one-second tick.
+watch(() => props.samples, renderChart)
 
 onMounted(() => {
   renderChart()

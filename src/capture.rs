@@ -132,9 +132,7 @@ fn window_class_name(native_id: u64) -> Option<String> {
     use std::ffi::c_void;
     use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::GetClassNameW};
 
-    let Some(window_id) = u32::try_from(native_id).ok() else {
-        return None;
-    };
+    let window_id = u32::try_from(native_id).ok()?;
     let hwnd = HWND(window_id as usize as *mut c_void);
     if hwnd.0.is_null() {
         return None;
@@ -525,7 +523,7 @@ pub fn ffmpeg_input_args(
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_owned());
         if kind == "monitor" {
@@ -563,6 +561,15 @@ pub fn ffmpeg_input_args(
         }
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (index, _native_id, fps, draw_mouse);
+        anyhow::bail!(
+            "screen capture is currently supported only on Windows and Linux/X11; '{kind}' is unavailable on this platform"
+        );
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     anyhow::bail!("unsupported FFmpeg capture source '{kind}'")
 }
 
