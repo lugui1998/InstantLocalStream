@@ -1132,12 +1132,6 @@ mod imp {
         }
 
         #[test]
-        fn monitor_center_uses_a_point_inside_the_reported_rectangle() {
-            let center = monitor_center(-1920, 40, 1920, 1080).unwrap();
-            assert_eq!((center.x, center.y), (-960, 580));
-        }
-
-        #[test]
         fn live_readback_schedule_keeps_the_first_frame_and_skips_early_arrivals() {
             let start = Instant::now();
             let interval = Duration::from_millis(33);

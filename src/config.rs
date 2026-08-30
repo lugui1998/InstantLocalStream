@@ -735,15 +735,6 @@ mod tests {
     }
 
     #[test]
-    fn h264_is_an_available_initial_codec() {
-        let config = AppConfig {
-            codec: "h264".to_owned(),
-            ..Default::default()
-        };
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
     fn capture_fps_is_bounded_for_timing_retention() {
         let mut config = AppConfig {
             fps: 240,

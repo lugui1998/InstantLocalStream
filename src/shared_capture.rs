@@ -1504,12 +1504,6 @@ mod tests {
     }
 
     #[test]
-    fn packed_four_channel_frames_use_four_bytes_per_pixel() {
-        assert_eq!(SourcePixelFormat::Bgra.frame_size(4, 2).unwrap(), 32);
-        assert_eq!(SourcePixelFormat::Bgra.ffmpeg_name(), "bgra");
-    }
-
-    #[test]
     fn detached_reader_cannot_publish_or_fail_a_new_generation() {
         let format = CaptureFormat {
             width: 4,

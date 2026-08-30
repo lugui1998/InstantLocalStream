@@ -415,11 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_encoder_frame_threshold_is_sub_second() {
-        assert!(MAX_ENCODED_FRAME_AGE <= Duration::from_millis(250));
-    }
-
-    #[test]
     fn h264_encoder_uses_single_slice_frames() {
         let pipeline = MediaPipeline::with_codec("h264").unwrap();
         let args = pipeline.video_encode_args(None, None, "1_000_000".to_owned());

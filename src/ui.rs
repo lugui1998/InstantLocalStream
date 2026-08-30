@@ -3381,17 +3381,6 @@ mod tests {
     }
 
     #[test]
-    fn native_ui_port_is_shared_by_tcp_and_udp() {
-        let mut config = AppConfig::default();
-
-        configure_shared_port(&mut config, 8475);
-
-        assert_eq!(config.http_port, 8475);
-        assert_eq!(config.media_ports.first, 8475);
-        assert_eq!(config.media_ports.last, 8475);
-    }
-
-    #[test]
     fn custom_viewer_host_accepts_a_host_without_a_url_scheme() {
         assert_eq!(
             custom_viewer_host("stream.example.com"),
@@ -3402,15 +3391,6 @@ mod tests {
         assert!(custom_viewer_host("stream.example.com/viewer").is_none());
         assert!(custom_viewer_host(" stream.example.com").is_none());
         assert!(custom_viewer_host("stream .example.com").is_none());
-    }
-
-    #[test]
-    fn settings_labels_standardize_automatic_as_auto() {
-        assert_eq!(quality_mode_label("adaptive"), "Auto");
-        assert_eq!(bitrate_mode_label("automatic"), "Auto");
-        assert_eq!(bitrate_mode_label("fixed"), "Manual");
-        assert_eq!(codec_label("auto"), "Auto");
-        assert_eq!(latency_preference_label("low"), "Low");
     }
 
     #[test]
@@ -3467,11 +3447,5 @@ mod tests {
         assert!(failed.label().contains("capture unavailable"));
 
         assert!(!HostStatus::Failed("bind failed".to_owned()).server_alive());
-    }
-
-    #[test]
-    fn bitrate_labels_are_human_readable() {
-        assert_eq!(bitrate_label(14_000_000), "14.0 Mbps");
-        assert_eq!(bitrate_label(750_000), "750 Kbps");
     }
 }

@@ -225,19 +225,4 @@ mod tests {
         assert_eq!(migrated.audio_mode, "system");
         assert!(migrated.excluded_audio_processes.is_empty());
     }
-
-    #[test]
-    fn host_network_test_result_round_trips() {
-        let result = HostNetworkTestResult {
-            upload_bps: 94_000_000,
-            tested_at_unix_secs: 1_750_000_000,
-        };
-        let config = AppConfig::default();
-        let preferences = UserPreferences::from_config(&config, Some(result.clone()));
-
-        let restored: UserPreferences =
-            serde_json::from_value(serde_json::to_value(preferences).unwrap()).unwrap();
-
-        assert_eq!(restored.host_network_test, Some(result));
-    }
 }

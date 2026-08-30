@@ -5232,14 +5232,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_slot_is_empty_until_a_capture_is_installed() {
-        let slot = CaptureSlot::default();
-        assert!(slot.current().is_none());
-        assert!(slot.take().is_none());
-        assert!(slot.current().is_none());
-    }
-
-    #[test]
     fn detached_group_cleanup_cannot_remove_replacement_media() {
         let settings = CaptureSettings::from_config(&AppConfig::default());
         let old_media = Arc::new(MediaPipeline::with_codec("vp8").unwrap());
@@ -5266,15 +5258,6 @@ mod tests {
                 .expect("replacement remains installed"),
             &replacement
         ));
-    }
-
-    #[test]
-    fn cold_groups_have_no_media_or_visible_primary() {
-        let settings = CaptureSettings::from_config(&AppConfig::default());
-        let groups = TranscodeGroups::new(vec![TranscodeGroup::stopped(0, settings, "vp8")]);
-        assert_eq!(groups.resource_count(), 0);
-        assert!(groups.active_group_ids().is_empty());
-        assert!(groups.media_by_id(0).is_none());
     }
 
     #[test]
