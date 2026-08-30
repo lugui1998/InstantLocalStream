@@ -56,10 +56,32 @@ if command -v appimagetool >/dev/null 2>&1 && command -v linuxdeploy >/dev/null 
     exit 1
   fi
   pipewire_library="$(pkg-config --variable=libdir libpipewire-0.3)/libpipewire-0.3.so.0"
+  pipewire_prefix="$(pkg-config --variable=prefix libpipewire-0.3)"
+  pipewire_libdir="$(pkg-config --variable=libdir libpipewire-0.3)"
+  pipewire_datadir="$(pkg-config --variable=datadir libpipewire-0.3)"
+  pipewire_modules="$pipewire_libdir/pipewire-0.3"
+  spa_plugins="$pipewire_libdir/spa-0.2"
+  pipewire_config="$pipewire_datadir/pipewire"
+  pipewire_license="$pipewire_prefix/share/doc/pipewire/COPYING"
   if [[ ! -s "$pipewire_library" ]]; then
     echo "PipeWire runtime library was not found: $pipewire_library" >&2
     exit 1
   fi
+  for runtime_tree in "$pipewire_modules" "$spa_plugins" "$pipewire_config"; do
+    if [[ ! -d "$runtime_tree" ]]; then
+      echo "PipeWire runtime tree was not found: $runtime_tree" >&2
+      exit 1
+    fi
+  done
+  if [[ ! -s "$pipewire_license" ]]; then
+    echo "PipeWire license was not found: $pipewire_license" >&2
+    exit 1
+  fi
+  mkdir -p "$appdir/usr/lib" "$appdir/usr/share"
+  cp -a "$pipewire_modules" "$appdir/usr/lib/"
+  cp -a "$spa_plugins" "$appdir/usr/lib/"
+  cp -a "$pipewire_config" "$appdir/usr/share/"
+  cp "$pipewire_license" "$license_dir/PIPEWIRE-LICENSE.txt"
   # linuxdeploy's standard exclusion list assumes PipeWire is installed on the
   # target system. Force-deploy it because this executable links to it at startup.
   APPIMAGE_EXTRACT_AND_RUN=1 linuxdeploy --appdir "$appdir" --library "$pipewire_library"
@@ -67,6 +89,20 @@ if command -v appimagetool >/dev/null 2>&1 && command -v linuxdeploy >/dev/null 
     echo "linuxdeploy did not bundle the required PipeWire runtime library." >&2
     exit 1
   fi
+  for required_runtime_file in \
+    "$appdir/usr/lib/libpipewire-0.3.so.0" \
+    "$appdir/usr/lib/pipewire-0.3/libpipewire-module-protocol-native.so" \
+    "$appdir/usr/lib/pipewire-0.3/libpipewire-module-client-node.so" \
+    "$appdir/usr/lib/pipewire-0.3/libpipewire-module-adapter.so" \
+    "$appdir/usr/lib/pipewire-0.3/libpipewire-module-metadata.so" \
+    "$appdir/usr/lib/spa-0.2/support/libspa-support.so" \
+    "$appdir/usr/lib/spa-0.2/audioconvert/libspa-audioconvert.so" \
+    "$appdir/usr/share/pipewire/client.conf"; do
+    if [[ ! -s "$required_runtime_file" ]]; then
+      echo "PipeWire runtime dependency was not bundled: $required_runtime_file" >&2
+      exit 1
+    fi
+  done
   runtime_args=()
   if [[ -n "${APPIMAGETOOL_RUNTIME_FILE:-}" ]]; then
     runtime_args=(--runtime-file "$APPIMAGETOOL_RUNTIME_FILE")

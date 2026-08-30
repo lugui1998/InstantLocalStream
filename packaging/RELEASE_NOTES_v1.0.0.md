@@ -22,8 +22,9 @@ for sharing a monitor or application window to modern browsers over WebRTC.
 - Windows: `Instant-Local-Stream-windows-x86_64.exe`
 - Linux: `Instant-Local-Stream-linux-x86_64.AppImage`
 
-Both applications include the pinned FFmpeg build used by the release. Verify
-downloads with `SHA256SUMS.txt`; FFmpeg license and source/build provenance are
+Both applications include the pinned FFmpeg build used by the release. The
+Linux AppImage also bundles its pinned PipeWire client runtime. Verify downloads
+with `SHA256SUMS.txt`; FFmpeg and PipeWire license and build provenance files are
 provided as separate release assets.
 
 ## Notes
@@ -32,8 +33,9 @@ provided as separate release assets.
   show a warning on first launch.
 - Linux screen capture targets X11. Wayland behavior depends on the desktop,
   portal, and capture permissions.
-- Linux audio capture requires a working host PipeWire service and its SPA
-  modules.
+- Linux audio capture requires a working host PipeWire service and session
+  manager. The AppImage bundles its PipeWire client library, client modules, SPA
+  plugins, and configuration.
 - LAN and public viewer links use HTTP and contain a bearer token. Use a trusted
   network or a secure reverse proxy, and do not publish the token link.
 - Public sharing requires forwarding the selected port to the host for both TCP
