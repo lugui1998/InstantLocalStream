@@ -58,10 +58,9 @@ if command -v appimagetool >/dev/null 2>&1 && command -v linuxdeploy >/dev/null 
   pipewire_library="$(pkg-config --variable=libdir libpipewire-0.3)/libpipewire-0.3.so.0"
   pipewire_prefix="$(pkg-config --variable=prefix libpipewire-0.3)"
   pipewire_libdir="$(pkg-config --variable=libdir libpipewire-0.3)"
-  pipewire_datadir="$(pkg-config --variable=datadir libpipewire-0.3)"
   pipewire_modules="$pipewire_libdir/pipewire-0.3"
   spa_plugins="$pipewire_libdir/spa-0.2"
-  pipewire_config="$pipewire_datadir/pipewire"
+  pipewire_config="$pipewire_prefix/share/pipewire"
   pipewire_license="$pipewire_prefix/share/doc/pipewire/COPYING"
   if [[ ! -s "$pipewire_library" ]]; then
     echo "PipeWire runtime library was not found: $pipewire_library" >&2
