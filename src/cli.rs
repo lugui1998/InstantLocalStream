@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -47,6 +48,14 @@ pub enum Command {
     Status {
         #[arg(long, default_value_t = 8475)]
         http_port: u16,
+    },
+    Licenses {
+        #[arg(
+            long,
+            default_value = "Instant-Local-Stream-licenses",
+            help = "Directory to receive the bundled license and notice files"
+        )]
+        output: PathBuf,
     },
     Version,
 }

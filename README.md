@@ -80,6 +80,8 @@ Run `cargo run -- --help` to see the command-line options. Contributors can find
 
 Instant Local Stream uses FFmpeg and other third-party components. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the [FFmpeg source information](packaging/FFMPEG_SOURCE_OFFER.md) for details.
 
+The portable downloads contain their required license notices. On Windows, run `Instant-Local-Stream-windows-x86_64.exe licenses` to extract readable copies.
+
 ## Disclosure
 
 AI tools were used while creating this project.

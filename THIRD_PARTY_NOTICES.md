@@ -6,12 +6,13 @@ Noncommercial License 1.0.0. The complete project license is provided in
 below; the project license does not replace or modify those terms.
 
 This notice summarizes the direct production dependencies resolved for
-v1.0.0. `Cargo.lock` and `web-package-lock.json`, shipped with the release,
-are the authoritative inventories of all direct and transitive versions.
+v1.0.0. `Cargo.lock` and `web/package-lock.json`, included in the source
+archives, are the authoritative inventories of all direct and transitive versions.
 Each component remains subject to its own license and copyright notices.
 Complete harvested license and copyright texts are provided in
-`THIRD_PARTY_LICENSES-RUST.txt` and `THIRD_PARTY_LICENSES-NPM.txt` with every
-release. They are also bundled inside the Windows archive and Linux AppImage.
+`THIRD_PARTY_LICENSES-RUST.txt` and `THIRD_PARTY_LICENSES-NPM.txt`. They are
+bundled inside the Windows executable and Linux AppImage. The Windows files can
+be extracted with `Instant-Local-Stream-windows-x86_64.exe licenses`.
 
 ## Rust dependencies
 
@@ -62,7 +63,7 @@ The compiled viewer includes these direct runtime dependencies:
 - `vue` 3.5.41 — MIT
 
 The frontend build toolchain and its complete transitive resolution are
-recorded in `web-package-lock.json`. Packages in that lockfile use permissive
+recorded in `web/package-lock.json`. Packages in that lockfile use permissive
 licenses including MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, and ISC; consult
 each package's bundled metadata for its copyright notice and exact terms.
 
@@ -70,11 +71,9 @@ each package's bundled metadata for its copyright notice and exact terms.
 
 The Windows and Linux portable artifacts embed an unmodified FFmpeg
 executable from BtbN/FFmpeg-Builds and invoke it as a separate process. The
-selected GPL build includes `libx264`. Each release includes:
+selected GPL build includes `libx264`. Each portable build includes:
 
 - the license text extracted from the exact platform archive;
-- the complete `ffmpeg -version` output, including configuration and library
-  versions;
 - pinned source, build, archive, and reproduction information in
   `FFMPEG_SOURCE_OFFER.md`.
 

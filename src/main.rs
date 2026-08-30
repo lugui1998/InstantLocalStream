@@ -77,6 +77,13 @@ fn run() -> Result<()> {
             }
         }
         Command::Status { http_port } => cli::print_status(http_port, json_output)?,
+        Command::Licenses { output } => {
+            let count = packaging::write_bundled_licenses(&output)?;
+            println!(
+                "wrote {count} license and notice files to {}",
+                output.display()
+            );
+        }
         Command::Version => println!("instant-local-stream {}", env!("CARGO_PKG_VERSION")),
     }
 

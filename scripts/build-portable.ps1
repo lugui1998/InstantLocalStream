@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$FfmpegPath,
+    [Parameter(Mandatory = $true)]
+    [string]$FfmpegLicensePath,
     [switch]$UsePrebuiltWeb
 )
 
@@ -19,6 +21,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "FFmpeg could not be executed: $resolvedFfmpeg"
 }
 $env:ILS_FFMPEG_PATH = $resolvedFfmpeg
+$ffmpegLicenseItem = Get-Item -LiteralPath $FfmpegLicensePath
+$resolvedFfmpegLicense = if ($ffmpegLicenseItem.ResolvedTarget) {
+    $ffmpegLicenseItem.ResolvedTarget
+} else {
+    $ffmpegLicenseItem.FullName
+}
+if ((Get-Item -LiteralPath $resolvedFfmpegLicense).Length -le 0) {
+    throw "FFmpeg license file is empty: $resolvedFfmpegLicense"
+}
+$env:ILS_FFMPEG_LICENSE_PATH = $resolvedFfmpegLicense
 
 if ($UsePrebuiltWeb) {
     $webIndex = Join-Path (Get-Location) "web\dist\index.html"

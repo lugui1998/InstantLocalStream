@@ -9,4 +9,4 @@ The Windows and Linux x86-64 release artifacts embed an unmodified, statically l
 - Windows archive: `ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-8.1.zip`
 - Linux archive: `ffmpeg-n8.1.2-50-g1a748fe2cd-linux64-gpl-8.1.tar.xz`
 
-The release includes the FFmpeg license text extracted from each upstream archive and platform-specific provenance files containing the complete `ffmpeg -version` output, including configure options and library versions. The release workflow verifies both archives against pinned SHA-256 values recorded in the workflow.
+The portable applications include the FFmpeg license text extracted from the exact upstream archive. On Windows, run `Instant-Local-Stream-windows-x86_64.exe licenses` to extract it and the other bundled notices. In the Linux AppImage, the notices are under `usr/share/doc/Instant-Local-Stream`. The release workflow verifies both archives against pinned SHA-256 values recorded in the workflow.

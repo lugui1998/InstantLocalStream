@@ -149,18 +149,8 @@ jobs:
               throw "Required FFmpeg encoder is missing: $encoder"
             }
           }
-          ./scripts/build-portable.ps1 -FfmpegPath $ffmpeg.FullName -UsePrebuiltWeb
+          ./scripts/build-portable.ps1 -FfmpegPath $ffmpeg.FullName -FfmpegLicensePath $ffmpegLicense.FullName -UsePrebuiltWeb
           Move-Item dist/Instant-Local-Stream.exe dist/Instant-Local-Stream-windows-x86_64.exe
-          Copy-Item $ffmpegLicense.FullName dist/FFMPEG-LICENSE-windows-x86_64.txt
-          @(
-            "Provider: https://github.com/BtbN/FFmpeg-Builds"
-            "Release: $env:FFMPEG_RELEASE"
-            "Revision: $env:FFMPEG_REVISION"
-            "Archive: $env:FFMPEG_ARCHIVE"
-            "Variant: Windows x86-64 GPL static"
-            ""
-          ) | Set-Content dist/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
-          & $ffmpeg.FullName -version 2>&1 | Add-Content dist/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
           if ((Get-Item dist/Instant-Local-Stream-windows-x86_64.exe).Length -le 0) {
             throw "Windows release artifact is empty"
           }
@@ -183,15 +173,33 @@ jobs:
           if (-not $validation.ok -or -not $validation.ffmpeg.available -or $validation.ffmpeg.command -ne "embedded FFmpeg") {
             throw "Packaged Windows validation did not use embedded FFmpeg: $(Get-Content $stdoutPath -Raw)"
           }
+          $licenseOutput = Join-Path $env:RUNNER_TEMP "instant-local-stream-licenses"
+          $licenseProcessArguments = @{
+            FilePath = (Resolve-Path dist/Instant-Local-Stream-windows-x86_64.exe)
+            ArgumentList = @("licenses", "--output", $licenseOutput)
+            Wait = $true
+            PassThru = $true
+          }
+          $licenseProcess = Start-Process @licenseProcessArguments
+          if ($licenseProcess.ExitCode -ne 0) {
+            throw "Packaged Windows license extraction failed"
+          }
+          foreach ($name in @("LICENSE", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES-RUST.txt", "THIRD_PARTY_LICENSES-NPM.txt", "FFMPEG_SOURCE_OFFER.md", "FFMPEG-LICENSE.txt")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $licenseOutput $name) -PathType Leaf)) {
+              throw "Packaged Windows license file is missing: $name"
+            }
+          }
+          $expectedLicenseHash = (Get-FileHash $ffmpegLicense.FullName -Algorithm SHA256).Hash
+          $actualLicenseHash = (Get-FileHash (Join-Path $licenseOutput "FFMPEG-LICENSE.txt") -Algorithm SHA256).Hash
+          if ($actualLicenseHash -ne $expectedLicenseHash) {
+            throw "Packaged Windows FFmpeg license does not match its embedded FFmpeg archive"
+          }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-windows-x86_64
-          path: |
-            dist/Instant-Local-Stream-windows-x86_64.exe
-            dist/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
-            dist/FFMPEG-LICENSE-windows-x86_64.txt
+          path: dist/Instant-Local-Stream-windows-x86_64.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -342,34 +350,18 @@ jobs:
           done
           bash scripts/build-portable.sh "$ffmpeg_path" "$ffmpeg_license" --use-prebuilt-web
           test -s dist/Instant-Local-Stream-linux-x86_64.AppImage
-          cp "$ffmpeg_license" dist/FFMPEG-LICENSE-linux-x86_64.txt
-          cp "$RUNNER_TEMP/pipewire-prefix/share/doc/pipewire/COPYING" dist/PIPEWIRE-LICENSE-linux-x86_64.txt
-          {
-            echo "Provider: https://github.com/BtbN/FFmpeg-Builds"
-            echo "Release: $FFMPEG_RELEASE"
-            echo "Revision: $FFMPEG_REVISION"
-            echo "Archive: $FFMPEG_ARCHIVE"
-            echo "Variant: Linux x86-64 GPL static"
-            echo
-            "$ffmpeg_path" -version
-          } > dist/Instant-Local-Stream-linux-x86_64.ffmpeg.txt
-          {
-            echo "Provider: https://github.com/PipeWire/pipewire"
-            echo "Version: $PIPEWIRE_VERSION"
-            echo "Commit: $PIPEWIRE_COMMIT"
-            echo "Build: source-built on Ubuntu 22.04 x86-64"
-          } > dist/Instant-Local-Stream-linux-x86_64.pipewire.txt
+          license_output="$(mktemp -d)"
+          dist/Instant-Local-Stream-linux-x86_64.AppImage licenses --output "$license_output"
+          for name in LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES-RUST.txt THIRD_PARTY_LICENSES-NPM.txt FFMPEG_SOURCE_OFFER.md FFMPEG-LICENSE.txt; do
+            test -s "$license_output/$name"
+          done
+          cmp "$ffmpeg_license" "$license_output/FFMPEG-LICENSE.txt"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-linux-x86_64
-          path: |
-            dist/Instant-Local-Stream-linux-x86_64.AppImage
-            dist/Instant-Local-Stream-linux-x86_64.ffmpeg.txt
-            dist/FFMPEG-LICENSE-linux-x86_64.txt
-            dist/Instant-Local-Stream-linux-x86_64.pipewire.txt
-            dist/PIPEWIRE-LICENSE-linux-x86_64.txt
+          path: dist/Instant-Local-Stream-linux-x86_64.AppImage
           if-no-files-found: error
           retention-days: 7
 
@@ -423,44 +415,13 @@ jobs:
           name: release-linux-x86_64
           path: release-linux
 
-      - name: Generate checksums
+      - name: Assemble release files
         shell: bash
         run: |
           set -euo pipefail
           mkdir release
           cp release-windows/Instant-Local-Stream-windows-x86_64.exe release/
-          cp release-windows/Instant-Local-Stream-windows-x86_64.ffmpeg.txt release/
-          cp release-windows/FFMPEG-LICENSE-windows-x86_64.txt release/
           cp release-linux/Instant-Local-Stream-linux-x86_64.AppImage release/
-          cp release-linux/Instant-Local-Stream-linux-x86_64.ffmpeg.txt release/
-          cp release-linux/FFMPEG-LICENSE-linux-x86_64.txt release/
-          cp release-linux/Instant-Local-Stream-linux-x86_64.pipewire.txt release/
-          cp release-linux/PIPEWIRE-LICENSE-linux-x86_64.txt release/
-          cp THIRD_PARTY_NOTICES.md release/THIRD_PARTY_NOTICES.md
-          cp packaging/THIRD_PARTY_LICENSES-RUST.txt release/THIRD_PARTY_LICENSES-RUST.txt
-          cp packaging/THIRD_PARTY_LICENSES-NPM.txt release/THIRD_PARTY_LICENSES-NPM.txt
-          cp packaging/FFMPEG_SOURCE_OFFER.md release/FFMPEG_SOURCE_OFFER.md
-          cp LICENSE release/LICENSE
-          cp Cargo.lock release/Cargo.lock
-          cp web/package-lock.json release/web-package-lock.json
-          cd release
-          sha256sum \
-            Instant-Local-Stream-windows-x86_64.exe \
-            Instant-Local-Stream-linux-x86_64.AppImage \
-            Instant-Local-Stream-windows-x86_64.ffmpeg.txt \
-            Instant-Local-Stream-linux-x86_64.ffmpeg.txt \
-            Instant-Local-Stream-linux-x86_64.pipewire.txt \
-            FFMPEG-LICENSE-windows-x86_64.txt \
-            FFMPEG-LICENSE-linux-x86_64.txt \
-            PIPEWIRE-LICENSE-linux-x86_64.txt \
-            FFMPEG_SOURCE_OFFER.md \
-            THIRD_PARTY_NOTICES.md \
-            THIRD_PARTY_LICENSES-RUST.txt \
-            THIRD_PARTY_LICENSES-NPM.txt \
-            LICENSE \
-            Cargo.lock \
-            web-package-lock.json \
-            > SHA256SUMS.txt
 
       - name: Create or update the release
         shell: bash
@@ -471,20 +432,6 @@ jobs:
           release_files=(
             release/Instant-Local-Stream-windows-x86_64.exe
             release/Instant-Local-Stream-linux-x86_64.AppImage
-            release/Instant-Local-Stream-windows-x86_64.ffmpeg.txt
-            release/Instant-Local-Stream-linux-x86_64.ffmpeg.txt
-            release/Instant-Local-Stream-linux-x86_64.pipewire.txt
-            release/FFMPEG-LICENSE-windows-x86_64.txt
-            release/FFMPEG-LICENSE-linux-x86_64.txt
-            release/PIPEWIRE-LICENSE-linux-x86_64.txt
-            release/FFMPEG_SOURCE_OFFER.md
-            release/THIRD_PARTY_NOTICES.md
-            release/THIRD_PARTY_LICENSES-RUST.txt
-            release/THIRD_PARTY_LICENSES-NPM.txt
-            release/LICENSE
-            release/Cargo.lock
-            release/web-package-lock.json
-            release/SHA256SUMS.txt
           )
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = "true"
@@ -498,6 +445,13 @@ jobs:
               fi
             done
             gh release upload "$GITHUB_REF_NAME" "${release_files[@]}"
+            existing_assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+            while IFS= read -r asset; do
+              case "$asset" in
+                Instant-Local-Stream-windows-x86_64.exe|Instant-Local-Stream-linux-x86_64.AppImage) ;;
+                *) gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes ;;
+              esac
+            done <<<"$existing_assets"
           else
             gh release create "$GITHUB_REF_NAME" "${release_files[@]}" \
               --verify-tag \
@@ -505,8 +459,9 @@ jobs:
               --notes-file packaging/RELEASE_NOTES_v1.0.0.md \
               --title "Instant Local Stream $GITHUB_REF_NAME"
           fi
+          expected_assets="$(printf '%s\n' \
+            Instant-Local-Stream-linux-x86_64.AppImage \
+            Instant-Local-Stream-windows-x86_64.exe)"
+          actual_assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort)"
+          test "$actual_assets" = "$expected_assets"
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
-          for file in "${release_files[@]}"; do
-            asset="$(basename "$file")"
-            gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -Fxq "$asset"
-          done

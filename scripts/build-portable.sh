@@ -8,6 +8,7 @@ fi
 
 export ILS_FFMPEG_PATH="$(realpath "$1")"
 ffmpeg_license="$(realpath "$2")"
+export ILS_FFMPEG_LICENSE_PATH="$ffmpeg_license"
 if [[ ! -s "$ILS_FFMPEG_PATH" ]]; then
   echo "FFmpeg file is empty: $ILS_FFMPEG_PATH" >&2
   exit 1

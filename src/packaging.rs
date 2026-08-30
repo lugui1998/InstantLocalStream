@@ -6,6 +6,41 @@ use anyhow::{Context, Result, bail};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_ffmpeg.rs"));
 
+const BUNDLED_LICENSES: [(&str, &[u8]); 5] = [
+    ("LICENSE", include_bytes!("../LICENSE")),
+    (
+        "THIRD_PARTY_NOTICES.md",
+        include_bytes!("../THIRD_PARTY_NOTICES.md"),
+    ),
+    (
+        "THIRD_PARTY_LICENSES-RUST.txt",
+        include_bytes!("../packaging/THIRD_PARTY_LICENSES-RUST.txt"),
+    ),
+    (
+        "THIRD_PARTY_LICENSES-NPM.txt",
+        include_bytes!("../packaging/THIRD_PARTY_LICENSES-NPM.txt"),
+    ),
+    (
+        "FFMPEG_SOURCE_OFFER.md",
+        include_bytes!("../packaging/FFMPEG_SOURCE_OFFER.md"),
+    ),
+];
+
+pub fn write_bundled_licenses(output: &Path) -> Result<usize> {
+    fs::create_dir_all(output).context("create license output directory")?;
+    for (name, contents) in BUNDLED_LICENSES {
+        fs::write(output.join(name), contents)
+            .with_context(|| format!("write bundled notice {name}"))?;
+    }
+    let mut count = BUNDLED_LICENSES.len();
+    if let Some(contents) = EMBEDDED_FFMPEG_LICENSE {
+        fs::write(output.join("FFMPEG-LICENSE.txt"), contents)
+            .context("write bundled FFmpeg license")?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 pub struct PreparedFfmpeg {
     pub command: String,
     cleanup_dir: Option<PathBuf>,
@@ -124,4 +159,25 @@ fn set_executable(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_license_files_can_be_extracted() {
+        let output = std::env::temp_dir().join(format!(
+            "instant-local-stream-license-test-{}",
+            rand::random::<u64>()
+        ));
+        let count = write_bundled_licenses(&output).unwrap();
+
+        assert!(count >= BUNDLED_LICENSES.len());
+        for (name, expected) in BUNDLED_LICENSES {
+            assert_eq!(fs::read(output.join(name)).unwrap(), expected);
+        }
+
+        fs::remove_dir_all(output).unwrap();
+    }
 }
