@@ -332,8 +332,8 @@ onMounted(start)
 
     <section class="data-grid" aria-label="Live stream metrics">
       <div class="data-cell">
-        <div class="meta-label" title="Quality selected by the host for this viewer">Assigned target</div>
-        <div class="meta-value">{{ quality }}</div>
+        <div class="meta-label" title="Quality and codec selected by the host for this viewer">Assigned target</div>
+        <div class="meta-value">{{ quality }} · {{ activeCodec }}</div>
       </div>
       <div class="data-cell">
         <div class="meta-label" :title="delayModeHint()">{{ delayLabel() }}</div>
