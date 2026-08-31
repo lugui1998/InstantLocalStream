@@ -48,7 +48,7 @@ jobs:
           name: ci-web-dist
           path: web/dist
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   windows:
     name: Windows build

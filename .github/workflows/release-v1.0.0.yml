@@ -40,6 +40,7 @@ jobs:
       release_version: ${{ steps.release.outputs.release_version }}
       release_notes: ${{ steps.release.outputs.release_notes }}
       source_sha: ${{ steps.release.outputs.source_sha }}
+      ci_run_id: ${{ steps.release.outputs.ci_run_id }}
     env:
       SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || github.event.workflow_run.head_sha }}
     steps:
@@ -76,6 +77,7 @@ jobs:
             echo "release_version=$release_version"
             echo "release_notes=$release_notes"
             echo "source_sha=$SOURCE_SHA"
+            echo "ci_run_id=${{ github.event.workflow_run.id }}"
           } >> "$GITHUB_OUTPUT"
 
   validate:
@@ -123,19 +125,22 @@ jobs:
           test "$conclusion" = "success"
 
   web:
-    name: Build viewer
+    name: Prepare viewer
     needs: [prepare, validate]
     runs-on: ubuntu-24.04
     env:
+      CI_RUN_ID: ${{ needs.prepare.outputs.ci_run_id }}
       SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
     steps:
       - name: Check out the release tag
+        if: github.event_name == 'push'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
 
       - name: Set up Node.js
+        if: github.event_name == 'push'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -143,7 +148,18 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Build the viewer
+        if: github.event_name == 'push'
         run: bash scripts/build-web.sh
+
+      - name: Download the viewer from CI
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-web-dist
+          path: web/dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.CI_RUN_ID }}
 
       - name: Upload the viewer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
