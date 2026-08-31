@@ -369,6 +369,7 @@ impl HostUi {
             "test" => SourceTab::TestPattern,
             _ => SourceTab::Displays,
         };
+        let source_selected = config.source.kind == "test";
         let (viewer_url_mode, custom_viewer_host, public_ipv4) = initial_viewer_url_state(&config);
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -417,8 +418,10 @@ impl HostUi {
             visible_preview_keys: HashSet::new(),
             source_tab,
             // The config's default source is only a placeholder.  This native
-            // UI requires an explicit source-card (or test-pattern) choice.
-            source_selected: false,
+            // UI requires an explicit source-card choice. The test pattern is
+            // self-contained, so a persisted test-pattern source is already a
+            // valid selection when the UI starts.
+            source_selected,
             display_non_window_elements: false,
             sources: Vec::new(),
             source_previews: HashMap::new(),
