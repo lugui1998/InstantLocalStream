@@ -44,9 +44,15 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState,
 };
 
-use crate::audio::AudioPipeline;
+use crate::audio::{
+    AudioPipeline, TEST_TONE_CYCLE_DURATION, TEST_TONE_FREQUENCY_HZ, TEST_TONE_LEVEL_DBFS,
+    TEST_TONE_ON_DURATION,
+};
 use crate::config::{AppConfig, MAX_AUTOMATIC_BITRATE_BPS, automatic_bitrate_floor};
-use crate::media::{CaptureSettings, MediaPipeline};
+use crate::media::{
+    CaptureSettings, H264Level, H265Level, MediaPipeline, NegotiatedVideoCodec,
+    h264_level_for_profile, h265_level_for_profile,
+};
 use crate::shared_capture::{SharedCapture, SourceFrame};
 use crate::udp_mux::UdpMux;
 #[cfg(windows)]
@@ -362,6 +368,7 @@ const ENCODER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 struct TranscodeGroup {
     id: usize,
     media: Arc<StdMutex<Option<Arc<MediaPipeline>>>>,
+    requested_codec: Arc<StdMutex<String>>,
     codec: Arc<StdMutex<String>>,
     settings: Arc<StdMutex<CaptureSettings>>,
     ceiling: Arc<StdMutex<CaptureSettings>>,
@@ -398,6 +405,7 @@ impl TranscodeGroup {
         Self {
             id,
             media: Arc::new(StdMutex::new(Some(media))),
+            requested_codec: Arc::new(StdMutex::new(codec.clone())),
             codec: Arc::new(StdMutex::new(codec)),
             settings: Arc::new(StdMutex::new(settings.clone())),
             ceiling: Arc::new(StdMutex::new(settings)),
@@ -408,10 +416,12 @@ impl TranscodeGroup {
     }
 
     fn stopped(id: usize, settings: CaptureSettings, codec: impl Into<String>) -> Self {
+        let codec = codec.into();
         Self {
             id,
             media: Arc::new(StdMutex::new(None)),
-            codec: Arc::new(StdMutex::new(codec.into())),
+            requested_codec: Arc::new(StdMutex::new(codec.clone())),
+            codec: Arc::new(StdMutex::new(codec)),
             settings: Arc::new(StdMutex::new(settings.clone())),
             ceiling: Arc::new(StdMutex::new(settings)),
             last_tuned: Arc::new(StdMutex::new(Instant::now() - Duration::from_secs(30))),
@@ -436,6 +446,19 @@ impl TranscodeGroup {
             .lock()
             .map(|codec| codec.clone())
             .unwrap_or_else(|_| "vp8".to_owned())
+    }
+
+    fn requested_codec(&self) -> String {
+        self.requested_codec
+            .lock()
+            .map(|codec| codec.clone())
+            .unwrap_or_else(|_| "vp8".to_owned())
+    }
+
+    fn set_effective_codec(&self, codec: &str) {
+        if let Ok(mut effective_codec) = self.codec.lock() {
+            *effective_codec = codec.to_owned();
+        }
     }
 }
 
@@ -474,14 +497,18 @@ impl GroupFactory {
             .capture_slot
             .current()
             .context("shared capture is not running")?;
-        let media = Arc::new(MediaPipeline::with_codec(codec)?);
+        let source_dimensions = shared_capture.source_dimensions();
+        let source_pixel_format = shared_capture.source_pixel_format();
+        let source_fps = shared_capture.source_fps();
+        let (codec, h264_level, h265_level) =
+            codec_for_capture_profile(codec, source_dimensions, source_fps, &settings)?;
+        let media = Arc::new(MediaPipeline::with_codec_profile(
+            codec, h264_level, h265_level,
+        )?);
         if let Ok(mut pipelines) = self.pipelines.lock() {
             pipelines.retain(|pipeline| pipeline.strong_count() > 0);
             pipelines.push(Arc::downgrade(&media));
         }
-        let source_dimensions = shared_capture.source_dimensions();
-        let source_pixel_format = shared_capture.source_pixel_format();
-        let source_fps = shared_capture.source_fps();
         let source = if include_latest_frame {
             shared_capture.subscribe_including_latest()
         } else {
@@ -531,6 +558,24 @@ impl GroupFactory {
             });
         }
     }
+}
+
+fn codec_for_capture_profile<'a>(
+    requested_codec: &'a str,
+    source_dimensions: (u32, u32),
+    source_fps: u32,
+    settings: &CaptureSettings,
+) -> Result<(&'a str, Option<H264Level>, Option<H265Level>)> {
+    if requested_codec.eq_ignore_ascii_case("h264") {
+        let level = h264_level_for_profile(source_dimensions, source_fps, settings)?;
+        return Ok((requested_codec, Some(level), None));
+    }
+    if requested_codec.eq_ignore_ascii_case("h265") || requested_codec.eq_ignore_ascii_case("hevc")
+    {
+        let level = h265_level_for_profile(source_dimensions, source_fps, settings)?;
+        return Ok((requested_codec, None, Some(level)));
+    }
+    Ok((requested_codec, None, None))
 }
 
 #[derive(Clone)]
@@ -667,8 +712,9 @@ impl TranscodeGroups {
             .as_ref()
             .context("dynamic transcode group factory is unavailable")?;
         let settings = self.group_settings(group_id);
-        let codec = group.codec();
+        let codec = group.requested_codec();
         let media = factory.start(&codec, settings)?;
+        group.set_effective_codec(media.codec_id());
         if let Ok(mut current) = group.media.lock() {
             *current = Some(Arc::clone(&media));
         }
@@ -697,7 +743,8 @@ impl TranscodeGroups {
             .factory
             .as_ref()
             .context("dynamic transcode group factory is unavailable")?;
-        let media = factory.start_primary(&group.codec(), self.group_settings(0))?;
+        let media = factory.start_primary(&group.requested_codec(), self.group_settings(0))?;
+        group.set_effective_codec(media.codec_id());
         *group
             .media
             .lock()
@@ -744,16 +791,6 @@ impl TranscodeGroups {
         self.activate_group(assignment.group_id)
     }
 
-    fn codec_for_client(&self, client_id: &str) -> Option<String> {
-        let group_id = self
-            .assignments
-            .lock()
-            .ok()?
-            .get(client_id)
-            .map(|assignment| assignment.group_id)?;
-        Some(self.group(group_id).codec())
-    }
-
     fn media_by_id(&self, group_id: usize) -> Option<Arc<MediaPipeline>> {
         self.group(group_id).media()
     }
@@ -785,6 +822,14 @@ impl TranscodeGroups {
             })
     }
 
+    fn group_ceiling(&self, group_id: usize) -> CaptureSettings {
+        self.group(group_id)
+            .ceiling
+            .lock()
+            .map(|ceiling| ceiling.clone())
+            .unwrap_or_else(|_| self.group_settings(group_id))
+    }
+
     /// Applies a new desired group budget and profile ceiling.
     ///
     /// `replace_active_media` is used when the raw capture format is about to
@@ -811,11 +856,16 @@ impl TranscodeGroups {
             .lifecycle_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("group lifecycle lock poisoned"))?;
-        let requested_budget = if settings.quality_mode == "adaptive" {
-            configured_group_count(&settings.max_quality_groups)
-        } else {
-            1
-        }
+        let codec_policy = self
+            .factory
+            .as_ref()
+            .map(|factory| factory.codec_policy.as_str())
+            .unwrap_or_default();
+        let requested_budget = configured_transcode_group_count(
+            &settings.quality_mode,
+            &settings.max_quality_groups,
+            codec_policy,
+        )
         .min(self.groups.len().max(1));
         let factory = self
             .factory
@@ -826,7 +876,7 @@ impl TranscodeGroups {
             group.id < requested_budget && group.lifecycle().is_visible() && group.media().is_some()
         }) {
             let profile = group_settings(&settings, group.id);
-            let codec = group.codec();
+            let codec = group.requested_codec();
             match factory.start(&codec, profile) {
                 Ok(media) => replacements.push((group.id, media)),
                 Err(error) => {
@@ -842,6 +892,8 @@ impl TranscodeGroups {
         // encoder has started successfully.
         let result = self.reconfigure_locked(settings, true);
         for (group_id, replacement) in replacements {
+            self.group(group_id)
+                .set_effective_codec(replacement.codec_id());
             let previous = self
                 .group(group_id)
                 .media
@@ -860,11 +912,16 @@ impl TranscodeGroups {
         settings: CaptureSettings,
         replace_active_media: bool,
     ) -> GroupReconfiguration {
-        let requested_budget = if settings.quality_mode == "adaptive" {
-            configured_group_count(&settings.max_quality_groups)
-        } else {
-            1
-        }
+        let codec_policy = self
+            .factory
+            .as_ref()
+            .map(|factory| factory.codec_policy.as_str())
+            .unwrap_or_default();
+        let requested_budget = configured_transcode_group_count(
+            &settings.quality_mode,
+            &settings.max_quality_groups,
+            codec_policy,
+        )
         .min(self.groups.len().max(1));
         let previous_budget = self.capacity();
         self.active_budget
@@ -933,7 +990,11 @@ impl TranscodeGroups {
     }
 
     fn group_codec(&self, group_id: usize) -> String {
-        self.group(group_id).codec()
+        let group = self.group(group_id);
+        group
+            .media()
+            .map(|media| media.codec_id().to_owned())
+            .unwrap_or_else(|| group.codec())
     }
 
     fn configure_stopped_group(
@@ -956,6 +1017,9 @@ impl TranscodeGroups {
         if let Ok(mut current_codec) = group.codec.lock() {
             *current_codec = codec.to_owned();
         }
+        if let Ok(mut requested_codec) = group.requested_codec.lock() {
+            *requested_codec = codec.to_owned();
+        }
         true
     }
 
@@ -967,17 +1031,29 @@ impl TranscodeGroups {
         ceiling: CaptureSettings,
     ) -> Option<usize> {
         let preferred = self.group(preferred_group_id);
-        if preferred.codec().eq_ignore_ascii_case(codec) {
-            if preferred.media().is_none() {
-                self.configure_stopped_group(preferred_group_id, codec, profile, ceiling);
+        if preferred.media().is_none() {
+            if preferred.codec().eq_ignore_ascii_case(codec) {
+                self.configure_stopped_group(
+                    preferred_group_id,
+                    codec,
+                    profile.clone(),
+                    ceiling.clone(),
+                );
+                return Some(preferred_group_id);
             }
+        } else if self
+            .group_codec(preferred_group_id)
+            .eq_ignore_ascii_case(codec)
+            && profiles_match_exactly(&self.group_settings(preferred_group_id), &profile)
+            && profiles_match_exactly(&self.group_ceiling(preferred_group_id), &ceiling)
+        {
             return Some(preferred_group_id);
         }
-        if let Some(group_id) = self
-            .active_group_ids()
-            .into_iter()
-            .find(|group_id| self.group_codec(*group_id).eq_ignore_ascii_case(codec))
-        {
+        if let Some(group_id) = self.active_group_ids().into_iter().find(|group_id| {
+            self.group_codec(*group_id).eq_ignore_ascii_case(codec)
+                && profiles_match_exactly(&self.group_settings(*group_id), &profile)
+                && profiles_match_exactly(&self.group_ceiling(*group_id), &ceiling)
+        }) {
             return Some(group_id);
         }
         let stopped_group_id = self
@@ -1200,11 +1276,20 @@ impl TranscodeGroups {
         restart: bool,
     ) -> serde_json::Value {
         let settings = self.group_settings(group_id);
-        let codec = self
-            .media_by_id(group_id)
+        let media = self.media_by_id(group_id);
+        let codec = media
+            .as_ref()
             .map(|media| media.codec_name().to_owned())
             .or_else(|| Some(display_codec_name(&self.group(group_id).codec()).to_owned()))
             .unwrap_or_else(|| "Unknown".to_owned());
+        let h264_level = media
+            .as_ref()
+            .and_then(|media| media.h264_level())
+            .map(H264Level::name);
+        let h265_level = media
+            .as_ref()
+            .and_then(|media| media.h265_level())
+            .map(H265Level::name);
         let display_index = self
             .active_group_ids()
             .iter()
@@ -1222,6 +1307,8 @@ impl TranscodeGroups {
             "fps": fps,
             "bitrate_bps": settings.bitrate,
             "codec": codec,
+            "h264_level": h264_level,
+            "h265_level": h265_level,
             "state": lifecycle.client_state(),
             "reason": reason,
             "restart": restart
@@ -1416,6 +1503,7 @@ impl TranscodeGroups {
         if self.activate_group(group_id).is_err() {
             group_id = self.primary_group_id();
         }
+        let effective_codec = self.group_codec(group_id);
         let mut assignments = self.assignments.lock().expect("group assignments lock");
         let assignment =
             assignments
@@ -1436,12 +1524,12 @@ impl TranscodeGroups {
         assignment.reason = if probe.timed_out {
             format!(
                 "bootstrap probe timed out; selected safe {} group",
-                display_codec_name(&codec)
+                display_codec_name(&effective_codec)
             )
         } else {
             format!(
                 "initial TCP throughput probe; selected {}",
-                display_codec_name(&codec)
+                display_codec_name(&effective_codec)
             )
         };
         GroupAssignment {
@@ -1477,6 +1565,7 @@ impl TranscodeGroups {
         let group_id =
             self.group_for_codec_profile(&codec, current_group_id, profile.clone(), profile)?;
         self.activate_group(group_id).ok()?;
+        let effective_codec = self.group_codec(group_id);
         let mut assignments = self.assignments.lock().ok()?;
         let assignment = assignments.get_mut(client_id)?;
         assignment.group_id = group_id;
@@ -1484,7 +1573,7 @@ impl TranscodeGroups {
         assignment.reason = format!(
             "{} decode failed; fell back to {}",
             display_codec_name(&failed_codec),
-            display_codec_name(&codec)
+            display_codec_name(&effective_codec)
         );
         Some(GroupAssignment {
             group_id,
@@ -1644,6 +1733,25 @@ fn configured_group_count(value: &str) -> usize {
     value.parse::<usize>().unwrap_or(2).clamp(1, 4)
 }
 
+fn configured_transcode_group_count(
+    quality_mode: &str,
+    max_quality_groups: &str,
+    codec_policy: &str,
+) -> usize {
+    let quality_groups = if quality_mode == "adaptive" {
+        configured_group_count(max_quality_groups)
+    } else {
+        1
+    };
+    if codec_policy.eq_ignore_ascii_case("auto") {
+        // Keep lightweight slots available for HEVC, the warm H.264 baseline,
+        // and a legacy fallback. Encoders are still started only on demand.
+        quality_groups.max(3)
+    } else {
+        quality_groups
+    }
+}
+
 fn lower_height(height: u32) -> u32 {
     match height {
         value if value > 2160 => 2160,
@@ -1770,12 +1878,21 @@ fn profiles_are_similar(left: &CaptureSettings, right: &CaptureSettings) -> bool
     ) && close(left.bitrate, right.bitrate, 0.20)
 }
 
+fn profiles_match_exactly(left: &CaptureSettings, right: &CaptureSettings) -> bool {
+    left.output_height.unwrap_or(left.height) == right.output_height.unwrap_or(right.height)
+        && left.output_fps.unwrap_or(left.fps) == right.output_fps.unwrap_or(right.fps)
+        && left.bitrate == right.bitrate
+}
+
 fn initial_codec_for_policy(policy: &str) -> &str {
     match policy.to_ascii_lowercase().as_str() {
         "vp8" => "vp8",
         "vp9" => "vp9",
         "h264" => "h264",
-        _ => "vp8",
+        "h265" | "hevc" => "h265",
+        // H.264 is the always-on baseline for capability-driven selection.
+        // HEVC is added lazily only after a viewer advertises video/H265.
+        _ => "h264",
     }
 }
 
@@ -1798,6 +1915,11 @@ fn discover_host_codecs(ffmpeg: &str, initial_codec: &str) -> HashSet<String> {
     if listing.contains("libx264") || listing.contains("h264_nvenc") {
         codecs.insert("h264".to_owned());
     }
+    // The current low-latency HEVC path invokes libx265 explicitly. Do not
+    // advertise hardware-only encoders until their argument paths exist.
+    if listing.contains("libx265") {
+        codecs.insert("h265".to_owned());
+    }
     codecs
 }
 
@@ -1813,7 +1935,11 @@ fn viewer_supported_codecs(probe: &ViewerBootstrap) -> HashSet<String> {
                 .next()
                 .map(|codec| codec.to_ascii_lowercase())
         })
-        .filter(|codec| matches!(codec.as_str(), "vp8" | "vp9" | "h264" | "av1"))
+        .map(|codec| match codec.as_str() {
+            "hevc" => "h265".to_owned(),
+            _ => codec,
+        })
+        .filter(|codec| matches!(codec.as_str(), "vp8" | "vp9" | "h264" | "h265" | "av1"))
         .collect()
 }
 
@@ -1822,6 +1948,7 @@ fn display_codec_name(codec: &str) -> &'static str {
         "vp8" => "VP8",
         "vp9" => "VP9",
         "h264" => "H.264",
+        "h265" | "hevc" => "H.265",
         "av1" => "AV1",
         _ => "Unknown",
     }
@@ -1837,13 +1964,12 @@ fn choose_codec(
 ) -> String {
     let normalized_policy = policy.to_ascii_lowercase();
     let candidates: Vec<&str> = if normalized_policy != "auto" {
-        vec![normalized_policy.as_str(), "vp8", "vp9", "h264"]
+        vec![normalized_policy.as_str()]
     } else {
-        // VP8 is the validated browser baseline. Other codecs remain
-        // available explicitly and as fallbacks, but must not outrank a codec
-        // that is known to produce decodable first frames across browsers.
+        // HEVC is attempted only after the viewer has explicitly advertised
+        // video/H265. H.264 remains the warm baseline and first fallback.
         let _ = (download_bps, latency_ms);
-        vec!["vp8", "vp9", "h264"]
+        vec!["h265", "h264", "vp8", "vp9"]
     };
     candidates
         .into_iter()
@@ -1851,9 +1977,9 @@ fn choose_codec(
             host_codecs.contains::<str>(codec)
                 && !rejected_codecs.contains::<str>(codec)
                 && (supported_codecs.contains::<str>(codec)
-                    || (supported_codecs.is_empty() && *codec == "vp8"))
+                    || (supported_codecs.is_empty() && *codec == "h264"))
         })
-        .unwrap_or("vp8")
+        .unwrap_or(normalized_policy.as_str())
         .to_owned()
 }
 
@@ -2123,11 +2249,11 @@ pub async fn run_with_control_readiness(
     let initial_settings = CaptureSettings::from_config(&config);
     let settings_slot = Arc::new(StdMutex::new(initial_settings.clone()));
     let capture_slot = Arc::new(CaptureSlot::default());
-    let group_budget = if config.quality_mode == "adaptive" {
-        configured_group_count(&config.max_quality_groups)
-    } else {
-        1
-    };
+    let group_budget = configured_transcode_group_count(
+        &config.quality_mode,
+        &config.max_quality_groups,
+        &config.codec,
+    );
     let group_factory = Arc::new(GroupFactory {
         ffmpeg: ffmpeg.command.clone(),
         capture_slot: Arc::clone(&capture_slot),
@@ -3633,6 +3759,14 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         .as_ref()
         .map(|media| media.codec_name().to_owned())
         .unwrap_or_else(|| state.groups.group(0).codec());
+    let h264_level = primary_media
+        .as_ref()
+        .and_then(|media| media.h264_level())
+        .map(H264Level::name);
+    let h265_level = primary_media
+        .as_ref()
+        .and_then(|media| media.h265_level())
+        .map(H265Level::name);
     json!({
         "status": if stream_resetting {
             "resetting"
@@ -3650,6 +3784,8 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "media_port": state.config.media_ports.first,
         "media_candidate": state.udp_mux.candidate_addr().ok().map(|address| address.to_string()),
         "codec": codec,
+        "h264_level": h264_level,
+        "h265_level": h265_level,
         "media_error": capture_error.clone().or_else(|| primary_media.as_ref().and_then(|media| media.failure())),
         "capture_error": capture_error,
         "encoder_delay_ms": primary_media.as_ref().and_then(|media| media.encoder_delay_ms()),
@@ -3657,22 +3793,22 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "encoder_backlog_restarts": primary_media.as_ref().map(|media| media.encoder_backlog_restarts()).unwrap_or_default(),
         "audio_status": audio_enabled.then(|| state.audio.as_ref().map(|audio| audio.status())).flatten(),
         "audio_error": audio_enabled.then(|| state.audio.as_ref().and_then(|audio| audio.failure())).flatten(),
+        "audio_diagnostics": audio_enabled.then(|| state.audio.as_ref().map(|audio| audio.diagnostics())).flatten(),
         "audio_enabled": audio_enabled,
+        "audio_mode": settings.as_ref().map(|settings| settings.audio_mode.as_str()).unwrap_or("off"),
+        "test_tone": settings.as_ref().is_some_and(|settings| settings.audio_mode == "test").then(|| json!({
+            "frequency_hz": TEST_TONE_FREQUENCY_HZ,
+            "level_dbfs": TEST_TONE_LEVEL_DBFS,
+            "on_ms": TEST_TONE_ON_DURATION.as_millis(),
+            "cycle_ms": TEST_TONE_CYCLE_DURATION.as_millis(),
+            "visual_marker": "green square while tone is active",
+        })),
         "quality": settings.as_ref().and_then(|settings| settings.output_height).map(|height| format!("{height}p")).unwrap_or_else(|| "Source".to_owned()),
         "fps": settings.as_ref().and_then(|settings| settings.output_fps).map(|fps| fps.to_string()).unwrap_or_else(|| "Source".to_owned()),
         "bitrate_bps": settings.as_ref().map(|settings| settings.bitrate),
         "max_viewers": state.max_viewers.load(Ordering::Acquire),
         "active_group_count": state.groups.count(),
-        "max_group_count": settings
-            .as_ref()
-            .map(|settings| {
-                if settings.quality_mode == "adaptive" {
-                    configured_group_count(&settings.max_quality_groups)
-                } else {
-                    1
-                }
-            })
-            .unwrap_or(1),
+        "max_group_count": state.groups.capacity(),
         "groups": state.groups.groups_json(),
         "latency_mode": "latest-frame",
         "sync_mode": "latest-frame",
@@ -3697,6 +3833,8 @@ fn status_for_client_revision(
     status["fps"] = group["fps"].clone();
     status["bitrate_bps"] = group["bitrate_bps"].clone();
     status["codec"] = group["codec"].clone();
+    status["h264_level"] = group["h264_level"].clone();
+    status["h265_level"] = group["h265_level"].clone();
     status["group"] = group;
     status["settings_revision"] = serde_json::json!(revision);
     status
@@ -3743,33 +3881,168 @@ async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-fn offer_supports_h264_level_31(sdp: &str) -> bool {
-    let h264_payloads = sdp
-        .lines()
+fn sdp_fmtp_line_for_payload(sdp: &str, payload_type: u8) -> Option<&str> {
+    sdp.lines()
+        .filter_map(|line| line.trim().strip_prefix("a=fmtp:"))
+        .filter_map(|format| format.split_once(' '))
+        .find(|(payload, _)| payload.trim().parse::<u8>() == Ok(payload_type))
+        .map(|(_, parameters)| parameters.trim())
+}
+
+fn sdp_fmtp_parameters(sdp: &str, payload_type: u8) -> HashMap<String, String> {
+    sdp_fmtp_line_for_payload(sdp, payload_type)
+        .map(|parameters| {
+            parameters
+                .split(';')
+                .filter_map(|parameter| parameter.trim().split_once('='))
+                .map(|(name, value)| {
+                    (
+                        name.trim().to_ascii_lowercase(),
+                        value.trim().to_ascii_lowercase(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sdp_fmtp_with_parameter(parameters: &str, name: &str, value: &str) -> String {
+    let mut replaced = false;
+    let mut parts = parameters
+        .split(';')
+        .filter_map(|parameter| {
+            let parameter = parameter.trim();
+            if parameter.is_empty() {
+                return None;
+            }
+            if parameter
+                .split_once('=')
+                .is_some_and(|(current, _)| current.trim().eq_ignore_ascii_case(name))
+            {
+                replaced = true;
+                Some(format!("{name}={value}"))
+            } else {
+                Some(parameter.to_owned())
+            }
+        })
+        .collect::<Vec<_>>();
+    if !replaced {
+        parts.push(format!("{name}={value}"));
+    }
+    parts.join(";")
+}
+
+fn offered_video_payloads(sdp: &str, codec_name: &str) -> Vec<u8> {
+    sdp.lines()
         .filter_map(|line| line.trim().strip_prefix("a=rtpmap:"))
         .filter_map(|mapping| mapping.split_once(' '))
         .filter(|(_, encoding)| {
             encoding
                 .split('/')
                 .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case("H264"))
+                .is_some_and(|name| name.eq_ignore_ascii_case(codec_name))
         })
-        .map(|(payload, _)| payload.trim())
-        .collect::<HashSet<_>>();
+        .filter_map(|(payload, _)| payload.trim().parse::<u8>().ok())
+        .collect()
+}
 
-    sdp.lines()
-        .filter_map(|line| line.trim().strip_prefix("a=fmtp:"))
-        .filter_map(|format| format.split_once(' '))
-        .filter(|(payload, _)| h264_payloads.contains(payload.trim()))
-        .flat_map(|(_, parameters)| parameters.split(';'))
-        .filter_map(|parameter| parameter.trim().split_once('='))
-        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("profile-level-id"))
-        .map(|(_, value)| value.trim().to_ascii_lowercase())
-        .any(|profile_level_id| {
-            profile_level_id.len() == 6
-                && profile_level_id.starts_with("42e0")
-                && u8::from_str_radix(&profile_level_id[4..], 16).is_ok_and(|level| level >= 0x1f)
-        })
+fn parse_h264_level_idc(value: &str) -> Option<u8> {
+    let bytes = value.as_bytes();
+    if !matches!(bytes.len(), 4 | 6) || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let suffix = std::str::from_utf8(&bytes[bytes.len() - 2..]).ok()?;
+    u8::from_str_radix(suffix, 16).ok()
+}
+
+fn negotiate_video_codec(sdp: &str, media: &MediaPipeline) -> Option<NegotiatedVideoCodec> {
+    let codec_name = media.codec_id();
+    let payloads = offered_video_payloads(sdp, codec_name);
+    if codec_name.eq_ignore_ascii_case("h265") {
+        let required_level = media.h265_level()?;
+        return payloads.into_iter().find_map(|payload_type| {
+            let parameters = sdp_fmtp_parameters(sdp, payload_type);
+            let profile_space_zero = parameters
+                .get("profile-space")
+                .is_none_or(|value| value == "0");
+            let main_profile = parameters
+                .get("profile-id")
+                .is_none_or(|value| value == "1");
+            let main_tier = parameters.get("tier-flag").is_none_or(|value| value == "0");
+            let single_stream_mode = parameters
+                .get("tx-mode")
+                .is_none_or(|value| value == "srst");
+            // RFC 7798 defaults an omitted level-id to 93 (Level 3.1).
+            // max-recv-level-id, when present, is the receiver's actual
+            // ceiling and may be higher than its default sending level.
+            let offered_level = parameters
+                .get("level-id")
+                .map(|value| value.parse::<u8>())
+                .transpose()
+                .ok()?
+                .unwrap_or(93);
+            let receive_level = parameters
+                .get("max-recv-level-id")
+                .map(|value| value.parse::<u8>())
+                .transpose()
+                .ok()?
+                .unwrap_or(offered_level);
+            (profile_space_zero
+                && main_profile
+                && main_tier
+                && single_stream_mode
+                && receive_level >= required_level.level_idc())
+            .then(|| NegotiatedVideoCodec {
+                payload_type,
+                mime_type: media.mime_type().to_owned(),
+                // Preserve symmetric offer parameters while answering with
+                // the active bitstream level. The offer's level-id is a
+                // receive default, not permission to mislabel our encoder.
+                sdp_fmtp_line: sdp_fmtp_with_parameter(
+                    sdp_fmtp_line_for_payload(sdp, payload_type).unwrap_or_default(),
+                    "level-id",
+                    &required_level.level_idc().to_string(),
+                ),
+            })
+        });
+    }
+    if !codec_name.eq_ignore_ascii_case("h264") {
+        let payload_type = payloads.into_iter().next()?;
+        return Some(NegotiatedVideoCodec {
+            payload_type,
+            mime_type: media.mime_type().to_owned(),
+            sdp_fmtp_line: media.sdp_fmtp_line().to_owned(),
+        });
+    }
+
+    let required_level = media.h264_level()?;
+    payloads.into_iter().find_map(|payload_type| {
+        let parameters = sdp_fmtp_parameters(sdp, payload_type);
+        let profile_level_id = parameters.get("profile-level-id")?;
+        let offered_level = parse_h264_level_idc(profile_level_id)?;
+        let receive_level = parameters
+            .get("max-recv-level")
+            .and_then(|value| parse_h264_level_idc(value))
+            .unwrap_or(offered_level);
+        let packetization_mode_one = parameters
+            .get("packetization-mode")
+            .is_some_and(|value| value == "1");
+        let compatible_profile = profile_level_id.len() == 6
+            && profile_level_id
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("42e0"));
+        let level_asymmetry = parameters
+            .get("level-asymmetry-allowed")
+            .is_some_and(|value| value == "1");
+        (packetization_mode_one
+            && compatible_profile
+            && (receive_level >= required_level.level_idc() || level_asymmetry))
+            .then(|| NegotiatedVideoCodec {
+                payload_type,
+                mime_type: media.mime_type().to_owned(),
+                sdp_fmtp_line: media.sdp_fmtp_line().to_owned(),
+            })
+    })
 }
 
 async fn offer(
@@ -3821,16 +4094,20 @@ async fn offer(
             "offer requires an authenticated control session".to_owned(),
         ));
     }
-    let assigned_codec = state
-        .groups
-        .codec_for_client(&client_id)
-        .ok_or_else(|| internal_error("control session has no media assignment"))?;
-    if assigned_codec == "h264" && !offer_supports_h264_level_31(&offer.sdp) {
-        return Err((
+    let media = state.groups.media_for(&client_id).map_err(internal_error)?;
+    let negotiated_video_codec = negotiate_video_codec(&offer.sdp, &media).ok_or_else(|| {
+        let profile = media
+            .h264_level()
+            .map(|level| format!(" constrained-baseline level {}", level.name()))
+            .unwrap_or_default();
+        (
             StatusCode::BAD_REQUEST,
-            "offer does not support constrained-baseline H.264 level 3.1".to_owned(),
-        ));
-    }
+            format!(
+                "offer does not support the active {}{profile} stream",
+                media.codec_name()
+            ),
+        )
+    })?;
 
     // Validate stateless inputs before replacing a working connection, then
     // reserve bounded capacity before activating or subscribing to media.
@@ -3851,22 +4128,7 @@ async fn offer(
         pending.insert(connection_id);
     }
 
-    let media = match state.groups.media_for(&client_id) {
-        Ok(media) => media,
-        Err(error) => {
-            remove_pending(&state, connection_id);
-            return Err(internal_error(error));
-        }
-    };
-    if media.codec_name() == "H.264" && !offer_supports_h264_level_31(&offer.sdp) {
-        remove_pending(&state, connection_id);
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "offer does not support constrained-baseline H.264 level 3.1".to_owned(),
-        ));
-    }
-
-    let media_track = match media.subscribe(connection_id) {
+    let media_track = match media.subscribe(connection_id, &negotiated_video_codec) {
         Ok(track) => track,
         Err(error) => {
             remove_pending(&state, connection_id);
@@ -3903,13 +4165,13 @@ async fn offer(
         .register_codec(
             RTCRtpCodecParameters {
                 rtp_codec: RTCRtpCodec {
-                    mime_type: media.mime_type().to_owned(),
+                    mime_type: negotiated_video_codec.mime_type.clone(),
                     clock_rate: 90_000,
                     channels: 0,
-                    sdp_fmtp_line: media.sdp_fmtp_line().to_owned(),
+                    sdp_fmtp_line: negotiated_video_codec.sdp_fmtp_line.clone(),
                     rtcp_feedback: vec![],
                 },
-                payload_type: media.payload_type(),
+                payload_type: negotiated_video_codec.payload_type,
             },
             RtpCodecKind::Video,
         )
@@ -4349,6 +4611,7 @@ async fn handle_control_ping(
         "encoderBacklogRestarts": media.as_ref().map(|media| media.encoder_backlog_restarts()).unwrap_or_default(),
         "mediaStatus": media_status,
         "mediaError": media_error,
+        "audioDiagnostics": state.audio.as_ref().map(|audio| audio.diagnostics()),
     });
     ack.send(&response).ok();
 }
@@ -5208,13 +5471,42 @@ mod tests {
     }
 
     #[test]
-    fn automatic_codec_prefers_the_validated_vp8_baseline() {
+    fn automatic_codec_uses_the_warm_h264_baseline_without_hevc() {
         let host = HashSet::from(["vp8".to_owned(), "h264".to_owned()]);
         let chromium = HashSet::from(["vp8".to_owned(), "h264".to_owned()]);
         assert_eq!(
             choose_codec("auto", &host, &chromium, &HashSet::new(), 8_000_000.0, 20.0),
-            "vp8"
+            "h264"
         );
+    }
+
+    #[test]
+    fn automatic_codec_prefers_h265_only_when_host_and_viewer_support_it() {
+        let host = HashSet::from(["vp8".to_owned(), "h264".to_owned(), "h265".to_owned()]);
+        let chromium = HashSet::from(["vp8".to_owned(), "h264".to_owned(), "h265".to_owned()]);
+        assert_eq!(
+            choose_codec("auto", &host, &chromium, &HashSet::new(), 8_000_000.0, 20.0),
+            "h265"
+        );
+        assert_eq!(
+            choose_codec(
+                "auto",
+                &host,
+                &chromium,
+                &HashSet::from(["h265".to_owned()]),
+                8_000_000.0,
+                20.0,
+            ),
+            "h264"
+        );
+    }
+
+    #[test]
+    fn automatic_codec_policy_reserves_lazy_fallback_slots() {
+        assert_eq!(configured_transcode_group_count("manual", "1", "auto"), 3);
+        assert_eq!(configured_transcode_group_count("adaptive", "2", "auto"), 3);
+        assert_eq!(configured_transcode_group_count("adaptive", "4", "auto"), 4);
+        assert_eq!(configured_transcode_group_count("manual", "1", "h265"), 1);
     }
 
     #[test]
@@ -5228,20 +5520,306 @@ mod tests {
     }
 
     #[test]
-    fn h264_offer_must_receive_constrained_baseline_level_31() {
-        let offer = |profile_level_id: &str| {
+    fn explicit_h264_policy_never_silently_falls_back_to_vp8() {
+        let host = HashSet::from(["vp8".to_owned(), "h264".to_owned()]);
+        let vp8_only_viewer = HashSet::from(["vp8".to_owned()]);
+        let rejected = HashSet::from(["h264".to_owned()]);
+
+        assert_eq!(
+            choose_codec(
+                "h264",
+                &host,
+                &vp8_only_viewer,
+                &rejected,
+                8_000_000.0,
+                20.0,
+            ),
+            "h264"
+        );
+    }
+
+    #[test]
+    fn h264_1080p60_selects_level_42_without_falling_back() {
+        let config = AppConfig {
+            codec: "h264".to_owned(),
+            quality_mode: "manual".to_owned(),
+            quality: "1080p".to_owned(),
+            fps_preset: "60".to_owned(),
+            ..Default::default()
+        };
+        let settings = CaptureSettings::from_config(&config);
+
+        let (codec, level, _) =
+            codec_for_capture_profile("h264", (1920, 1080), 60, &settings).unwrap();
+
+        assert_eq!(codec, "h264");
+        assert_eq!(level.map(H264Level::name), Some("4.2"));
+    }
+
+    #[test]
+    fn unrepresentable_h264_profile_fails_instead_of_switching_codecs() {
+        let config = AppConfig {
+            codec: "h264".to_owned(),
+            quality_mode: "manual".to_owned(),
+            quality: "source".to_owned(),
+            fps_preset: "source".to_owned(),
+            ..Default::default()
+        };
+        let settings = CaptureSettings::from_config(&config);
+
+        let error = codec_for_capture_profile("h264", (7680, 4320), 240, &settings).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no supported H.264 level can represent")
+        );
+    }
+
+    #[test]
+    fn compatible_h264_profile_remains_h264() {
+        let config = AppConfig {
+            codec: "h264".to_owned(),
+            quality_mode: "manual".to_owned(),
+            quality: "720p".to_owned(),
+            fps_preset: "30".to_owned(),
+            ..Default::default()
+        };
+        let settings = CaptureSettings::from_config(&config);
+
+        let (codec, level, _) =
+            codec_for_capture_profile("h264", (1920, 1080), 60, &settings).unwrap();
+
+        assert_eq!(codec, "h264");
+        assert_eq!(level.map(H264Level::name), Some("3.1"));
+    }
+
+    #[test]
+    fn h264_profile_changes_reselect_the_level_without_changing_codec() {
+        let group = TranscodeGroup::stopped(
+            0,
+            CaptureSettings::from_config(&AppConfig::default()),
+            "h264",
+        );
+        let incompatible = AppConfig {
+            codec: "h264".to_owned(),
+            quality_mode: "manual".to_owned(),
+            quality: "1080p".to_owned(),
+            fps_preset: "60".to_owned(),
+            ..Default::default()
+        };
+        let requested_codec = group.requested_codec();
+        let (effective_codec, level, _) = codec_for_capture_profile(
+            &requested_codec,
+            (1920, 1080),
+            60,
+            &CaptureSettings::from_config(&incompatible),
+        )
+        .unwrap();
+        assert_eq!(level.map(H264Level::name), Some("4.2"));
+        group.set_effective_codec(effective_codec);
+        assert_eq!(group.codec(), "h264");
+        assert_eq!(group.requested_codec(), "h264");
+
+        let compatible = AppConfig {
+            codec: "h264".to_owned(),
+            quality_mode: "manual".to_owned(),
+            quality: "720p".to_owned(),
+            fps_preset: "30".to_owned(),
+            ..Default::default()
+        };
+        let requested_codec = group.requested_codec();
+        let (next_effective_codec, level, _) = codec_for_capture_profile(
+            &requested_codec,
+            (1920, 1080),
+            60,
+            &CaptureSettings::from_config(&compatible),
+        )
+        .unwrap();
+        assert_eq!(level.map(H264Level::name), Some("3.1"));
+        assert_eq!(next_effective_codec, "h264");
+    }
+
+    #[test]
+    fn client_negotiation_uses_the_active_media_codec_over_stale_group_metadata() {
+        let settings = CaptureSettings::from_config(&AppConfig::default());
+        let media = Arc::new(MediaPipeline::with_codec("vp8").unwrap());
+        let group = TranscodeGroup::active(0, media, settings);
+        group.set_effective_codec("h264");
+        let groups = TranscodeGroups::new(vec![group]);
+        groups.ensure_client("viewer");
+
+        assert_eq!(groups.group_codec(0), "vp8");
+    }
+
+    #[test]
+    fn h264_offer_negotiation_uses_dynamic_level_and_payload_type() {
+        let config = AppConfig {
+            codec: "h264".to_owned(),
+            quality_mode: "manual".to_owned(),
+            quality: "1080p".to_owned(),
+            fps_preset: "60".to_owned(),
+            ..Default::default()
+        };
+        let settings = CaptureSettings::from_config(&config);
+        let level = h264_level_for_profile((1920, 1080), 60, &settings).unwrap();
+        let media = MediaPipeline::with_codec_profile("h264", Some(level), None).unwrap();
+        let offer = |payload: u8, parameters: &str| {
             format!(
-                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 108\r\na=rtpmap:108 H264/90000\r\na=fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}\r\n"
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF {payload}\r\na=rtpmap:{payload} H264/90000\r\na=fmtp:{payload} {parameters}\r\n"
             )
         };
 
-        assert!(offer_supports_h264_level_31(&offer("42e01f")));
-        assert!(offer_supports_h264_level_31(&offer("42e02a")));
-        assert!(!offer_supports_h264_level_31(&offer("42e01e")));
-        assert!(!offer_supports_h264_level_31(&offer("4d001f")));
-        assert!(!offer_supports_h264_level_31(
-            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n"
-        ));
+        let negotiated = negotiate_video_codec(
+            &offer(
+                121,
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+            ),
+            &media,
+        )
+        .unwrap();
+        assert_eq!(negotiated.payload_type, 121);
+        assert!(negotiated.sdp_fmtp_line.contains("profile-level-id=42e02a"));
+
+        assert!(
+            negotiate_video_codec(
+                &offer(122, "packetization-mode=1;profile-level-id=42e02a"),
+                &media,
+            )
+            .is_some()
+        );
+        assert!(
+            negotiate_video_codec(
+                &offer(122, "packetization-mode=1;profile-level-id=42e01f"),
+                &media,
+            )
+            .is_none()
+        );
+        assert!(
+            negotiate_video_codec(
+                &offer(
+                    122,
+                    "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e02a",
+                ),
+                &media,
+            )
+            .is_none()
+        );
+        assert!(
+            negotiate_video_codec(
+                &offer(
+                    122,
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d002a",
+                ),
+                &media,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn h265_offer_negotiation_uses_encoder_level_and_receiver_ceiling() {
+        let mut settings = CaptureSettings::from_config(&AppConfig::default());
+        settings.output_height = Some(1080);
+        settings.output_fps = Some(60);
+        settings.bitrate = 20_000_000;
+        let level = h265_level_for_profile((1920, 1080), 60, &settings).unwrap();
+        assert_eq!(level.name(), "4.1");
+        let media = MediaPipeline::with_codec_profile("h265", None, Some(level)).unwrap();
+        let offer = |payload: u8, parameters: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF {payload}\r\na=rtpmap:{payload} H265/90000\r\na=fmtp:{payload} {parameters}\r\n"
+            )
+        };
+        let chrome_parameters = "level-id=180;profile-id=1;tier-flag=0;tx-mode=SRST";
+
+        let negotiated = negotiate_video_codec(&offer(125, chrome_parameters), &media).unwrap();
+
+        assert_eq!(negotiated.payload_type, 125);
+        assert_eq!(negotiated.mime_type, "video/H265");
+        assert_eq!(
+            negotiated.sdp_fmtp_line,
+            "level-id=123;profile-id=1;tier-flag=0;tx-mode=SRST"
+        );
+        assert!(
+            negotiate_video_codec(
+                &offer(126, "level-id=120;profile-id=1;tier-flag=0;tx-mode=SRST"),
+                &media,
+            )
+            .is_none()
+        );
+        let asymmetric = negotiate_video_codec(
+            &offer(
+                126,
+                "level-id=93;max-recv-level-id=123;profile-id=1;tier-flag=0;tx-mode=SRST",
+            ),
+            &media,
+        )
+        .unwrap();
+        assert_eq!(
+            asymmetric.sdp_fmtp_line,
+            "level-id=123;max-recv-level-id=123;profile-id=1;tier-flag=0;tx-mode=SRST"
+        );
+        assert!(
+            negotiate_video_codec(&offer(126, "profile-id=1;tier-flag=0;tx-mode=SRST"), &media,)
+                .is_none()
+        );
+        assert!(
+            negotiate_video_codec(
+                &offer(126, "level-id=180;profile-id=2;tier-flag=0;tx-mode=SRST"),
+                &media,
+            )
+            .is_none()
+        );
+        assert!(
+            negotiate_video_codec(
+                &offer(126, "level-id=180;profile-id=1;tier-flag=0;tx-mode=MRST"),
+                &media,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn codec_group_reuse_requires_an_exact_encoding_profile() {
+        let primary_settings = CaptureSettings::from_config(&AppConfig::default());
+        let secondary_settings = group_settings(&primary_settings, 1);
+        let first = TranscodeGroup::active(
+            0,
+            Arc::new(MediaPipeline::with_codec("vp8").unwrap()),
+            secondary_settings.clone(),
+        );
+        *first.ceiling.lock().unwrap() = primary_settings.clone();
+        let groups = TranscodeGroups::new(vec![
+            first,
+            TranscodeGroup::active(
+                1,
+                Arc::new(MediaPipeline::with_codec("vp8").unwrap()),
+                secondary_settings.clone(),
+            ),
+        ]);
+
+        assert_eq!(
+            groups.group_for_codec_profile(
+                "vp8",
+                0,
+                secondary_settings.clone(),
+                secondary_settings.clone(),
+            ),
+            Some(1)
+        );
+
+        groups.group(0).set_effective_codec("h264");
+        assert_eq!(
+            groups.group_for_codec_profile(
+                "h264",
+                0,
+                secondary_settings.clone(),
+                secondary_settings,
+            ),
+            None,
+            "stale metadata must not disguise the live VP8 encoder as H.264"
+        );
     }
 
     #[test]

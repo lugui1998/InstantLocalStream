@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { isTerminalSocketDisconnect, playbackRateFor, retryDelayFor, sessionGoodbyeMessage } from './viewerUtils'
+import { diagnosticRecordingLimitMs, isTerminalSocketDisconnect, playbackRateFor, preferredRecordingMimeType, retryDelayFor, sessionGoodbyeMessage } from './viewerUtils'
+import { normalizeCodecName } from './composables/useViewer'
 
 describe('viewer timing policies', () => {
+  it('normalizes display and MIME spellings before reporting codec failures', () => {
+    expect(normalizeCodecName('H.264')).toBe('h264')
+    expect(normalizeCodecName('video/H264')).toBe('h264')
+    expect(normalizeCodecName('H.265')).toBe('h265')
+    expect(normalizeCodecName('video/HEVC')).toBe('h265')
+  })
+
   it('backs off retries with a fixed ceiling', () => {
     expect(retryDelayFor(0)).toBe(1_000)
     expect(retryDelayFor(2)).toBe(5_000)
@@ -29,5 +37,14 @@ describe('viewer timing policies', () => {
     expect(isTerminalSocketDisconnect('io server disconnect')).toBe(true)
     expect(isTerminalSocketDisconnect('transport close')).toBe(false)
     expect(isTerminalSocketDisconnect('ping timeout')).toBe(false)
+  })
+
+  it('prefers an Opus WebM recording and falls back to a supported container', () => {
+    expect(preferredRecordingMimeType(mime => mime === 'video/webm;codecs=vp9,opus'))
+      .toBe('video/webm;codecs=vp9,opus')
+    expect(preferredRecordingMimeType(mime => mime === 'video/mp4'))
+      .toBe('video/mp4')
+    expect(preferredRecordingMimeType(() => false)).toBe('')
+    expect(diagnosticRecordingLimitMs).toBe(30_000)
   })
 })

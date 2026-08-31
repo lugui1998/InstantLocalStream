@@ -2033,8 +2033,6 @@ dependencies = [
 [[package]]
 name = "flexaudio"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b78bf190231ce5475386a1a03fde59578675940755227aad7c6950b4e9d57c0d"
 dependencies = [
  "flexaudio-core",
  "flexaudio-mic",

@@ -61,3 +61,6 @@ tower = "0.5"
 
 [build-dependencies]
 embed-resource = "3.0.11"
+
+[patch.crates-io]
+flexaudio = { path = "vendor/flexaudio" }

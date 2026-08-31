@@ -50,9 +50,13 @@ function waitForIce(peer: RTCPeerConnection, signal: AbortSignal) {
   })
 }
 
-function normalizeCodecName(codec: string | null | undefined) {
+export function normalizeCodecName(codec: string | null | undefined) {
   const normalized = codec?.trim().toLowerCase()
-  return normalized || null
+  if (!normalized) return null
+  const name = normalized.includes('/') ? normalized.slice(normalized.lastIndexOf('/') + 1) : normalized
+  if (name === 'h264' || name === 'h.264' || name === 'avc') return 'h264'
+  if (name === 'h265' || name === 'h.265' || name === 'hevc') return 'h265'
+  return name
 }
 
 function formatProbeBytes(bytes: number) {
@@ -64,12 +68,12 @@ function formatProbeBytes(bytes: number) {
 function formatCodecName(codec: string | null | undefined) {
   const normalized = normalizeCodecName(codec)
   if (!normalized) return null
-  const name = normalized.includes('/') ? normalized.slice(normalized.lastIndexOf('/') + 1) : normalized
-  if (name === 'h264' || name === 'avc') return 'H.264'
-  if (name === 'vp8') return 'VP8'
-  if (name === 'vp9') return 'VP9'
-  if (name === 'av1' || name === 'av01') return 'AV1'
-  return name.toUpperCase()
+  if (normalized === 'h264') return 'H.264'
+  if (normalized === 'h265') return 'H.265'
+  if (normalized === 'vp8') return 'VP8'
+  if (normalized === 'vp9') return 'VP9'
+  if (normalized === 'av1' || normalized === 'av01') return 'AV1'
+  return normalized.toUpperCase()
 }
 
 function normalizeCodecParameters(parameters: unknown) {
@@ -122,6 +126,13 @@ export function useViewer() {
   const framesDropped = ref<number | null>(null)
   const freezeCount = ref<number | null>(null)
   const jitterBufferDelayMs = ref<number | null>(null)
+  const audioPacketsLost = ref<number | null>(null)
+  const audioJitterMs = ref<number | null>(null)
+  const audioConcealmentEvents = ref<number | null>(null)
+  const audioConcealedSamples = ref<number | null>(null)
+  const audioInsertedSamplesForDeceleration = ref<number | null>(null)
+  const audioRemovedSamplesForAcceleration = ref<number | null>(null)
+  const audioJitterBufferDelayMs = ref<number | null>(null)
   const catchUpDelayMs = ref<number | null>(null)
   const playoutDelayMs = ref<number | null>(null)
   const captureToDisplayDelayMs = ref<number | null>(null)
@@ -179,7 +190,7 @@ export function useViewer() {
   let startupNoMediaChecks = 0
   let lastFrameTimingRequestAt = 0
   let lastHostFrameTimingAt = 0
-  let videoElement: HTMLVideoElement | null = null
+  const videoElement = ref<HTMLVideoElement | null>(null)
   let statsFailures = 0
   let statsNextAllowedAt = 0
   let hostFrameTimingExpiryTimer: number | null = null
@@ -196,7 +207,13 @@ export function useViewer() {
 
   const quality = computed(() => `${group.value?.quality ?? status.value.quality ?? '—'} · ${group.value?.fps ?? status.value.fps ?? '—'} FPS · ${formatBitrate(group.value?.bitrate_bps ?? status.value.bitrate_bps)}`)
   const synchronizationMode = computed(() => group.value?.sync_mode ?? status.value.sync_mode ?? status.value.synchronization_mode ?? 'Independent')
-  const activeCodec = computed(() => negotiatedCodec.value ?? formatCodecName(group.value?.codec ?? status.value.codec) ?? '—')
+  const activeCodec = computed(() => {
+    const codec = negotiatedCodec.value ?? formatCodecName(group.value?.codec ?? status.value.codec) ?? '—'
+    const h264Level = group.value?.h264_level ?? status.value.h264_level
+    const h265Level = group.value?.h265_level ?? status.value.h265_level
+    const level = formatCodecName(codec) === 'H.264' ? h264Level : h265Level
+    return level ? `${codec} · Level ${level}` : codec
+  })
 
   function formatBitrate(value: number | null | undefined) {
     if (!value || value <= 0) return '—'
@@ -626,6 +643,9 @@ export function useViewer() {
       if (typeof ack.mediaError === 'string' && ack.mediaError) {
         connection.value = `Media error: ${ack.mediaError}`
       }
+      if (ack.audioDiagnostics) {
+        status.value = { ...status.value, audio_diagnostics: ack.audioDiagnostics }
+      }
     })
   }
 
@@ -664,6 +684,13 @@ export function useViewer() {
     let decodeTime: number | null = null
     let inboundCodecId: string | null = null
     let estimatedPlayoutTimestamp: number | null = null
+    let inboundAudioPacketsLost: number | null = null
+    let inboundAudioJitter: number | null = null
+    let inboundAudioConcealmentEvents: number | null = null
+    let inboundAudioConcealedSamples: number | null = null
+    let inboundAudioInsertedSamplesForDeceleration: number | null = null
+    let inboundAudioRemovedSamplesForAcceleration: number | null = null
+    let inboundAudioJitterBufferDelay: number | null = null
     reports.forEach((report) => {
       if (report.type === 'candidate-pair' && report.state === 'succeeded') {
         const selected = report.selected === true || report.nominated === true
@@ -700,8 +727,27 @@ export function useViewer() {
           decodeTime = report.totalDecodeTime * 1_000 / report.framesDecoded
         }
       }
+      if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+        if (typeof report.packetsLost === 'number') inboundAudioPacketsLost = report.packetsLost
+        if (typeof report.jitter === 'number') inboundAudioJitter = report.jitter * 1_000
+        if (typeof report.concealmentEvents === 'number') inboundAudioConcealmentEvents = report.concealmentEvents
+        if (typeof report.concealedSamples === 'number') inboundAudioConcealedSamples = report.concealedSamples
+        if (typeof report.insertedSamplesForDeceleration === 'number') {
+          inboundAudioInsertedSamplesForDeceleration = report.insertedSamplesForDeceleration
+        }
+        if (typeof report.removedSamplesForAcceleration === 'number') {
+          inboundAudioRemovedSamplesForAcceleration = report.removedSamplesForAcceleration
+        }
+        if (typeof report.jitterBufferDelay === 'number'
+          && typeof report.jitterBufferEmittedCount === 'number'
+          && report.jitterBufferEmittedCount > 0) {
+          // WebRTC exposes cumulative delay and emitted samples. Their ratio is
+          // the browser's average audio jitter-buffer delay for this session.
+          inboundAudioJitterBufferDelay = Math.max(0, report.jitterBufferDelay * 1_000 / report.jitterBufferEmittedCount)
+        }
+      }
     })
-    const renderedQuality = videoElement?.getVideoPlaybackQuality?.()
+    const renderedQuality = videoElement.value?.getVideoPlaybackQuality?.()
     if (renderedQuality && typeof renderedQuality.droppedVideoFrames === 'number') {
       dropped = renderedQuality.droppedVideoFrames
     }
@@ -713,6 +759,13 @@ export function useViewer() {
     }
     rttMs.value = candidateRtt ?? fallbackCandidateRtt ?? rttMs.value
     jitterMs.value = inboundJitter
+    audioPacketsLost.value = inboundAudioPacketsLost
+    audioJitterMs.value = inboundAudioJitter
+    audioConcealmentEvents.value = inboundAudioConcealmentEvents
+    audioConcealedSamples.value = inboundAudioConcealedSamples
+    audioInsertedSamplesForDeceleration.value = inboundAudioInsertedSamplesForDeceleration
+    audioRemovedSamplesForAcceleration.value = inboundAudioRemovedSamplesForAcceleration
+    audioJitterBufferDelayMs.value = inboundAudioJitterBufferDelay
     if (jitterBufferDelayTotal !== null && jitterBufferEmittedCount !== null) {
       const emittedDelta = lastJitterBufferEmittedCount === null
         ? 0
@@ -775,6 +828,13 @@ export function useViewer() {
         ...(freezes === null ? {} : { freezeCount: freezes }),
         ...(jitterBufferDelayMs.value === null ? {} : { jitterBufferDelayMs: jitterBufferDelayMs.value }),
         ...(decodeTime === null ? {} : { decodeTimeMs: decodeTime }),
+        ...(audioPacketsLost.value === null ? {} : { audioPacketsLost: audioPacketsLost.value }),
+        ...(audioJitterMs.value === null ? {} : { audioJitterMs: audioJitterMs.value }),
+        ...(audioConcealmentEvents.value === null ? {} : { audioConcealmentEvents: audioConcealmentEvents.value }),
+        ...(audioConcealedSamples.value === null ? {} : { audioConcealedSamples: audioConcealedSamples.value }),
+        ...(audioInsertedSamplesForDeceleration.value === null ? {} : { audioInsertedSamplesForDeceleration: audioInsertedSamplesForDeceleration.value }),
+        ...(audioRemovedSamplesForAcceleration.value === null ? {} : { audioRemovedSamplesForAcceleration: audioRemovedSamplesForAcceleration.value }),
+        ...(audioJitterBufferDelayMs.value === null ? {} : { audioJitterBufferDelayMs: audioJitterBufferDelayMs.value }),
         visibilityState: document.visibilityState,
       }
       socket?.emit('viewer.stats', metrics)
@@ -999,6 +1059,13 @@ export function useViewer() {
     framesDropped.value = null
     freezeCount.value = null
     jitterBufferDelayMs.value = null
+    audioPacketsLost.value = null
+    audioJitterMs.value = null
+    audioConcealmentEvents.value = null
+    audioConcealedSamples.value = null
+    audioInsertedSamplesForDeceleration.value = null
+    audioRemovedSamplesForAcceleration.value = null
+    audioJitterBufferDelayMs.value = null
     catchUpDelayMs.value = null
     playoutDelayMs.value = null
     captureToDisplayDelayMs.value = null
@@ -1144,7 +1211,7 @@ export function useViewer() {
   }
 
   function setVideoElement(element: HTMLVideoElement | null) {
-    videoElement = element
+    videoElement.value = element
   }
 
   function reportPlaybackError() {
@@ -1211,5 +1278,5 @@ export function useViewer() {
   }
 
   onBeforeUnmount(stop)
-  return { videoStream, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, setVideoElement, reportPlaybackError, reportPlaybackStarted, seekToLiveEdge, noteVideoFrameRendered, ping }
+  return { videoStream, videoElement, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, audioPacketsLost, audioJitterMs, audioConcealmentEvents, audioConcealedSamples, audioInsertedSamplesForDeceleration, audioRemovedSamplesForAcceleration, audioJitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, setVideoElement, reportPlaybackError, reportPlaybackStarted, seekToLiveEdge, noteVideoFrameRendered, ping }
 }

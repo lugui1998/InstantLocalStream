@@ -6,6 +6,9 @@ export interface StreamStatus {
   max_viewers?: number
   media_error?: string | null
   audio_enabled?: boolean
+  audio_mode?: string
+  test_tone?: TestToneDescription | null
+  audio_diagnostics?: AudioDiagnostics | null
   quality?: string
   fps?: string | number
   bitrate_bps?: number
@@ -15,10 +18,33 @@ export interface StreamStatus {
   stale_encoded_frames?: number
   encoder_backlog_restarts?: number
   codec?: string | null
+  h264_level?: string | null
+  h265_level?: string | null
   group?: GroupAssignment | null
   groups?: GroupAssignment[]
   sync_mode?: string
   synchronization_mode?: string
+}
+
+export interface TestToneDescription {
+  frequency_hz: number
+  level_dbfs: number
+  on_ms: number
+  cycle_ms: number
+  visual_marker: string
+}
+
+export interface AudioDiagnostics {
+  capture_raw_sample_drops: number
+  capture_chunk_drops: number
+  capture_discontinuities: number
+  capture_recovery_gap_packets: number
+  pacing_backlog_drops: number
+  subscriber_queue_drops: number
+  malformed_chunks: number
+  encode_failures: number
+  write_failures: number
+  native_thread_priority_promotions: number
 }
 
 export interface GroupAssignment {
@@ -28,6 +54,8 @@ export interface GroupAssignment {
   fps: string | number
   bitrate_bps: number
   codec?: string | null
+  h264_level?: string | null
+  h265_level?: string | null
   state: string
   reason: string | null
   restart?: boolean
@@ -76,6 +104,13 @@ export interface ViewerStats {
   freezeCount?: number
   jitterBufferDelayMs?: number
   decodeTimeMs?: number
+  audioPacketsLost?: number
+  audioJitterMs?: number
+  audioConcealmentEvents?: number
+  audioConcealedSamples?: number
+  audioInsertedSamplesForDeceleration?: number
+  audioRemovedSamplesForAcceleration?: number
+  audioJitterBufferDelayMs?: number
   visibilityState?: DocumentVisibilityState
 }
 
@@ -109,6 +144,7 @@ export interface PingAcknowledgement {
   encoderBacklogRestarts?: number
   mediaStatus?: string
   mediaError?: string | null
+  audioDiagnostics?: AudioDiagnostics | null
 }
 
 export interface WebRtcAnswer {

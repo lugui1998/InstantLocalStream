@@ -1,5 +1,7 @@
 # Rust build output
 /target/
+/vendor/**/target/
+
 
 # Generated release and packaging output
 /dist/

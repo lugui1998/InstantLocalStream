@@ -1,4 +1,5 @@
 export const retryDelays = [1_000, 2_000, 5_000, 10_000, 20_000, 30_000] as const
+export const diagnosticRecordingLimitMs = 30_000
 
 export function retryDelayFor(attempt: number) {
   const index = Math.max(0, Math.min(Math.trunc(attempt), retryDelays.length - 1))
@@ -25,4 +26,14 @@ export function playbackRateFor(delayMs: number | null, hasLiveAudio = false) {
   if (delayMs >= 500) return 1.12
   if (delayMs >= 250) return 1.08
   return 1.04
+}
+
+export function preferredRecordingMimeType(isTypeSupported: (mimeType: string) => boolean) {
+  return [
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp9,opus',
+    'video/webm',
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4',
+  ].find(isTypeSupported) ?? ''
 }

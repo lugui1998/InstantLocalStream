@@ -16,7 +16,7 @@ use rtc::media::{
 };
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::{
-    MIME_TYPE_H264, MIME_TYPE_VP8, MIME_TYPE_VP9,
+    MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_VP8, MIME_TYPE_VP9,
 };
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
@@ -36,21 +36,213 @@ fn hide_console(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_console(_command: &mut Command) {}
 
-const VP8_PAYLOAD_TYPE: u8 = 96;
-const VP9_PAYLOAD_TYPE: u8 = 98;
-// Chrome advertises constrained-baseline packetization-mode=1 as PT 108.
-// Keeping this fixed makes the static sample writer match the answer SDP.
-const H264_PAYLOAD_TYPE: u8 = 108;
-// The shared encoder must fit the level browsers actually offer to receive.
-// Mainstream WebRTC offers commonly use constrained-baseline level 3.1; higher
-// output profiles are rejected instead of negotiating 3.1 and emitting a 4.2
-// bitstream that the receiver never agreed to decode.
-const H264_LEVEL: &str = "3.1";
-const H264_SDP_FMTP_LINE: &str =
-    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
-const H264_LEVEL_31_MAX_FRAME_SIZE_MACROBLOCKS: u64 = 3_600;
-const H264_LEVEL_31_MAX_MACROBLOCKS_PER_SECOND: u64 = 108_000;
-const H264_LEVEL_31_MAX_BITRATE_BPS: u32 = 14_000_000;
+const H264_CONSTRAINED_BASELINE_PROFILE_PREFIX: &str = "42e0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct H264Level {
+    name: &'static str,
+    level_idc: u8,
+    max_frame_size_macroblocks: u64,
+    max_macroblocks_per_second: u64,
+    max_bitrate_bps: u32,
+}
+
+impl H264Level {
+    pub(crate) const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) const fn level_idc(self) -> u8 {
+        self.level_idc
+    }
+
+    fn sdp_fmtp_line(self) -> String {
+        format!(
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={H264_CONSTRAINED_BASELINE_PROFILE_PREFIX}{:02x}",
+            self.level_idc
+        )
+    }
+}
+
+const H264_LEVEL_31: H264Level = H264Level {
+    name: "3.1",
+    level_idc: 0x1f,
+    max_frame_size_macroblocks: 3_600,
+    max_macroblocks_per_second: 108_000,
+    max_bitrate_bps: 14_000_000,
+};
+
+// H.264 Annex A table A-1 limits for Baseline profile. Keep these ordered so
+// profile selection always chooses the smallest conforming level.
+const H264_LEVELS: &[H264Level] = &[
+    H264_LEVEL_31,
+    H264Level {
+        name: "3.2",
+        level_idc: 0x20,
+        max_frame_size_macroblocks: 5_120,
+        max_macroblocks_per_second: 216_000,
+        max_bitrate_bps: 20_000_000,
+    },
+    H264Level {
+        name: "4.0",
+        level_idc: 0x28,
+        max_frame_size_macroblocks: 8_192,
+        max_macroblocks_per_second: 245_760,
+        max_bitrate_bps: 20_000_000,
+    },
+    H264Level {
+        name: "4.1",
+        level_idc: 0x29,
+        max_frame_size_macroblocks: 8_192,
+        max_macroblocks_per_second: 245_760,
+        max_bitrate_bps: 50_000_000,
+    },
+    H264Level {
+        name: "4.2",
+        level_idc: 0x2a,
+        max_frame_size_macroblocks: 8_704,
+        max_macroblocks_per_second: 522_240,
+        max_bitrate_bps: 50_000_000,
+    },
+    H264Level {
+        name: "5.0",
+        level_idc: 0x32,
+        max_frame_size_macroblocks: 22_080,
+        max_macroblocks_per_second: 589_824,
+        max_bitrate_bps: 135_000_000,
+    },
+    H264Level {
+        name: "5.1",
+        level_idc: 0x33,
+        max_frame_size_macroblocks: 36_864,
+        max_macroblocks_per_second: 983_040,
+        max_bitrate_bps: 240_000_000,
+    },
+    H264Level {
+        name: "5.2",
+        level_idc: 0x34,
+        max_frame_size_macroblocks: 36_864,
+        max_macroblocks_per_second: 2_073_600,
+        max_bitrate_bps: 240_000_000,
+    },
+    H264Level {
+        name: "6.0",
+        level_idc: 0x3c,
+        max_frame_size_macroblocks: 139_264,
+        max_macroblocks_per_second: 4_177_920,
+        max_bitrate_bps: 240_000_000,
+    },
+    H264Level {
+        name: "6.1",
+        level_idc: 0x3d,
+        max_frame_size_macroblocks: 139_264,
+        max_macroblocks_per_second: 8_355_840,
+        max_bitrate_bps: 480_000_000,
+    },
+    H264Level {
+        name: "6.2",
+        level_idc: 0x3e,
+        max_frame_size_macroblocks: 139_264,
+        max_macroblocks_per_second: 16_711_680,
+        max_bitrate_bps: 800_000_000,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct H265Level {
+    name: &'static str,
+    level_idc: u8,
+    max_luma_picture_size: u64,
+    max_luma_sample_rate: u64,
+    max_bitrate_bps: u32,
+}
+
+impl H265Level {
+    pub(crate) const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) const fn level_idc(self) -> u8 {
+        self.level_idc
+    }
+
+    fn sdp_fmtp_line(self) -> String {
+        format!(
+            "level-id={};profile-id=1;tier-flag=0;tx-mode=SRST",
+            self.level_idc
+        )
+    }
+}
+
+const H265_LEVEL_31: H265Level = H265Level {
+    name: "3.1",
+    level_idc: 93,
+    max_luma_picture_size: 983_040,
+    max_luma_sample_rate: 33_177_600,
+    max_bitrate_bps: 10_000_000,
+};
+
+// HEVC Table A.6 picture/sample-rate limits and Table A.8 Main-tier bitrate
+// limits. Keep these ordered so selection chooses the smallest valid level.
+const H265_LEVELS: &[H265Level] = &[
+    H265_LEVEL_31,
+    H265Level {
+        name: "4.0",
+        level_idc: 120,
+        max_luma_picture_size: 2_228_224,
+        max_luma_sample_rate: 66_846_720,
+        max_bitrate_bps: 12_000_000,
+    },
+    H265Level {
+        name: "4.1",
+        level_idc: 123,
+        max_luma_picture_size: 2_228_224,
+        max_luma_sample_rate: 133_693_440,
+        max_bitrate_bps: 20_000_000,
+    },
+    H265Level {
+        name: "5.0",
+        level_idc: 150,
+        max_luma_picture_size: 8_912_896,
+        max_luma_sample_rate: 267_386_880,
+        max_bitrate_bps: 25_000_000,
+    },
+    H265Level {
+        name: "5.1",
+        level_idc: 153,
+        max_luma_picture_size: 8_912_896,
+        max_luma_sample_rate: 534_773_760,
+        max_bitrate_bps: 40_000_000,
+    },
+    H265Level {
+        name: "5.2",
+        level_idc: 156,
+        max_luma_picture_size: 8_912_896,
+        max_luma_sample_rate: 1_069_547_520,
+        max_bitrate_bps: 60_000_000,
+    },
+    H265Level {
+        name: "6.0",
+        level_idc: 180,
+        max_luma_picture_size: 35_651_584,
+        max_luma_sample_rate: 1_069_547_520,
+        max_bitrate_bps: 60_000_000,
+    },
+    H265Level {
+        name: "6.1",
+        level_idc: 183,
+        max_luma_picture_size: 35_651_584,
+        max_luma_sample_rate: 2_139_095_040,
+        max_bitrate_bps: 120_000_000,
+    },
+    H265Level {
+        name: "6.2",
+        level_idc: 186,
+        max_luma_picture_size: 35_651_584,
+        max_luma_sample_rate: 4_278_190_080,
+        max_bitrate_bps: 240_000_000,
+    },
+];
 const MAX_ENCODED_FRAME_AGE: Duration = Duration::from_millis(250);
 const ENCODER_BACKLOG_RESTART_AGE: Duration = Duration::from_millis(750);
 const ENCODER_BACKLOG_RESTART_FRAMES: u32 = 8;
@@ -63,6 +255,7 @@ pub enum VideoCodec {
     Vp8,
     Vp9,
     H264,
+    H265,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +323,7 @@ impl VideoCodec {
             "vp8" => Ok(Self::Vp8),
             "vp9" => Ok(Self::Vp9),
             "h264" => Ok(Self::H264),
+            "h265" | "hevc" => Ok(Self::H265),
             other => anyhow::bail!("unsupported codec '{other}'"),
         }
     }
@@ -139,15 +333,16 @@ impl VideoCodec {
             Self::Vp8 => "VP8",
             Self::Vp9 => "VP9",
             Self::H264 => "H.264",
+            Self::H265 => "H.265",
         }
     }
 
-    #[cfg(test)]
     pub const fn id(self) -> &'static str {
         match self {
             Self::Vp8 => "vp8",
             Self::Vp9 => "vp9",
             Self::H264 => "h264",
+            Self::H265 => "h265",
         }
     }
 
@@ -156,22 +351,19 @@ impl VideoCodec {
             Self::Vp8 => MIME_TYPE_VP8,
             Self::Vp9 => MIME_TYPE_VP9,
             Self::H264 => MIME_TYPE_H264,
+            Self::H265 => MIME_TYPE_HEVC,
         }
     }
 
-    pub const fn payload_type(self) -> u8 {
-        match self {
-            Self::Vp8 => VP8_PAYLOAD_TYPE,
-            Self::Vp9 => VP9_PAYLOAD_TYPE,
-            Self::H264 => H264_PAYLOAD_TYPE,
-        }
-    }
-
-    pub const fn sdp_fmtp_line(self) -> &'static str {
+    pub const fn default_sdp_fmtp_line(self) -> &'static str {
         match self {
             Self::Vp8 => "",
             Self::Vp9 => "profile-id=0",
-            Self::H264 => H264_SDP_FMTP_LINE,
+            Self::H264 => "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+            // HEVC profile/tier/level parameters come from the viewer's offer.
+            // Keeping the pipeline default empty also matches RFC 7798 defaults
+            // and the upstream rtc crate's HEVC registration.
+            Self::H265 => "",
         }
     }
 }
@@ -185,6 +377,13 @@ pub struct MediaTrack {
     preserve_nal_order: bool,
     queue: Arc<SubscriberQueue>,
     frame_capture_times: Arc<Mutex<HashMap<Uuid, VecDeque<FrameCaptureMapping>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NegotiatedVideoCodec {
+    pub payload_type: u8,
+    pub mime_type: String,
+    pub sdp_fmtp_line: String,
 }
 
 #[derive(Clone, Copy)]
@@ -425,24 +624,84 @@ mod tests {
     }
 
     #[test]
-    fn h264_encoder_and_sdp_advertise_the_same_conservative_level() {
-        let pipeline = MediaPipeline::with_codec("h264").unwrap();
-        let low =
-            pipeline.video_encode_args(Some(720), Some("30".to_owned()), "1_000_000".to_owned());
-        let high =
-            pipeline.video_encode_args(Some(1080), Some("60".to_owned()), "1_000_000".to_owned());
-        assert!(low.windows(2).any(|pair| pair == ["-level:v", H264_LEVEL]));
-        assert!(high.windows(2).any(|pair| pair == ["-level:v", H264_LEVEL]));
-        assert!(pipeline.sdp_fmtp_line().contains("profile-level-id=42e01f"));
+    fn h264_encoder_and_sdp_advertise_the_selected_dynamic_level() {
+        for (level, profile_level_id) in [
+            (H264_LEVEL_31, "42e01f"),
+            (H264_LEVELS[1], "42e020"),
+            (H264_LEVELS[2], "42e028"),
+            (H264_LEVELS[4], "42e02a"),
+        ] {
+            let pipeline = MediaPipeline::with_codec_profile("h264", Some(level), None).unwrap();
+            let args = pipeline.video_encode_args(
+                Some(1080),
+                Some("60".to_owned()),
+                "1_000_000".to_owned(),
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-level:v", level.name()])
+            );
+            assert!(pipeline.sdp_fmtp_line().contains(profile_level_id));
+        }
     }
 
     #[test]
-    fn h264_level_31_limits_cover_720p30_but_not_larger_profiles() {
-        assert!(h264_level_31_compatible(1280, 720, 30));
-        assert!(!h264_level_31_compatible(1280, 720, 60));
-        assert!(!h264_level_31_compatible(1920, 1080, 30));
-        assert!(h264_level_31_bitrate_compatible(14_000_000));
-        assert!(!h264_level_31_bitrate_compatible(14_000_001));
+    fn h265_encoder_uses_main_profile_and_zero_latency_annex_b_output() {
+        let pipeline =
+            MediaPipeline::with_codec_profile("h265", None, Some(H265_LEVELS[2])).unwrap();
+        let args =
+            pipeline.video_encode_args(Some(1080), Some("60".to_owned()), "10_000_000".to_owned());
+
+        assert_eq!(pipeline.codec_name(), "H.265");
+        assert_eq!(pipeline.mime_type(), MIME_TYPE_HEVC);
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx265"]));
+        assert!(args.windows(2).any(|pair| pair == ["-profile:v", "main"]));
+        assert!(args.windows(2).any(|pair| pair == ["-level:v", "4.1"]));
+        assert!(args.windows(2).any(|pair| pair == ["-f", "hevc"]));
+        assert!(pipeline.sdp_fmtp_line().contains("level-id=123"));
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "-x265-params",
+                "repeat-headers=1:aud=1:bframes=0:rc-lookahead=0:scenecut=0",
+            ]
+        }));
+    }
+
+    #[test]
+    fn h264_level_selection_covers_common_realtime_profiles() {
+        let level_for = |height, fps, bitrate| {
+            let mut settings = CaptureSettings::from_config(&AppConfig::default());
+            settings.output_height = Some(height);
+            settings.output_fps = Some(fps);
+            settings.bitrate = bitrate;
+            h264_level_for_profile((1920, 1080), 60, &settings)
+                .unwrap()
+                .name()
+        };
+
+        assert_eq!(level_for(720, 30, 14_000_000), "3.1");
+        assert_eq!(level_for(720, 60, 20_000_000), "3.2");
+        assert_eq!(level_for(1080, 30, 20_000_000), "4.0");
+        assert_eq!(level_for(1080, 60, 50_000_000), "4.2");
+        assert_eq!(level_for(720, 30, 20_000_001), "4.1");
+    }
+
+    #[test]
+    fn h265_level_selection_covers_common_realtime_profiles() {
+        let level_for = |height, fps, bitrate| {
+            let mut settings = CaptureSettings::from_config(&AppConfig::default());
+            settings.output_height = Some(height);
+            settings.output_fps = Some(fps);
+            settings.bitrate = bitrate;
+            h265_level_for_profile((1920, 1080), 60, &settings)
+                .unwrap()
+                .name()
+        };
+
+        assert_eq!(level_for(720, 30, 10_000_000), "3.1");
+        assert_eq!(level_for(1080, 30, 12_000_000), "4.0");
+        assert_eq!(level_for(1080, 60, 20_000_000), "4.1");
+        assert_eq!(level_for(2160, 60, 25_000_000), "5.1");
     }
 
     #[test]
@@ -501,6 +760,9 @@ pub struct MediaPipeline {
     readiness: Arc<(Mutex<EncoderReadiness>, Condvar)>,
     encoder_children: Arc<Mutex<Vec<Weak<Mutex<Child>>>>>,
     codec: VideoCodec,
+    h264_level: Option<H264Level>,
+    h265_level: Option<H265Level>,
+    sdp_fmtp_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,7 +773,25 @@ enum EncoderReadiness {
 }
 
 impl MediaPipeline {
+    #[cfg(test)]
     pub fn with_codec(codec: &str) -> Result<Self> {
+        Self::with_codec_profile(codec, None, None)
+    }
+
+    pub(crate) fn with_codec_profile(
+        codec: &str,
+        h264_level: Option<H264Level>,
+        h265_level: Option<H265Level>,
+    ) -> Result<Self> {
+        let codec = VideoCodec::parse(codec)?;
+        let h264_level =
+            matches!(codec, VideoCodec::H264).then_some(h264_level.unwrap_or(H264_LEVEL_31));
+        let h265_level =
+            matches!(codec, VideoCodec::H265).then_some(h265_level.unwrap_or(H265_LEVEL_31));
+        let sdp_fmtp_line = h264_level
+            .map(H264Level::sdp_fmtp_line)
+            .or_else(|| h265_level.map(H265Level::sdp_fmtp_line))
+            .unwrap_or_else(|| codec.default_sdp_fmtp_line().to_owned());
         Ok(Self {
             subscribers: Arc::new(Mutex::new(HashMap::new())),
             frame_capture_times: Arc::new(Mutex::new(HashMap::new())),
@@ -526,11 +806,18 @@ impl MediaPipeline {
             encoder_backlog_restarts: Arc::new(AtomicU64::new(0)),
             readiness: Arc::new((Mutex::new(EncoderReadiness::Pending), Condvar::new())),
             encoder_children: Arc::new(Mutex::new(Vec::new())),
-            codec: VideoCodec::parse(codec)?,
+            codec,
+            h264_level,
+            h265_level,
+            sdp_fmtp_line,
         })
     }
 
-    pub fn subscribe(&self, connection_id: Uuid) -> Result<MediaTrack> {
+    pub fn subscribe(
+        &self,
+        connection_id: Uuid,
+        negotiated_codec: &NegotiatedVideoCodec,
+    ) -> Result<MediaTrack> {
         let ssrc = rand::random::<u32>();
         let track = TrackLocalStaticSample::new(MediaStreamTrack::new(
             "instant-local-stream".to_owned(),
@@ -543,10 +830,10 @@ impl MediaPipeline {
                     ..Default::default()
                 },
                 codec: RTCRtpCodec {
-                    mime_type: self.codec.mime_type().to_owned(),
+                    mime_type: negotiated_codec.mime_type.clone(),
                     clock_rate: 90_000,
                     channels: 0,
-                    sdp_fmtp_line: self.codec.sdp_fmtp_line().to_owned(),
+                    sdp_fmtp_line: negotiated_codec.sdp_fmtp_line.clone(),
                     rtcp_feedback: vec![],
                 },
                 ..Default::default()
@@ -556,7 +843,10 @@ impl MediaPipeline {
             connection_id,
             track: Arc::new(track),
             ssrc,
-            payload_type: self.codec.payload_type(),
+            payload_type: negotiated_codec.payload_type,
+            // The HEVC sample reader already returns a whole access unit. Its
+            // parameter sets must travel with the newest picture rather than
+            // accumulating in the H.264-only ordered prefix queue.
             preserve_nal_order: matches!(self.codec, VideoCodec::H264),
             queue: Arc::new(SubscriberQueue {
                 samples: Mutex::new(VecDeque::with_capacity(1)),
@@ -613,18 +903,20 @@ impl MediaPipeline {
     pub fn codec_name(&self) -> &'static str {
         self.codec.name()
     }
-    #[cfg(test)]
     pub fn codec_id(&self) -> &'static str {
         self.codec.id()
     }
     pub fn mime_type(&self) -> &'static str {
         self.codec.mime_type()
     }
-    pub fn sdp_fmtp_line(&self) -> &'static str {
-        self.codec.sdp_fmtp_line()
+    pub fn sdp_fmtp_line(&self) -> &str {
+        &self.sdp_fmtp_line
     }
-    pub fn payload_type(&self) -> u8 {
-        self.codec.payload_type()
+    pub(crate) fn h264_level(&self) -> Option<H264Level> {
+        self.h264_level
+    }
+    pub(crate) fn h265_level(&self) -> Option<H265Level> {
+        self.h265_level
     }
     pub fn stop(&self) {
         self.request_stop();
@@ -828,18 +1120,24 @@ impl MediaPipeline {
         let frame_size = source_pixel_format_frame_size(source_pixel_format, width, height)?;
         let output_fps = configured_output_fps(source_fps, settings)?;
         if matches!(self.codec, VideoCodec::H264) {
-            let (output_width, output_height) =
-                output_dimensions(width, height, settings.output_height)?;
-            if !h264_level_31_compatible(output_width, output_height, output_fps) {
+            let required_level = h264_level_for_profile((width, height), source_fps, settings)?;
+            let configured_level = self.h264_level.unwrap_or(H264_LEVEL_31);
+            if configured_level.level_idc() < required_level.level_idc() {
                 anyhow::bail!(
-                    "requested H.264 output {output_width}x{output_height} at {output_fps} FPS exceeds constrained-baseline level {H264_LEVEL}"
+                    "H.264 encoder level {} is below the required level {}",
+                    configured_level.name(),
+                    required_level.name()
                 );
             }
-            if !h264_level_31_bitrate_compatible(settings.bitrate) {
+        }
+        if matches!(self.codec, VideoCodec::H265) {
+            let required_level = h265_level_for_profile((width, height), source_fps, settings)?;
+            let configured_level = self.h265_level.unwrap_or(H265_LEVEL_31);
+            if configured_level.level_idc() < required_level.level_idc() {
                 anyhow::bail!(
-                    "requested H.264 bitrate {} exceeds constrained-baseline level {H264_LEVEL}'s {} bps limit",
-                    settings.bitrate,
-                    H264_LEVEL_31_MAX_BITRATE_BPS
+                    "H.265 encoder level {} is below the required level {}",
+                    configured_level.name(),
+                    required_level.name()
                 );
             }
         }
@@ -1062,7 +1360,7 @@ impl MediaPipeline {
                 "-profile:v".to_owned(),
                 "baseline".to_owned(),
                 "-level:v".to_owned(),
-                H264_LEVEL.to_owned(),
+                self.h264_level.unwrap_or(H264_LEVEL_31).name().to_owned(),
                 "-pix_fmt".to_owned(),
                 "yuv420p".to_owned(),
                 "-keyint_min".to_owned(),
@@ -1083,6 +1381,33 @@ impl MediaPipeline {
                 "1".to_owned(),
                 "pipe:1".to_owned(),
             ]),
+            VideoCodec::H265 => args.extend([
+                "-c:v".to_owned(),
+                "libx265".to_owned(),
+                "-preset".to_owned(),
+                "ultrafast".to_owned(),
+                "-tune".to_owned(),
+                "zerolatency".to_owned(),
+                "-profile:v".to_owned(),
+                "main".to_owned(),
+                "-level:v".to_owned(),
+                self.h265_level.unwrap_or(H265_LEVEL_31).name().to_owned(),
+                "-pix_fmt".to_owned(),
+                "yuv420p".to_owned(),
+                "-x265-params".to_owned(),
+                "repeat-headers=1:aud=1:bframes=0:rc-lookahead=0:scenecut=0".to_owned(),
+                "-flags".to_owned(),
+                "low_delay".to_owned(),
+                "-max_delay".to_owned(),
+                "0".to_owned(),
+                "-b:v".to_owned(),
+                bitrate,
+                "-f".to_owned(),
+                "hevc".to_owned(),
+                "-flush_packets".to_owned(),
+                "1".to_owned(),
+                "pipe:1".to_owned(),
+            ]),
         }
         args.splice(0..0, keyframe_args);
         args
@@ -1097,6 +1422,7 @@ impl MediaPipeline {
         match self.codec {
             VideoCodec::Vp8 | VideoCodec::Vp9 => self.stream_ivf(stdout, timing),
             VideoCodec::H264 => self.stream_h264(stdout, fps.unwrap_or(60), timing),
+            VideoCodec::H265 => self.stream_h265(stdout, fps.unwrap_or(60), timing),
         }
     }
 
@@ -1179,6 +1505,66 @@ impl MediaPipeline {
                     timed_samples,
                     bytes = sample.data.len(),
                     "H.264 encoder is producing access units"
+                );
+            }
+            let frame_timing = timing.encoded_frame_timing();
+            if self.encoder_backlog_requires_restart(&frame_timing, &mut backlog_frames) {
+                return Ok(());
+            }
+            if !self.active.load(Ordering::Acquire) || frame_timing.stale {
+                pacer.reset_to_now();
+                continue;
+            }
+            self.write_frame(
+                sample.data,
+                frame_duration,
+                frame_timing.capture_time_unix_nanos,
+                frame_timing.encoder_delay_ms,
+            )?;
+            pacer.wait_after_frame();
+        }
+        Ok(())
+    }
+
+    fn stream_h265(
+        &self,
+        stdout: impl std::io::Read,
+        fps: u32,
+        timing: &EncoderTiming,
+    ) -> Result<()> {
+        let mut reader = H26xSampleReader::new(BufReader::new(stdout), 1_048_576, true);
+        let frame_duration = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+        let mut pacer = FramePacer::new(frame_duration);
+        let mut timed_samples = 0_u64;
+        let mut backlog_frames = 0_u32;
+        while !self.stop.load(Ordering::Acquire) {
+            let sample = match reader.next_sample() {
+                Ok(sample) => sample,
+                Err(_error) if self.stop.load(Ordering::Acquire) => break,
+                Err(error) => {
+                    tracing::error!(%error, "H.265 sample reader stopped");
+                    return Err(anyhow::anyhow!("FFmpeg H.265 stream ended: {error}"));
+                }
+            };
+            if !sample.timed {
+                if self.active.load(Ordering::Acquire) {
+                    self.write_frame(sample.data, Duration::ZERO, None, None)?;
+                }
+                continue;
+            }
+            timed_samples += 1;
+            self.mark_ready();
+            if timed_samples <= 3 {
+                tracing::info!(
+                    timed_samples,
+                    bytes = sample.data.len(),
+                    "H.265 sample received"
+                );
+            } else if timed_samples.is_multiple_of(30) {
+                tracing::debug!(
+                    timed_samples,
+                    bytes = sample.data.len(),
+                    "H.265 encoder is producing access units"
                 );
             }
             let frame_timing = timing.encoded_frame_timing();
@@ -1337,18 +1723,98 @@ fn output_dimensions(
     Ok((width, output_height))
 }
 
-fn h264_level_31_compatible(width: u32, height: u32, fps: u32) -> bool {
+fn h264_level_compatible(
+    level: H264Level,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+) -> bool {
     if width == 0 || height == 0 || fps == 0 {
         return false;
     }
     let macroblocks_per_frame = u64::from(width).div_ceil(16) * u64::from(height).div_ceil(16);
-    macroblocks_per_frame <= H264_LEVEL_31_MAX_FRAME_SIZE_MACROBLOCKS
-        && macroblocks_per_frame.saturating_mul(u64::from(fps))
-            <= H264_LEVEL_31_MAX_MACROBLOCKS_PER_SECOND
+    macroblocks_per_frame <= level.max_frame_size_macroblocks
+        && macroblocks_per_frame.saturating_mul(u64::from(fps)) <= level.max_macroblocks_per_second
+        && bitrate_bps <= level.max_bitrate_bps
 }
 
-fn h264_level_31_bitrate_compatible(bitrate_bps: u32) -> bool {
-    bitrate_bps <= H264_LEVEL_31_MAX_BITRATE_BPS
+pub(crate) fn h264_level_for_profile(
+    source_dimensions: (u32, u32),
+    source_fps: u32,
+    settings: &CaptureSettings,
+) -> Result<H264Level> {
+    let output_fps = configured_output_fps(source_fps, settings)?;
+    let (output_width, output_height) = output_dimensions(
+        source_dimensions.0,
+        source_dimensions.1,
+        settings.output_height,
+    )?;
+    H264_LEVELS
+        .iter()
+        .copied()
+        .find(|level| {
+            h264_level_compatible(
+                *level,
+                output_width,
+                output_height,
+                output_fps,
+                settings.bitrate,
+            )
+        })
+        .with_context(|| {
+            format!(
+                "no supported H.264 level can represent {output_width}x{output_height} at {output_fps} FPS and {} bps",
+                settings.bitrate
+            )
+        })
+}
+
+fn h265_level_compatible(
+    level: H265Level,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+) -> bool {
+    if width == 0 || height == 0 || fps == 0 {
+        return false;
+    }
+    let luma_picture_size = u64::from(width).saturating_mul(u64::from(height));
+    luma_picture_size <= level.max_luma_picture_size
+        && luma_picture_size.saturating_mul(u64::from(fps)) <= level.max_luma_sample_rate
+        && bitrate_bps <= level.max_bitrate_bps
+}
+
+pub(crate) fn h265_level_for_profile(
+    source_dimensions: (u32, u32),
+    source_fps: u32,
+    settings: &CaptureSettings,
+) -> Result<H265Level> {
+    let output_fps = configured_output_fps(source_fps, settings)?;
+    let (output_width, output_height) = output_dimensions(
+        source_dimensions.0,
+        source_dimensions.1,
+        settings.output_height,
+    )?;
+    H265_LEVELS
+        .iter()
+        .copied()
+        .find(|level| {
+            h265_level_compatible(
+                *level,
+                output_width,
+                output_height,
+                output_fps,
+                settings.bitrate,
+            )
+        })
+        .with_context(|| {
+            format!(
+                "no supported H.265 level can represent {output_width}x{output_height} at {output_fps} FPS and {} bps",
+                settings.bitrate
+            )
+        })
 }
 
 fn yuv420p_frame_size(width: u32, height: u32) -> Result<usize> {

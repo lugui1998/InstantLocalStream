@@ -42,13 +42,30 @@ The link contains a private 12-character access token. Anyone with the link can 
 ## Features
 
 - Monitor and application-window capture
-- VP8 video, with experimental VP9 and H.264 modes
+- Capability-driven H.265/HEVC with a warm H.264 fallback, plus explicit VP8, VP9, H.264, and H.265 modes
 - Optional system or application audio
 - Automatic quality adjustment for each viewer
 - Low-latency WebRTC playback
 - Live latency, bitrate, and connection statistics
 - Support for multiple viewers through one UDP port
 - Built-in test pattern for connection checks
+
+## Diagnostic audio/video recording
+
+Select **Test pattern** in the host and enable **Generate diagnostic test tone**, or launch the headless host with:
+
+```powershell
+instant-local-stream.exe start --source test:0 --test-tone
+```
+
+The host sends a deterministic 1 kHz tone at -12 dBFS for one second followed by one second of silence. A green square appears while the tone is active, using the same two-second epoch so recordings can expose A/V drift. The tone bypasses hardware audio capture but uses the normal FlexAudio, Opus, RTP, WebRTC, and browser receive path.
+
+Open the viewer link and choose one of the diagnostic exports:
+
+- **Record received stream** captures the WebRTC receiver's decoded audio/video tracks, isolating the transport, jitter-buffer, and decoder path.
+- **Record browser tab/window** opens the browser sharing prompt and captures the rendered page. Select the viewer tab/window and enable **Share audio**.
+
+Let the recording run for several tone/silence cycles, then select **Stop & export**. Recording stops automatically after 30 seconds and downloads a high-bitrate WebM file; browsers without WebM recording support use their supported container instead. Both export modes re-encode the captured tracks, so use the known gate timing and the viewer diagnostics when comparing artifacts.
 
 
 ## Build from source

@@ -13,7 +13,7 @@ pub const QUALITY_PRESETS: &[&str] = &[
     "source", "144p", "240p", "360p", "480p", "720p", "1080p", "1440p", "2160p", "4320p",
 ];
 pub const FPS_PRESETS: &[&str] = &["source", "5", "10", "24", "30", "60", "75", "120"];
-pub const AUDIO_MODES: &[&str] = &["off", "system", "window"];
+pub const AUDIO_MODES: &[&str] = &["off", "system", "window", "test"];
 pub const QUALITY_MODES: &[&str] = &["manual", "adaptive"];
 pub const BITRATE_MODES: &[&str] = &["fixed", "automatic"];
 pub const LATENCY_PREFERENCES: &[&str] = &["low", "balanced", "quality"];
@@ -146,8 +146,19 @@ pub struct ConfigArgs {
     pub max_quality_groups: String,
     #[arg(long, default_value = "low", env = "ILS_LATENCY_PREFERENCE")]
     pub latency_preference: String,
-    #[arg(long, env = "ILS_AUDIO")]
+    #[arg(
+        long,
+        env = "ILS_AUDIO",
+        help = "Audio mode: off, system, window, or test (test-pattern source only)"
+    )]
     pub audio: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "ILS_TEST_TONE",
+        help = "Generate the deterministic diagnostic tone; requires --source test:0"
+    )]
+    pub test_tone: bool,
     #[arg(
         long = "exclude-audio-process",
         action = ArgAction::Append,
@@ -255,13 +266,23 @@ impl AppConfig {
         self.adaptive_fps_ceiling = args.adaptive_fps_ceiling;
         self.max_quality_groups = args.max_quality_groups;
         self.latency_preference = args.latency_preference;
-        self.audio_mode = args.audio.unwrap_or_else(|| {
-            if self.source.kind == "test" {
-                "off".to_owned()
-            } else {
-                "system".to_owned()
-            }
-        });
+        if args.test_tone && self.source.kind != "test" {
+            bail!("--test-tone requires --source test:0");
+        }
+        if args.test_tone && args.audio.as_deref().is_some_and(|audio| audio != "test") {
+            bail!("--test-tone cannot be combined with a different --audio mode");
+        }
+        self.audio_mode = if args.test_tone {
+            "test".to_owned()
+        } else {
+            args.audio.unwrap_or_else(|| {
+                if self.source.kind == "test" {
+                    "off".to_owned()
+                } else {
+                    "system".to_owned()
+                }
+            })
+        };
         if !args.exclude_audio_process.is_empty() {
             self.excluded_audio_processes = args.exclude_audio_process;
         }
@@ -300,8 +321,10 @@ impl AppConfig {
             bail!("capture FPS must not exceed 240");
         }
         match self.codec.to_ascii_lowercase().as_str() {
-            "auto" | "vp8" | "vp9" | "h264" => {}
-            other => bail!("unsupported initial codec '{other}', choose auto, vp8, vp9, or h264"),
+            "auto" | "vp8" | "vp9" | "h264" | "h265" => {}
+            other => {
+                bail!("unsupported initial codec '{other}', choose auto, vp8, vp9, h264, or h265")
+            }
         }
         if self.quality != "custom" && !QUALITY_PRESETS.contains(&self.quality.as_str()) {
             bail!(
@@ -356,7 +379,7 @@ impl AppConfig {
         }
         if !AUDIO_MODES.contains(&self.audio_mode.as_str()) {
             bail!(
-                "unsupported audio mode '{}', choose off, system, or window",
+                "unsupported audio mode '{}', choose off, system, window, or test",
                 self.audio_mode
             );
         }
@@ -365,6 +388,9 @@ impl AppConfig {
         }
         if self.audio_mode == "system" && self.source.kind == "test" {
             bail!("system audio is unavailable for the test pattern");
+        }
+        if self.audio_mode == "test" && self.source.kind != "test" {
+            bail!("test-tone audio requires the test-pattern source");
         }
         Ok(())
     }
@@ -400,8 +426,11 @@ impl AppConfig {
             "vp8" => 1.0,
             "vp9" => 0.6875,
             "h264" => 0.8125,
+            "h265" => 0.625,
             "av1" => 0.5,
-            _ => 1.0,
+            // Auto keeps an H.264 encoder warm and upgrades to HEVC only for
+            // viewers that advertise a usable hardware-backed decoder.
+            _ => 0.8125,
         };
         let multiplier = match self.latency_preference.as_str() {
             "low" => 0.90,
@@ -735,6 +764,29 @@ mod tests {
     }
 
     #[test]
+    fn test_tone_flag_enables_audio_only_for_the_test_pattern() {
+        let cli = Cli::try_parse_from([
+            "instant-local-stream",
+            "start",
+            "--source",
+            "test:0",
+            "--test-tone",
+        ])
+        .unwrap();
+        let Command::Start(start) = cli.command.unwrap() else {
+            panic!("expected the start command");
+        };
+        assert_eq!(AppConfig::from_cli(Some(start)).unwrap().audio_mode, "test");
+
+        let invalid =
+            Cli::try_parse_from(["instant-local-stream", "start", "--test-tone"]).unwrap();
+        let Command::Start(invalid) = invalid.command.unwrap() else {
+            panic!("expected the start command");
+        };
+        assert!(AppConfig::from_cli(Some(invalid)).is_err());
+    }
+
+    #[test]
     fn capture_fps_is_bounded_for_timing_retention() {
         let mut config = AppConfig {
             fps: 240,
@@ -853,6 +905,7 @@ mod tests {
                 max_quality_groups: "1".to_owned(),
                 latency_preference: "balanced".to_owned(),
                 audio: Some("off".to_owned()),
+                test_tone: false,
                 exclude_audio_process: Vec::new(),
             })
             .unwrap();

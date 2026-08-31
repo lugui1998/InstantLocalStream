@@ -1165,6 +1165,9 @@ impl HostUi {
         if self.config.source.kind != "test" {
             return;
         }
+        if self.config.audio_mode == "test" {
+            self.config.audio_mode = "off".to_owned();
+        }
         if let Some(source) = self.sources.iter().find(|source| source.kind == kind) {
             self.config.source.kind = source.kind.clone();
             self.config.source.index = source.index;
@@ -2282,6 +2285,7 @@ fn codec_label(value: &str) -> &'static str {
         "vp8" => "VP8",
         "vp9" => "VP9",
         "h264" => "H.264",
+        "h265" => "H.265 / HEVC",
         _ => "Auto",
     }
 }
@@ -2421,7 +2425,7 @@ impl eframe::App for HostUi {
                 egui::ComboBox::from_id_salt("codec")
                     .selected_text(codec_label(&self.config.codec))
                     .show_ui(ui, |ui| {
-                        for value in ["auto", "vp8", "vp9", "h264"] {
+                        for value in ["auto", "vp8", "vp9", "h264", "h265"] {
                             ui.selectable_value(
                                 &mut self.config.codec,
                                 value.to_owned(),
@@ -2568,7 +2572,30 @@ impl eframe::App for HostUi {
             if self.source_tab != SourceTab::TestPattern {
                 self.draw_audio_settings(ui, stream_active, &available_audio_processes);
             } else {
-                ui.label("Audio is unavailable for the test pattern.");
+                let mut test_tone = self.config.audio_mode == "test";
+                let response = ui
+                    .add_enabled(
+                        !stream_active,
+                        egui::Checkbox::new(
+                            &mut test_tone,
+                            "Generate diagnostic test tone",
+                        ),
+                    )
+                    .on_hover_text(if stream_active {
+                        "Stop the stream before changing the diagnostic tone."
+                    } else {
+                        "Send a deterministic gated 1 kHz tone through FlexAudio, Opus, WebRTC, and the viewer."
+                    });
+                if response.changed() {
+                    self.config.audio_mode = if test_tone {
+                        "test".to_owned()
+                    } else {
+                        "off".to_owned()
+                    };
+                }
+                if test_tone {
+                    ui.label("1 kHz at -12 dBFS · 1 second on / 1 second silent");
+                }
             }
 
             let ui = &mut host_columns[0];

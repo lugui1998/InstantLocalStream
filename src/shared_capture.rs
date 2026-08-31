@@ -1269,7 +1269,16 @@ fn ffmpeg_args(
         )?
     };
     args.push("-an".to_owned());
-    if settings.source_kind != "test" {
+    if settings.source_kind == "test" && settings.audio_mode == "test" {
+        let marker_size = (height / 8).clamp(24, 160);
+        let marker_margin = (height / 40).clamp(8, 32);
+        args.extend([
+            "-vf".to_owned(),
+            format!(
+                "drawbox=x={marker_margin}:y={marker_margin}:w={marker_size}:h={marker_size}:color=lime@0.9:t=fill:enable=lt(mod(time(0)\\,2)\\,1)"
+            ),
+        ]);
+    } else if settings.source_kind != "test" {
         // The raw reader has a fixed frame-size contract. Always produce the
         // exact advertised canvas; preserve the real source aspect ratio with
         // letterboxing rather than stretching it.
@@ -1322,6 +1331,21 @@ mod tests {
         settings.source_kind = "test".to_owned();
         settings.output_height = Some(360);
         assert_eq!(target_dimensions(&settings).unwrap(), (640, 360));
+    }
+
+    #[test]
+    fn diagnostic_test_pattern_contains_the_tone_gate_marker() {
+        let mut settings = test_settings();
+        settings.source_kind = "test".to_owned();
+        settings.audio_mode = "test".to_owned();
+        let args = ffmpeg_args(&settings, 1_280, 720, 60).unwrap();
+        let filter = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "-vf").then_some(pair[1].as_str()))
+            .expect("diagnostic test pattern should have a video marker filter");
+        assert!(filter.contains("drawbox="));
+        assert!(filter.contains("color=lime@0.9"));
+        assert!(filter.contains("enable=lt(mod(time(0)"));
     }
 
     #[test]
