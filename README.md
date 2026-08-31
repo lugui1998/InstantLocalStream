@@ -33,7 +33,7 @@ Linux screen capture uses X11. Wayland support depends on your desktop, portal, 
 3. Click **Start Stream**.
 4. Copy the link and open it on another device.
 
-The link contains a private 12-character access token. Anyone with the link can watch the stream, so share it with care.
+The link contains a private access token (random by default). Anyone with the link can watch the stream, so share it with care. The host UI can configure its length, case sensitivity, persistence, or a custom token; custom and locked tokens are less secure.
 
 ## Sharing public stream
 
@@ -49,6 +49,7 @@ The link contains a private 12-character access token. Anyone with the link can 
 - Live latency, bitrate, and connection statistics
 - Support for multiple viewers through one UDP port
 - Built-in test pattern for connection checks
+- Hardware encoder and multi-GPU device detection with automatic quality-group budgeting
 
 ## Diagnostic audio/video recording
 
@@ -60,12 +61,9 @@ instant-local-stream.exe start --source test:0 --test-tone
 
 The host sends a deterministic 1 kHz tone at -12 dBFS for one second followed by one second of silence. A green square appears while the tone is active, using the same two-second epoch so recordings can expose A/V drift. The tone bypasses hardware audio capture but uses the normal FlexAudio, Opus, RTP, WebRTC, and browser receive path.
 
-Open the viewer link and choose one of the diagnostic exports:
+Open the viewer link, expand **Diagnostics**, and select **Record received stream** to capture the WebRTC receiver's decoded audio/video tracks, isolating the transport, jitter-buffer, and decoder path.
 
-- **Record received stream** captures the WebRTC receiver's decoded audio/video tracks, isolating the transport, jitter-buffer, and decoder path.
-- **Record browser tab/window** opens the browser sharing prompt and captures the rendered page. Select the viewer tab/window and enable **Share audio**.
-
-Let the recording run for several tone/silence cycles, then select **Stop & export**. Recording stops automatically after 30 seconds and downloads a high-bitrate WebM file; browsers without WebM recording support use their supported container instead. Both export modes re-encode the captured tracks, so use the known gate timing and the viewer diagnostics when comparing artifacts.
+Let the recording run for several tone/silence cycles, then select **Stop & export**. Recording stops automatically after 30 seconds and downloads a high-bitrate WebM file; browsers without WebM recording support use their supported container instead. The export re-encodes the captured tracks, so use the known gate timing and the viewer diagnostics when comparing artifacts.
 
 
 ## Build from source

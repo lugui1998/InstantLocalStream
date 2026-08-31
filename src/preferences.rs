@@ -4,9 +4,13 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, DEFAULT_AUDIO_EXCLUSIONS, SourceSpec};
+use crate::config::{
+    AppConfig, DEFAULT_AUDIO_EXCLUSIONS, DEFAULT_TOKEN_LENGTH, MAX_QUALITY_GROUPS,
+    MAX_TOKEN_LENGTH, MIN_TOKEN_LENGTH, SourceSpec, TOKEN_MODES, generate_token_with_options,
+    token_for_display, validate_token, validate_token_with_length,
+};
 
-const CURRENT_PREFERENCES_VERSION: u32 = 1;
+const CURRENT_PREFERENCES_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostNetworkTestResult {
@@ -22,6 +26,16 @@ pub struct UserPreferences {
     pub http_port: u16,
     #[serde(default = "default_max_viewers")]
     pub max_viewers: usize,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default = "default_token_mode")]
+    pub token_mode: String,
+    #[serde(default)]
+    pub token_locked: bool,
+    #[serde(default = "default_token_length")]
+    pub token_length: usize,
+    #[serde(default = "default_token_case_sensitive")]
+    pub token_case_sensitive: bool,
     pub source: SourceSpec,
     pub draw_mouse: bool,
     pub codec: String,
@@ -33,15 +47,39 @@ pub struct UserPreferences {
     pub adaptive_quality_ceiling: String,
     pub adaptive_fps_ceiling: String,
     pub max_quality_groups: String,
+    #[serde(default = "default_encoder_device")]
+    pub encoder_device: String,
     pub latency_preference: String,
     pub audio_mode: String,
     pub excluded_audio_processes: Vec<String>,
+    #[serde(default = "default_diagnostics_enabled")]
+    pub diagnostics_enabled: bool,
     #[serde(default)]
     pub host_network_test: Option<HostNetworkTestResult>,
 }
 
 fn default_max_viewers() -> usize {
     8
+}
+
+fn default_token_length() -> usize {
+    DEFAULT_TOKEN_LENGTH
+}
+
+fn default_token_mode() -> String {
+    "automatic".to_owned()
+}
+
+fn default_token_case_sensitive() -> bool {
+    true
+}
+
+fn default_encoder_device() -> String {
+    "auto".to_owned()
+}
+
+fn default_diagnostics_enabled() -> bool {
+    true
 }
 
 impl UserPreferences {
@@ -59,6 +97,12 @@ impl UserPreferences {
             bind: config.bind.clone(),
             http_port: config.http_port,
             max_viewers: config.max_viewers,
+            token: (config.token_mode == "custom" || config.token_locked)
+                .then(|| token_for_display(&config.token, config.token_case_sensitive)),
+            token_mode: config.token_mode.clone(),
+            token_locked: config.token_locked,
+            token_length: config.token_length,
+            token_case_sensitive: config.token_case_sensitive,
             source,
             draw_mouse: config.draw_mouse,
             codec: config.codec.clone(),
@@ -70,9 +114,11 @@ impl UserPreferences {
             adaptive_quality_ceiling: config.adaptive_quality_ceiling.clone(),
             adaptive_fps_ceiling: config.adaptive_fps_ceiling.clone(),
             max_quality_groups: config.max_quality_groups.clone(),
+            encoder_device: config.encoder_device.clone(),
             latency_preference: config.latency_preference.clone(),
             audio_mode: config.audio_mode.clone(),
             excluded_audio_processes: config.excluded_audio_processes.clone(),
+            diagnostics_enabled: config.diagnostics_enabled,
             host_network_test,
         }
     }
@@ -84,6 +130,34 @@ impl UserPreferences {
         config.bind = self.bind.clone();
         config.http_port = self.http_port;
         config.max_viewers = self.max_viewers.max(1);
+        config.token_mode = if TOKEN_MODES.contains(&self.token_mode.as_str()) {
+            self.token_mode.clone()
+        } else {
+            default_token_mode()
+        };
+        config.token_length = self.token_length.clamp(MIN_TOKEN_LENGTH, MAX_TOKEN_LENGTH);
+        config.token_case_sensitive = if config.token_mode == "custom" {
+            true
+        } else {
+            self.token_case_sensitive
+        };
+        config.token_locked = config.token_mode == "automatic" && self.token_locked;
+        config.token = match config.token_mode.as_str() {
+            "custom" => match self.token.as_deref() {
+                Some(token) if validate_token(token).is_ok() => token.to_owned(),
+                _ => generate_token_with_options(config.token_length, config.token_case_sensitive),
+            },
+            _ if config.token_locked => match self.token.as_deref() {
+                Some(token) if validate_token_with_length(token, config.token_length).is_ok() => {
+                    token_for_display(token, config.token_case_sensitive)
+                }
+                _ => generate_token_with_options(config.token_length, config.token_case_sensitive),
+            },
+            _ => generate_token_with_options(config.token_length, config.token_case_sensitive),
+        };
+        if config.token_mode == "custom" {
+            config.token_length = config.token.len();
+        }
         config.source = self.source.clone();
         config.draw_mouse = self.draw_mouse;
         config.codec = self.codec.clone();
@@ -95,11 +169,20 @@ impl UserPreferences {
         config.adaptive_quality_ceiling = self.adaptive_quality_ceiling.clone();
         config.adaptive_fps_ceiling = self.adaptive_fps_ceiling.clone();
         config.max_quality_groups = match self.max_quality_groups.parse::<usize>() {
-            Ok(groups) if groups > 4 => "4".to_owned(),
+            Ok(groups) if groups > MAX_QUALITY_GROUPS => MAX_QUALITY_GROUPS.to_string(),
             _ => self.max_quality_groups.clone(),
+        };
+        config.encoder_device = if self.encoder_device == "software"
+            || self.encoder_device == "auto"
+            || self.encoder_device.starts_with("gpu:")
+        {
+            self.encoder_device.clone()
+        } else {
+            "auto".to_owned()
         };
         config.latency_preference = self.latency_preference.clone();
         config.audio_mode = self.audio_mode.clone();
+        config.diagnostics_enabled = self.diagnostics_enabled;
         let legacy_default_exclusions = self.excluded_audio_processes.len()
             == DEFAULT_AUDIO_EXCLUSIONS.len()
             && DEFAULT_AUDIO_EXCLUSIONS.iter().all(|default| {
@@ -190,17 +273,70 @@ mod tests {
     }
 
     #[test]
+    fn unlocked_tokens_are_not_persisted() {
+        let config = AppConfig::default();
+
+        assert!(!config.token_locked);
+        assert_eq!(UserPreferences::from_config(&config, None).token, None);
+    }
+
+    #[test]
+    fn locked_token_and_generation_settings_round_trip() {
+        let mut config = AppConfig::default();
+        config.token = "Abcdefgh123456".to_owned();
+        config.token_mode = "automatic".to_owned();
+        config.token_locked = true;
+        config.token_length = config.token.len();
+        config.token_case_sensitive = false;
+
+        let preferences = UserPreferences::from_config(&config, None);
+        let mut restored = AppConfig::default();
+        preferences.apply_to(&mut restored);
+
+        assert_eq!(restored.token, "ABCDEFGH123456");
+        assert!(restored.token_locked);
+        assert_eq!(restored.token_length, 14);
+        assert!(!restored.token_case_sensitive);
+    }
+
+    #[test]
+    fn custom_token_is_persisted_without_the_automatic_lock() {
+        let mut config = AppConfig::default();
+        config.token_mode = "custom".to_owned();
+        config.token = "MyCustomToken123".to_owned();
+        config.token_length = config.token.len();
+
+        let preferences = UserPreferences::from_config(&config, None);
+        assert_eq!(preferences.token.as_deref(), Some("MyCustomToken123"));
+        assert!(!preferences.token_locked);
+    }
+
+    #[test]
+    fn diagnostics_visibility_round_trips() {
+        let mut config = AppConfig::default();
+        config.diagnostics_enabled = false;
+
+        let preferences = UserPreferences::from_config(&config, None);
+        let mut restored = AppConfig::default();
+        preferences.apply_to(&mut restored);
+
+        assert!(!restored.diagnostics_enabled);
+    }
+
+    #[test]
     fn older_preferences_get_defaults_for_new_persisted_fields() {
         let config = AppConfig::default();
         let mut value = serde_json::to_value(UserPreferences::from_config(&config, None)).unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("max_viewers");
         object.remove("host_network_test");
+        object.remove("diagnostics_enabled");
 
         let restored: UserPreferences = serde_json::from_value(value).unwrap();
 
         assert_eq!(restored.max_viewers, 8);
         assert_eq!(restored.host_network_test, None);
+        assert!(restored.diagnostics_enabled);
     }
 
     #[test]

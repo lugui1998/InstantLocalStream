@@ -1700,6 +1700,7 @@ mod tests {
             adaptive_quality_ceiling: "source".to_owned(),
             adaptive_fps_ceiling: "source".to_owned(),
             max_quality_groups: "1".to_owned(),
+            encoder_device: "software".to_owned(),
             latency_preference: "low".to_owned(),
             audio_mode: "off".to_owned(),
             excluded_audio_processes: Vec::new(),

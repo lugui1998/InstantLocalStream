@@ -7,6 +7,7 @@ export interface StreamStatus {
   media_error?: string | null
   audio_enabled?: boolean
   audio_mode?: string
+  diagnostics_enabled?: boolean
   test_tone?: TestToneDescription | null
   audio_diagnostics?: AudioDiagnostics | null
   quality?: string

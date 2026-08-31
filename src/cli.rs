@@ -111,6 +111,16 @@ pub fn validate(args: ValidateArgs, json_output: bool) -> Result<()> {
     config.apply_args(args.config)?;
     config.validate()?;
     let ffmpeg = encoder::find_ffmpeg();
+    let encoding_devices = if ffmpeg.available {
+        encoder::discover_local_encoding_devices()
+    } else {
+        vec![encoder::software_device()]
+    };
+    let automatic_group_budget = encoder::automatic_quality_group_budget_for_codec(
+        &config.encoder_device,
+        &config.codec,
+        &encoding_devices,
+    );
     let (sources, source_error) = if config.source.kind == "test" {
         (Vec::new(), None)
     } else {
@@ -143,6 +153,9 @@ pub fn validate(args: ValidateArgs, json_output: bool) -> Result<()> {
         "audio_mode": config.audio_mode,
         "excluded_audio_processes": config.excluded_audio_processes,
         "ffmpeg": ffmpeg,
+        "encoder_device": config.encoder_device,
+        "encoding_devices": encoding_devices,
+        "automatic_group_budget": automatic_group_budget,
         "sources": sources,
         "source_available": source_available,
         "source_error": source_error,

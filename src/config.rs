@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::StartArgs;
 
-pub const TOKEN_LENGTH: usize = 12;
+pub const DEFAULT_TOKEN_LENGTH: usize = 12;
+pub const MIN_TOKEN_LENGTH: usize = 8;
+pub const MAX_TOKEN_LENGTH: usize = 256;
+pub const TOKEN_MODES: &[&str] = &["automatic", "custom"];
 pub const QUALITY_PRESETS: &[&str] = &[
     "source", "144p", "240p", "360p", "480p", "720p", "1080p", "1440p", "2160p", "4320p",
 ];
@@ -18,6 +21,9 @@ pub const QUALITY_MODES: &[&str] = &["manual", "adaptive"];
 pub const BITRATE_MODES: &[&str] = &["fixed", "automatic"];
 pub const LATENCY_PREFERENCES: &[&str] = &["low", "balanced", "quality"];
 pub const MAX_AUTOMATIC_BITRATE_BPS: u32 = 1_500_000_000;
+/// Safety ceiling for the number of quality-group slots exposed by the UI.
+/// The automatic value is supplied by the selected encoder device.
+pub const MAX_QUALITY_GROUPS: usize = 16;
 pub const DEFAULT_AUDIO_EXCLUSIONS: &[&str] = &[
     "Discord",
     "WhatsApp",
@@ -35,6 +41,10 @@ pub struct AppConfig {
     pub media_ports: PortRange,
     pub advertise_host: Option<String>,
     pub token: String,
+    pub token_mode: String,
+    pub token_locked: bool,
+    pub token_length: usize,
+    pub token_case_sensitive: bool,
     pub max_viewers: usize,
     pub source: SourceSpec,
     pub draw_mouse: bool,
@@ -50,9 +60,11 @@ pub struct AppConfig {
     pub adaptive_quality_ceiling: String,
     pub adaptive_fps_ceiling: String,
     pub max_quality_groups: String,
+    pub encoder_device: String,
     pub latency_preference: String,
     pub audio_mode: String,
     pub excluded_audio_processes: Vec<String>,
+    pub diagnostics_enabled: bool,
     pub json: bool,
 }
 
@@ -142,8 +154,15 @@ pub struct ConfigArgs {
     pub adaptive_quality_ceiling: String,
     #[arg(long, default_value = "source", env = "ILS_ADAPTIVE_FPS_CEILING")]
     pub adaptive_fps_ceiling: String,
-    #[arg(long, default_value = "2", env = "ILS_MAX_QUALITY_GROUPS")]
+    #[arg(long, default_value = "auto", env = "ILS_MAX_QUALITY_GROUPS")]
     pub max_quality_groups: String,
+    #[arg(
+        long,
+        default_value = "auto",
+        env = "ILS_ENCODER_DEVICE",
+        help = "Encoding device: auto, software, or a detected gpu:N"
+    )]
+    pub encoder_device: String,
     #[arg(long, default_value = "low", env = "ILS_LATENCY_PREFERENCE")]
     pub latency_preference: String,
     #[arg(
@@ -178,7 +197,11 @@ impl Default for AppConfig {
                 last: 8475,
             },
             advertise_host: None,
-            token: generate_token(),
+            token: generate_token_with_options(DEFAULT_TOKEN_LENGTH, true),
+            token_mode: "automatic".to_owned(),
+            token_locked: false,
+            token_length: DEFAULT_TOKEN_LENGTH,
+            token_case_sensitive: true,
             max_viewers: 8,
             source: SourceSpec {
                 kind: "monitor".to_owned(),
@@ -197,10 +220,12 @@ impl Default for AppConfig {
             bitrate_mode: "automatic".to_owned(),
             adaptive_quality_ceiling: "source".to_owned(),
             adaptive_fps_ceiling: "source".to_owned(),
-            max_quality_groups: "2".to_owned(),
+            max_quality_groups: "auto".to_owned(),
+            encoder_device: "auto".to_owned(),
             latency_preference: "low".to_owned(),
             audio_mode: "system".to_owned(),
             excluded_audio_processes: Vec::new(),
+            diagnostics_enabled: true,
             json: false,
         }
     }
@@ -224,7 +249,11 @@ impl AppConfig {
         self.advertise_host = args.advertise_host;
         if let Some(token) = args.token {
             validate_token(&token)?;
+            self.token_length = token.len();
             self.token = token;
+            self.token_mode = "custom".to_owned();
+            self.token_locked = false;
+            self.token_case_sensitive = true;
         }
         self.max_viewers = args.max_viewers;
         self.source = parse_source(&args.source)?;
@@ -265,6 +294,7 @@ impl AppConfig {
         self.adaptive_quality_ceiling = args.adaptive_quality_ceiling;
         self.adaptive_fps_ceiling = args.adaptive_fps_ceiling;
         self.max_quality_groups = args.max_quality_groups;
+        self.encoder_device = args.encoder_device;
         self.latency_preference = args.latency_preference;
         if args.test_tone && self.source.kind != "test" {
             bail!("--test-tone requires --source test:0");
@@ -314,6 +344,18 @@ impl AppConfig {
         if self.max_viewers == 0 {
             bail!("max viewers must be greater than zero");
         }
+        if !TOKEN_MODES.contains(&self.token_mode.as_str()) {
+            bail!(
+                "unsupported token mode '{}', choose automatic or custom",
+                self.token_mode
+            );
+        }
+        if !(MIN_TOKEN_LENGTH..=MAX_TOKEN_LENGTH).contains(&self.token_length) {
+            bail!(
+                "token length must be between {MIN_TOKEN_LENGTH} and {MAX_TOKEN_LENGTH} characters"
+            );
+        }
+        validate_token_with_length(&self.token, self.token_length)?;
         if self.width == 0 || self.height == 0 || self.fps == 0 || self.bitrate == 0 {
             bail!("width, height, fps, and bitrate must be greater than zero");
         }
@@ -367,9 +409,24 @@ impl AppConfig {
                 .max_quality_groups
                 .parse::<usize>()
                 .ok()
-                .is_none_or(|groups| !(1..=4).contains(&groups))
+                .is_none_or(|groups| !(1..=MAX_QUALITY_GROUPS).contains(&groups))
         {
-            bail!("the current adaptive implementation supports one to four quality groups");
+            bail!(
+                "the current adaptive implementation supports one to {MAX_QUALITY_GROUPS} quality groups"
+            );
+        }
+        if self.encoder_device != "auto"
+            && self.encoder_device != "software"
+            && self
+                .encoder_device
+                .strip_prefix("gpu:")
+                .and_then(|index| index.parse::<usize>().ok())
+                .is_none()
+        {
+            bail!(
+                "unsupported encoder device '{}', choose auto, software, or a detected gpu:N",
+                self.encoder_device
+            );
         }
         if !LATENCY_PREFERENCES.contains(&self.latency_preference.as_str()) {
             bail!(
@@ -517,7 +574,7 @@ impl AppConfig {
             "http://{}:{}/{}",
             viewer_url_host(host),
             self.http_port,
-            self.token
+            token_for_display(&self.token, self.token_case_sensitive)
         )
     }
 }
@@ -594,19 +651,46 @@ pub fn local_ipv4() -> Option<std::net::Ipv4Addr> {
     })
 }
 
-pub fn generate_token() -> String {
+pub fn generate_token_with_options(length: usize, case_sensitive: bool) -> String {
     rand::rng()
         .sample_iter(Alphanumeric)
-        .take(TOKEN_LENGTH)
+        .take(length.clamp(MIN_TOKEN_LENGTH, MAX_TOKEN_LENGTH))
         .map(char::from)
+        .map(|character| {
+            if case_sensitive {
+                character
+            } else {
+                character.to_ascii_uppercase()
+            }
+        })
         .collect()
 }
 
 pub fn validate_token(token: &str) -> Result<()> {
-    if token.len() != TOKEN_LENGTH || !token.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        bail!("token must contain exactly {TOKEN_LENGTH} ASCII letters or digits");
+    if !(MIN_TOKEN_LENGTH..=MAX_TOKEN_LENGTH).contains(&token.len())
+        || !token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        bail!(
+            "token must contain between {MIN_TOKEN_LENGTH} and {MAX_TOKEN_LENGTH} ASCII letters or digits"
+        );
     }
     Ok(())
+}
+
+pub fn validate_token_with_length(token: &str, length: usize) -> Result<()> {
+    validate_token(token)?;
+    if token.len() != length {
+        bail!("token must contain exactly {length} ASCII letters or digits");
+    }
+    Ok(())
+}
+
+pub fn token_for_display(token: &str, case_sensitive: bool) -> String {
+    if case_sensitive {
+        token.to_owned()
+    } else {
+        token.to_ascii_uppercase()
+    }
 }
 
 pub fn parse_port_range(value: &str) -> Result<PortRange> {
@@ -649,10 +733,30 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn generated_tokens_are_twelve_ascii_alphanumeric_characters() {
-        let token = generate_token();
-        assert_eq!(token.len(), TOKEN_LENGTH);
+    fn generated_tokens_use_the_default_length() {
+        let token = generate_token_with_options(DEFAULT_TOKEN_LENGTH, true);
+        assert_eq!(token.len(), DEFAULT_TOKEN_LENGTH);
         assert!(token.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn token_generation_honors_length_and_case_mode() {
+        let token = generate_token_with_options(23, false);
+
+        assert_eq!(token.len(), 23);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        );
+    }
+
+    #[test]
+    fn token_validation_accepts_configured_length_range_only() {
+        assert!(validate_token(&"A".repeat(MIN_TOKEN_LENGTH)).is_ok());
+        assert!(validate_token(&"A".repeat(MAX_TOKEN_LENGTH)).is_ok());
+        assert!(validate_token(&"A".repeat(MIN_TOKEN_LENGTH - 1)).is_err());
+        assert!(validate_token(&"A".repeat(MAX_TOKEN_LENGTH + 1)).is_err());
     }
 
     #[test]
@@ -672,12 +776,13 @@ mod tests {
         let config = AppConfig {
             http_port: 9000,
             token: "Ab12Cd34Ef56".to_owned(),
+            token_case_sensitive: false,
             ..Default::default()
         };
 
         assert_eq!(
             config.viewer_url_for_host("stream.example.com"),
-            "http://stream.example.com:9000/Ab12Cd34Ef56"
+            "http://stream.example.com:9000/AB12CD34EF56"
         );
     }
 
@@ -903,6 +1008,7 @@ mod tests {
                 adaptive_quality_ceiling: "source".to_owned(),
                 adaptive_fps_ceiling: "source".to_owned(),
                 max_quality_groups: "1".to_owned(),
+                encoder_device: "auto".to_owned(),
                 latency_preference: "balanced".to_owned(),
                 audio: Some("off".to_owned()),
                 test_tone: false,

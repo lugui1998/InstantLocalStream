@@ -275,6 +275,7 @@ pub struct CaptureSettings {
     pub adaptive_quality_ceiling: String,
     pub adaptive_fps_ceiling: String,
     pub max_quality_groups: String,
+    pub encoder_device: String,
     pub latency_preference: String,
     pub audio_mode: String,
     pub excluded_audio_processes: Vec<String>,
@@ -298,6 +299,7 @@ impl CaptureSettings {
             adaptive_quality_ceiling: config.adaptive_quality_ceiling.clone(),
             adaptive_fps_ceiling: config.adaptive_fps_ceiling.clone(),
             max_quality_groups: config.max_quality_groups.clone(),
+            encoder_device: config.encoder_device.clone(),
             latency_preference: config.latency_preference.clone(),
             audio_mode: config.audio_mode.clone(),
             excluded_audio_processes: config.excluded_audio_processes.clone(),
@@ -668,6 +670,25 @@ mod tests {
     }
 
     #[test]
+    fn selected_nvenc_device_is_reflected_in_ffmpeg_arguments() {
+        let pipeline = MediaPipeline::with_codec_profile_and_encoder(
+            "h264",
+            None,
+            None,
+            Some(crate::encoder::SelectedEncoder {
+                name: "h264_nvenc".to_owned(),
+                gpu_index: Some(2),
+                qsv_device: None,
+            }),
+        )
+        .unwrap();
+        let args = pipeline.video_encode_args(None, None, "1_000_000".to_owned());
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "h264_nvenc"]));
+        assert!(args.windows(2).any(|pair| pair == ["-gpu", "2"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+    }
+
+    #[test]
     fn h264_level_selection_covers_common_realtime_profiles() {
         let level_for = |height, fps, bitrate| {
             let mut settings = CaptureSettings::from_config(&AppConfig::default());
@@ -760,6 +781,9 @@ pub struct MediaPipeline {
     readiness: Arc<(Mutex<EncoderReadiness>, Condvar)>,
     encoder_children: Arc<Mutex<Vec<Weak<Mutex<Child>>>>>,
     codec: VideoCodec,
+    encoder_name: Option<String>,
+    encoder_gpu_index: Option<usize>,
+    encoder_qsv_device: Option<usize>,
     h264_level: Option<H264Level>,
     h265_level: Option<H265Level>,
     sdp_fmtp_line: String,
@@ -778,10 +802,20 @@ impl MediaPipeline {
         Self::with_codec_profile(codec, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_codec_profile(
         codec: &str,
         h264_level: Option<H264Level>,
         h265_level: Option<H265Level>,
+    ) -> Result<Self> {
+        Self::with_codec_profile_and_encoder(codec, h264_level, h265_level, None)
+    }
+
+    pub(crate) fn with_codec_profile_and_encoder(
+        codec: &str,
+        h264_level: Option<H264Level>,
+        h265_level: Option<H265Level>,
+        encoder: Option<crate::encoder::SelectedEncoder>,
     ) -> Result<Self> {
         let codec = VideoCodec::parse(codec)?;
         let h264_level =
@@ -807,6 +841,9 @@ impl MediaPipeline {
             readiness: Arc::new((Mutex::new(EncoderReadiness::Pending), Condvar::new())),
             encoder_children: Arc::new(Mutex::new(Vec::new())),
             codec,
+            encoder_name: encoder.as_ref().map(|encoder| encoder.name.clone()),
+            encoder_gpu_index: encoder.as_ref().and_then(|encoder| encoder.gpu_index),
+            encoder_qsv_device: encoder.as_ref().and_then(|encoder| encoder.qsv_device),
             h264_level,
             h265_level,
             sdp_fmtp_line,
@@ -1141,7 +1178,16 @@ impl MediaPipeline {
                 );
             }
         }
-        let mut args = vec![
+        let mut args = Vec::new();
+        if let Some(device) = self.encoder_qsv_device {
+            // QSV selects a DirectX adapter through its child device. This is
+            // a global FFmpeg option and therefore must precede the input.
+            args.extend([
+                "-init_hw_device".to_owned(),
+                format!("qsv=qsv:hw,child_device={device},child_device_type=d3d11va"),
+            ]);
+        }
+        args.extend([
             "-hide_banner".to_owned(),
             "-loglevel".to_owned(),
             "error".to_owned(),
@@ -1161,7 +1207,7 @@ impl MediaPipeline {
             "-i".to_owned(),
             "pipe:0".to_owned(),
             "-an".to_owned(),
-        ];
+        ]);
         args.extend(self.video_encode_args(
             settings.output_height,
             Some(output_fps.to_string()),
@@ -1294,6 +1340,56 @@ impl MediaPipeline {
         let mut keyframe_args = Vec::new();
         if let Some(group) = group {
             keyframe_args.extend(["-g".to_owned(), group]);
+        }
+        if let Some(encoder) = self.encoder_name.as_deref()
+            && !matches!(encoder, "libx264" | "libx265")
+        {
+            args.extend(["-c:v".to_owned(), encoder.to_owned()]);
+            if matches!(
+                encoder,
+                "h264_nvenc" | "hevc_nvenc" | "h264_amf" | "hevc_amf"
+            ) && let Some(gpu_index) = self.encoder_gpu_index
+            {
+                args.extend(["-gpu".to_owned(), gpu_index.to_string()]);
+            }
+            match self.codec {
+                VideoCodec::H264 => args.extend([
+                    "-profile:v".to_owned(),
+                    "baseline".to_owned(),
+                    "-level:v".to_owned(),
+                    self.h264_level.unwrap_or(H264_LEVEL_31).name().to_owned(),
+                    "-pix_fmt".to_owned(),
+                    "yuv420p".to_owned(),
+                    "-bf".to_owned(),
+                    "0".to_owned(),
+                ]),
+                VideoCodec::H265 => args.extend([
+                    "-profile:v".to_owned(),
+                    "main".to_owned(),
+                    "-level:v".to_owned(),
+                    self.h265_level.unwrap_or(H265_LEVEL_31).name().to_owned(),
+                    "-pix_fmt".to_owned(),
+                    "yuv420p".to_owned(),
+                    "-bf".to_owned(),
+                    "0".to_owned(),
+                ]),
+                _ => unreachable!("hardware encoder selection only supports H.264/HEVC"),
+            }
+            args.extend([
+                "-b:v".to_owned(),
+                bitrate,
+                "-f".to_owned(),
+                if matches!(self.codec, VideoCodec::H264) {
+                    "h264".to_owned()
+                } else {
+                    "hevc".to_owned()
+                },
+                "-flush_packets".to_owned(),
+                "1".to_owned(),
+                "pipe:1".to_owned(),
+            ]);
+            args.splice(0..0, keyframe_args);
+            return args;
         }
         match self.codec {
             VideoCodec::Vp8 => args.extend([

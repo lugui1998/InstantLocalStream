@@ -16,13 +16,15 @@ use eframe::egui;
 
 use crate::capture::{self, CapturePreview, CaptureSourceInfo};
 use crate::config::{
-    AppConfig, DEFAULT_AUDIO_EXCLUSIONS, FPS_PRESETS, QUALITY_PRESETS, fps_value, generate_token,
-    local_ipv4, quality_height,
+    AppConfig, DEFAULT_AUDIO_EXCLUSIONS, FPS_PRESETS, MAX_TOKEN_LENGTH, MIN_TOKEN_LENGTH,
+    QUALITY_PRESETS, fps_value, generate_token_with_options, local_ipv4, quality_height,
+    token_for_display, validate_token,
 };
 use crate::media::CaptureSettings;
 use crate::network::UploadSpeedTestProgress;
 use crate::preferences::{self, HostNetworkTestResult, UserPreferences};
 use crate::server;
+use crate::{encoder, encoder::EncodingDevice};
 
 const PREVIEW_QUEUE_CAPACITY: usize = 4;
 const PREVIEW_EVENT_CAPACITY: usize = 12;
@@ -62,6 +64,7 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
     // need one router rule with both protocols instead of a hidden second port.
     let viewer_port = config.http_port;
     configure_shared_port(&mut config, viewer_port);
+    let encoding_devices = encoder::discover_local_encoding_devices();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([DEFAULT_WINDOW_WIDTH, 650.0])
@@ -75,6 +78,7 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
             creation_context.egui_ctx.set_visuals(viewer_visuals());
             Ok(Box::new(HostUi::new(
                 config.clone(),
+                encoding_devices.clone(),
                 creation_context.egui_ctx.clone(),
                 saved_preferences
                     .as_ref()
@@ -101,6 +105,7 @@ fn viewer_visuals() -> egui::Visuals {
 
 struct HostUi {
     config: AppConfig,
+    encoding_devices: Vec<EncodingDevice>,
     status: HostStatus,
     command_tx: mpsc::Sender<UiCommand>,
     event_rx: mpsc::Receiver<UiEvent>,
@@ -136,11 +141,16 @@ struct HostUi {
     public_ip_error: Option<String>,
     copied_until: Option<Instant>,
     port_input: String,
+    token_mode: TokenMode,
+    token_length_input: String,
+    custom_token_input: String,
+    token_update_pending: bool,
     host_network_test: Option<HostNetworkTestResult>,
     network_test_inflight: bool,
     network_test_error: Option<String>,
     network_test_progress: Option<UploadSpeedTestProgress>,
     last_sent_max_viewers: Option<usize>,
+    last_sent_diagnostics_enabled: Option<bool>,
     last_sent_media_candidate_host: Option<String>,
 }
 
@@ -149,6 +159,12 @@ enum SourceTab {
     Displays,
     Windows,
     TestPattern,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenMode {
+    Automatic,
+    Custom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,10 +362,17 @@ struct TestPreviewSignature {
 impl HostUi {
     fn new(
         config: AppConfig,
+        encoding_devices: Vec<EncodingDevice>,
         repaint_context: egui::Context,
         host_network_test: Option<HostNetworkTestResult>,
     ) -> Self {
         let mut config = config;
+        if !encoding_devices
+            .iter()
+            .any(|device| device.id == config.encoder_device)
+        {
+            config.encoder_device = "auto".to_owned();
+        }
         if config.source.kind == "test" {
             if config.quality == "source" {
                 config.quality = "1080p".to_owned();
@@ -370,6 +393,12 @@ impl HostUi {
             _ => SourceTab::Displays,
         };
         let source_selected = config.source.kind == "test";
+        let token_mode = if config.token_mode == "custom" {
+            TokenMode::Custom
+        } else {
+            TokenMode::Automatic
+        };
+        let custom_token_input = config.token.clone();
         let (viewer_url_mode, custom_viewer_host, public_ipv4) = initial_viewer_url_state(&config);
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -396,8 +425,10 @@ impl HostUi {
         thread::spawn(move || worker_loop(command_rx, event_tx, thread_shutdown, thread_control));
         let initial_preferences = UserPreferences::from_config(&config, host_network_test.clone());
         let port_input = config.http_port.to_string();
+        let token_length = config.token_length;
         let mut app = Self {
             config,
+            encoding_devices,
             status: HostStatus::StartingServer,
             command_tx,
             event_rx,
@@ -437,11 +468,16 @@ impl HostUi {
             public_ip_error: None,
             copied_until: None,
             port_input,
+            token_mode,
+            token_length_input: token_length.to_string(),
+            custom_token_input,
+            token_update_pending: false,
             network_test_inflight: host_network_test.is_none(),
             host_network_test,
             network_test_error: None,
             network_test_progress: None,
             last_sent_max_viewers: None,
+            last_sent_diagnostics_enabled: None,
             last_sent_media_candidate_host: None,
         };
         // Discover both classes cheaply in the background so tab switches can
@@ -1526,6 +1562,212 @@ impl HostUi {
         self.config.viewer_url_for_host(&host)
     }
 
+    fn sync_token_to_server(&mut self) {
+        if !self.token_update_pending {
+            return;
+        }
+        let sent = self
+            .control_slot
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref().map(|sender| {
+                    sender
+                        .send(server::ServerCommand::ResetToken {
+                            token: self.config.token.clone(),
+                            case_sensitive: self.config.token_case_sensitive,
+                        })
+                        .is_ok()
+                })
+            })
+            .unwrap_or(false);
+        if sent {
+            self.token_update_pending = false;
+        }
+    }
+
+    fn mark_token_update_pending(&mut self) {
+        self.config.token = token_for_display(&self.config.token, self.config.token_case_sensitive);
+        self.token_update_pending = true;
+        self.sync_token_to_server();
+    }
+
+    fn regenerate_token(&mut self) {
+        self.config.token =
+            generate_token_with_options(self.config.token_length, self.config.token_case_sensitive);
+        self.custom_token_input = self.config.token.clone();
+        self.mark_token_update_pending();
+    }
+
+    fn reset_token(&mut self) {
+        if self.token_mode == TokenMode::Custom {
+            self.token_mode = TokenMode::Automatic;
+            self.config.token_mode = "automatic".to_owned();
+            self.config.token_locked = false;
+        }
+        self.regenerate_token();
+    }
+
+    fn apply_token_length(&mut self) -> bool {
+        let Some(length) = self.token_length_input.parse::<usize>().ok() else {
+            return false;
+        };
+        if !(MIN_TOKEN_LENGTH..=MAX_TOKEN_LENGTH).contains(&length) {
+            return false;
+        }
+        self.token_length_input = length.to_string();
+        if self.config.token_length != length {
+            self.config.token_length = length;
+            self.regenerate_token();
+        }
+        true
+    }
+
+    fn apply_custom_token(&mut self) -> bool {
+        if validate_token(&self.custom_token_input).is_err() {
+            return false;
+        }
+        self.config.token_mode = "custom".to_owned();
+        self.config.token_locked = false;
+        self.config.token_case_sensitive = true;
+        self.config.token_length = self.custom_token_input.len();
+        self.config.token = self.custom_token_input.clone();
+        self.token_update_pending = true;
+        self.sync_token_to_server();
+        true
+    }
+
+    fn select_token_mode(&mut self, mode: TokenMode) {
+        if self.token_mode == mode {
+            return;
+        }
+        self.token_mode = mode;
+        match mode {
+            TokenMode::Automatic => {
+                self.config.token_mode = "automatic".to_owned();
+                self.config.token_locked = false;
+                self.regenerate_token();
+            }
+            TokenMode::Custom => {
+                self.config.token_mode = "custom".to_owned();
+                self.config.token_locked = false;
+                self.config.token_case_sensitive = true;
+                self.custom_token_input = self.config.token.clone();
+                self.mark_token_update_pending();
+            }
+        }
+    }
+
+    fn draw_token_settings(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Token");
+            let mut next_mode = None;
+            for (mode, label) in [
+                (TokenMode::Automatic, "Automatic"),
+                (TokenMode::Custom, "Custom"),
+            ] {
+                if ui
+                    .selectable_label(self.token_mode == mode, label)
+                    .clicked()
+                {
+                    next_mode = Some(mode);
+                }
+            }
+            if let Some(mode) = next_mode {
+                self.select_token_mode(mode);
+            }
+        });
+
+        match self.token_mode {
+            TokenMode::Automatic => {
+                ui.horizontal(|ui| {
+                    ui.label("Token length");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.token_length_input)
+                            .desired_width(55.0)
+                            .char_limit(3),
+                    );
+                    if response.changed() {
+                        self.token_length_input
+                            .retain(|character| character.is_ascii_digit());
+                    }
+                    if ui.button("Apply").clicked() {
+                        let _ = self.apply_token_length();
+                    }
+                    if self
+                        .token_length_input
+                        .parse::<usize>()
+                        .ok()
+                        .is_none_or(|length| {
+                            !(MIN_TOKEN_LENGTH..=MAX_TOKEN_LENGTH).contains(&length)
+                        })
+                    {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(210, 170, 80),
+                            format!("Use {MIN_TOKEN_LENGTH}-{MAX_TOKEN_LENGTH}"),
+                        );
+                    }
+                });
+                let case_response =
+                    ui.checkbox(&mut self.config.token_case_sensitive, "Case-sensitive");
+                if case_response.changed() {
+                    self.mark_token_update_pending();
+                }
+                ui.horizontal(|ui| {
+                    let label = if self.config.token_locked {
+                        "Unlock token"
+                    } else {
+                        "Lock token"
+                    };
+                    if ui.button(label).clicked() {
+                        self.config.token_locked = !self.config.token_locked;
+                    }
+                    if self.config.token_locked {
+                        ui.label(
+                            egui::RichText::new(
+                                "Less secure: the token is stored and remains valid across restarts.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_rgb(210, 170, 80)),
+                        );
+                    }
+                });
+            }
+            TokenMode::Custom => {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.custom_token_input)
+                            .desired_width(280.0)
+                            .char_limit(MAX_TOKEN_LENGTH),
+                    );
+                    if response.changed() {
+                        self.custom_token_input
+                            .retain(|character| character.is_ascii_alphanumeric());
+                    }
+                    if ui.button("Apply").clicked() {
+                        let _ = self.apply_custom_token();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Less secure: custom tokens are predictable. Use Automatic for a random token.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(210, 170, 80)),
+                );
+                if validate_token(&self.custom_token_input).is_err() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(210, 170, 80),
+                        format!(
+                            "Custom token must contain {MIN_TOKEN_LENGTH}-{MAX_TOKEN_LENGTH} ASCII letters or digits."
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     fn port_change_pending(&self) -> bool {
         self.port_input
             .parse::<u16>()
@@ -1649,13 +1891,7 @@ impl HostUi {
             .add_sized([92.0, 38.0], egui::Button::new("Reset Token"))
             .on_hover_text("Generate a new token and invalidate the previous viewer URL.");
         if reset_response.clicked() {
-            let token = generate_token();
-            self.config.token = token.clone();
-            if let Ok(slot) = self.control_slot.lock()
-                && let Some(sender) = slot.as_ref()
-            {
-                let _ = sender.send(server::ServerCommand::ResetToken(token));
-            }
+            self.reset_token();
         }
         if self
             .copied_until
@@ -2293,6 +2529,26 @@ fn codec_label(value: &str) -> &'static str {
     }
 }
 
+fn encoding_device_label(device: &EncodingDevice) -> String {
+    if !device.hardware {
+        return device.name.clone();
+    }
+    let adapter = device
+        .gpu_index
+        .map(|index| format!("adapter #{index}"))
+        .unwrap_or_else(|| "adapter unknown".to_owned());
+    let encoder = device
+        .h264_encoder
+        .as_deref()
+        .or(device.h265_encoder.as_deref())
+        .unwrap_or("no FFmpeg hardware encoder");
+    let sessions = device
+        .max_sessions
+        .map(|limit| format!("up to {limit} sessions"))
+        .unwrap_or_else(|| "driver-limited sessions".to_owned());
+    format!("{} · {adapter} [{encoder}; {sessions}]", device.name)
+}
+
 fn latency_preference_label(value: &str) -> &'static str {
     match value {
         "low" => "Low",
@@ -2407,11 +2663,37 @@ impl eframe::App for HostUi {
                 ui.end_row();
 
                 if self.config.quality_mode == "adaptive" {
+                    let group_limit = encoder::automatic_quality_group_budget_for_codec(
+                        &self.config.encoder_device,
+                        &self.config.codec,
+                        &self.encoding_devices,
+                    );
+                    if let Ok(groups) = self.config.max_quality_groups.parse::<usize>()
+                        && groups > group_limit
+                    {
+                        self.config.max_quality_groups = group_limit.to_string();
+                    }
                     ui.label("Viewer quality groups");
                     egui::ComboBox::from_id_salt("quality-groups")
-                        .selected_text(&self.config.max_quality_groups)
+                        .selected_text(if self.config.max_quality_groups == "auto" {
+                            format!(
+                                "Auto ({})",
+                                encoder::automatic_quality_group_budget_for_codec(
+                                    &self.config.encoder_device,
+                                    &self.config.codec,
+                                    &self.encoding_devices,
+                                )
+                            )
+                        } else {
+                            self.config.max_quality_groups.clone()
+                        })
                         .show_ui(ui, |ui| {
-                            for groups in 1..=4 {
+                            ui.selectable_value(
+                                &mut self.config.max_quality_groups,
+                                "auto".to_owned(),
+                                "Auto (hardware-aware budget)",
+                            );
+                            for groups in 1..=group_limit {
                                 let value = groups.to_string();
                                 ui.selectable_value(
                                     &mut self.config.max_quality_groups,
@@ -2423,6 +2705,41 @@ impl eframe::App for HostUi {
                     ui.end_row();
 
                 }
+
+                ui.label("Encoding device").on_hover_text(
+                    "Auto selects a compatible hardware encoder when FFmpeg exposes one. The driver still enforces its own concurrent-session limit.",
+                );
+                let selected_device = self
+                    .encoding_devices
+                    .iter()
+                    .find(|device| device.id == self.config.encoder_device)
+                    .map(encoding_device_label)
+                    .unwrap_or_else(|| "Unknown device".to_owned());
+                egui::ComboBox::from_id_salt("encoder-device")
+                    .selected_text(if self.config.encoder_device == "auto" {
+                        "Auto".to_owned()
+                    } else {
+                        selected_device
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.config.encoder_device,
+                            "auto".to_owned(),
+                            "Auto",
+                        );
+                        for device in &self.encoding_devices {
+                            if device.id == "auto" {
+                                continue;
+                            }
+                            let label = encoding_device_label(device);
+                            ui.selectable_value(
+                                &mut self.config.encoder_device,
+                                device.id.clone(),
+                                label,
+                            );
+                        }
+                    });
+                ui.end_row();
 
                 ui.label("Codec");
                 egui::ComboBox::from_id_salt("codec")
@@ -2649,6 +2966,15 @@ impl eframe::App for HostUi {
                         );
                         ui.end_row();
                     }
+                    ui.label("Diagnostics");
+                    ui.checkbox(
+                        &mut self.config.diagnostics_enabled,
+                        "Show diagnostics in viewer clients",
+                    )
+                    .on_hover_text(
+                        "Show or hide the diagnostics section, including received-stream recording, for all connected viewers.",
+                    );
+                    ui.end_row();
                 });
             ui.horizontal(|ui| {
                 ui.label("Share URL host");
@@ -2720,6 +3046,7 @@ impl eframe::App for HostUi {
                     .unwrap_or("Looking up public IPv4…");
                 ui.colored_label(egui::Color32::from_rgb(210, 170, 80), message);
             }
+            self.draw_token_settings(ui);
             egui::Grid::new("share-endpoint-settings")
                 .num_columns(2)
                 .spacing([8.0, 6.0])
@@ -2773,6 +3100,7 @@ impl eframe::App for HostUi {
                 });
         });
 
+        self.sync_token_to_server();
         let preferences_snapshot =
             UserPreferences::from_config(&self.config, self.host_network_test.clone());
         if self.last_saved_preferences.as_ref() != Some(&preferences_snapshot) {
@@ -2802,6 +3130,18 @@ impl eframe::App for HostUi {
                 .is_ok()
         {
             self.last_sent_max_viewers = Some(self.config.max_viewers);
+        }
+        if self.status.server_alive()
+            && self.last_sent_diagnostics_enabled != Some(self.config.diagnostics_enabled)
+            && let Ok(slot) = self.control_slot.lock()
+            && let Some(sender) = slot.as_ref()
+            && sender
+                .send(server::ServerCommand::UpdateDiagnosticsEnabled(
+                    self.config.diagnostics_enabled,
+                ))
+                .is_ok()
+        {
+            self.last_sent_diagnostics_enabled = Some(self.config.diagnostics_enabled);
         }
     }
 

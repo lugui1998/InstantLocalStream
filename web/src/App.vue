@@ -8,7 +8,6 @@ import { diagnosticRecordingLimitMs, preferredRecordingMimeType } from '@/viewer
 
 const {
   videoStream,
-  videoElement: viewerVideoElement,
   status,
   mediaStatus,
   rttMs,
@@ -51,25 +50,19 @@ const {
 } = useViewer()
 
 const recording = ref(false)
-const recordingPending = ref(false)
 const recordingSeconds = ref(0)
 const recordingError = ref<string | null>(null)
 const maxRecordingSeconds = diagnosticRecordingLimitMs / 1_000
-const recordingMode = ref<'received' | 'browser' | null>(null)
 let recorder: MediaRecorder | null = null
 let recordingChunks: Blob[] = []
 let recordingTimer: number | null = null
 let recordingStartedAt = 0
 let recordingTrackIds = ''
 let exportRecordingOnStop = true
-let ownedRecordingStream: MediaStream | null = null
-let recordingRequestId = 0
 let disposed = false
-let restoreViewerMute = false
 let recordingTrackEndListeners: Array<{ track: MediaStreamTrack, listener: () => void }> = []
 
 const mediaRecorderSupported = typeof MediaRecorder !== 'undefined'
-const browserCaptureSupported = typeof navigator.mediaDevices?.getDisplayMedia === 'function'
 
 function formatCodecProfile(profile: GroupAssignment) {
   const codec = profile.codec ?? '—'
@@ -85,15 +78,13 @@ const recordingReady = computed(() => {
 })
 
 const recordingStatus = computed(() => {
-  if (recordingPending.value) return 'Waiting for the browser sharing selection…'
   if (recording.value) {
-    const source = recordingMode.value === 'browser' ? 'browser tab/window' : 'received stream'
-    return `Recording ${source} · ${recordingSeconds.value}s / ${maxRecordingSeconds}s…`
+    return `Recording received stream · ${recordingSeconds.value}s / ${maxRecordingSeconds}s…`
   }
   if (recordingError.value) return recordingError.value
   if (!mediaRecorderSupported) return 'MediaRecorder is unavailable in this browser.'
   if (!recordingReady.value) return 'Waiting for live video and audio tracks'
-  return 'Ready · received-stream export or browser tab/window capture'
+  return 'Ready'
 })
 
 function clearRecordingTimer() {
@@ -101,13 +92,13 @@ function clearRecordingTimer() {
   recordingTimer = null
 }
 
-function downloadRecording(blob: Blob, mode: 'received' | 'browser') {
+function downloadRecording(blob: Blob) {
   const extension = blob.type.includes('mp4') ? 'mp4' : 'webm'
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `instant-local-stream-${mode}-test-${timestamp}.${extension}`
+  link.download = `instant-local-stream-received-test-${timestamp}.${extension}`
   link.hidden = true
   document.body.appendChild(link)
   link.click()
@@ -115,25 +106,14 @@ function downloadRecording(blob: Blob, mode: 'received' | 'browser') {
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
 }
 
-function stopOwnedRecordingTracks() {
-  ownedRecordingStream?.getTracks().forEach(track => track.stop())
-  ownedRecordingStream = null
-}
-
 function clearRecordingTrackEndListeners() {
   recordingTrackEndListeners.forEach(({ track, listener }) => track.removeEventListener('ended', listener))
   recordingTrackEndListeners = []
 }
 
-function restoreViewerMuteIfNeeded() {
-  if (restoreViewerMute && viewerVideoElement.value) viewerVideoElement.value.muted = true
-  restoreViewerMute = false
-}
-
-function beginRecording(recordingStream: MediaStream, mode: 'received' | 'browser', ownsTracks: boolean) {
+function beginRecording(recordingStream: MediaStream) {
   recordingError.value = null
   if (disposed || recording.value || recorder) {
-    if (ownsTracks) recordingStream.getTracks().forEach(track => track.stop())
     recordingError.value = 'Another diagnostic recording is already active.'
     return false
   }
@@ -141,7 +121,6 @@ function beginRecording(recordingStream: MediaStream, mode: 'received' | 'browse
   const hasVideo = tracks.some(track => track.kind === 'video')
   const hasAudio = tracks.some(track => track.kind === 'audio')
   if (!hasVideo || !hasAudio) {
-    if (ownsTracks) tracks.forEach(track => track.stop())
     recordingError.value = 'A live video track and test-tone audio track are required.'
     return false
   }
@@ -159,17 +138,14 @@ function beginRecording(recordingStream: MediaStream, mode: 'received' | 'browse
       recorder = new MediaRecorder(recordingStream)
     } catch (error) {
       recorder = null
-      if (ownsTracks) tracks.forEach(track => track.stop())
       recordingError.value = error instanceof Error ? error.message : 'This browser cannot record the stream.'
       return false
     }
   }
 
-  ownedRecordingStream = ownsTracks ? recordingStream : null
   recordingChunks = []
   recordingStartedAt = Date.now()
-  recordingTrackIds = mode === 'received' ? tracks.map(track => track.id).sort().join(':') : ''
-  recordingMode.value = mode
+  recordingTrackIds = tracks.map(track => track.id).sort().join(':')
   exportRecordingOnStop = true
   const activeRecorder = recorder
   activeRecorder.addEventListener('dataavailable', (event) => {
@@ -187,25 +163,20 @@ function beginRecording(recordingStream: MediaStream, mode: 'received' | 'browse
     if (exportRecordingOnStop && recordingChunks.length > 0) {
       downloadRecording(new Blob(recordingChunks, {
         type: activeRecorder.mimeType || mimeType || 'video/webm',
-      }), mode)
+      }))
     } else if (exportRecordingOnStop) {
       recordingError.value = 'The browser did not produce recording data.'
     }
-    stopOwnedRecordingTracks()
-    if (mode === 'browser') restoreViewerMuteIfNeeded()
     recorder = null
     recordingChunks = []
     recordingTrackIds = ''
-    recordingMode.value = null
   }, { once: true })
   try {
     activeRecorder.start(1_000)
   } catch (error) {
-    stopOwnedRecordingTracks()
     recorder = null
     recordingChunks = []
     recordingTrackIds = ''
-    recordingMode.value = null
     recordingError.value = error instanceof Error ? error.message : 'The browser could not start recording.'
     return false
   }
@@ -226,92 +197,13 @@ function beginRecording(recordingStream: MediaStream, mode: 'received' | 'browse
 }
 
 function startReceivedStreamRecording() {
-  if (recordingPending.value || recording.value) return
+  if (recording.value) return
   const source = videoStream.value
   if (!recordingReady.value || !source) {
     recordingError.value = 'A live video track and test-tone audio track are required.'
     return
   }
-  beginRecording(new MediaStream(source.getTracks()), 'received', false)
-}
-
-async function startBrowserRecording() {
-  if (recordingPending.value || recording.value) return
-  recordingError.value = null
-  if (!browserCaptureSupported) {
-    recordingError.value = 'Browser tab/window capture is unavailable in this browser.'
-    return
-  }
-  const requestId = ++recordingRequestId
-  recordingPending.value = true
-  const element = viewerVideoElement.value
-  restoreViewerMute = element?.muted === true
-  if (element) element.muted = false
-
-  // Start both permission-sensitive operations from the button's user gesture.
-  const playbackPromise = element?.play() ?? Promise.resolve()
-  let displayPromise: Promise<MediaStream>
-  try {
-    displayPromise = navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: true,
-      preferCurrentTab: true,
-      selfBrowserSurface: 'include',
-      systemAudio: 'include',
-    } as DisplayMediaStreamOptions)
-  } catch (error) {
-    void playbackPromise.catch(() => undefined)
-    restoreViewerMuteIfNeeded()
-    recordingPending.value = false
-    recordingError.value = error instanceof Error ? error.message : 'Browser capture was cancelled.'
-    return
-  }
-
-  try {
-    const [playbackResult, displayResult] = await Promise.allSettled([
-      playbackPromise,
-      displayPromise,
-    ])
-    if (displayResult.status === 'rejected') {
-      restoreViewerMuteIfNeeded()
-      recordingError.value = displayResult.reason instanceof Error
-        ? displayResult.reason.message
-        : 'Browser capture was cancelled.'
-      return
-    }
-    const displayStream = displayResult.value
-    if (playbackResult.status === 'rejected') {
-      displayStream.getTracks().forEach(track => track.stop())
-      restoreViewerMuteIfNeeded()
-      recordingError.value = playbackResult.reason instanceof Error
-        ? playbackResult.reason.message
-        : 'The viewer audio could not be started.'
-      return
-    }
-    if (disposed || requestId !== recordingRequestId || recording.value || recorder) {
-      displayStream.getTracks().forEach(track => track.stop())
-      restoreViewerMuteIfNeeded()
-      return
-    }
-    if (!recordingReady.value) {
-      displayStream.getTracks().forEach(track => track.stop())
-      recordingError.value = 'The WebRTC stream changed while browser capture was being selected.'
-      restoreViewerMuteIfNeeded()
-      return
-    }
-    if (!displayStream.getAudioTracks().some(track => track.readyState === 'live')) {
-      displayStream.getTracks().forEach(track => track.stop())
-      recordingError.value = 'No audio was shared. Select this browser tab/window and enable “Share audio”.'
-      restoreViewerMuteIfNeeded()
-      return
-    }
-    if (!beginRecording(displayStream, 'browser', true)) restoreViewerMuteIfNeeded()
-  } catch (error) {
-    restoreViewerMuteIfNeeded()
-    recordingError.value = error instanceof Error ? error.message : 'Browser capture was cancelled.'
-  } finally {
-    if (requestId === recordingRequestId) recordingPending.value = false
-  }
+  beginRecording(new MediaStream(source.getTracks()))
 }
 
 function stopDiagnosticRecording() {
@@ -319,13 +211,7 @@ function stopDiagnosticRecording() {
 }
 
 watch(videoStream, (stream) => {
-  if (recordingPending.value) {
-    recordingRequestId += 1
-    recordingPending.value = false
-    restoreViewerMuteIfNeeded()
-    recordingError.value = 'The WebRTC stream changed; browser capture was cancelled.'
-  }
-  if (!recording.value || recordingMode.value !== 'received') return
+  if (!recording.value) return
   const currentTrackIds = stream?.getTracks().map(track => track.id).sort().join(':') ?? ''
   if (currentTrackIds !== recordingTrackIds) {
     recordingError.value = 'The WebRTC stream changed; the partial recording was exported.'
@@ -333,16 +219,16 @@ watch(videoStream, (stream) => {
   }
 })
 
+watch(() => status.value.diagnostics_enabled, (enabled) => {
+  if (enabled === false && recording.value) stopDiagnosticRecording()
+})
+
 onBeforeUnmount(() => {
   disposed = true
-  recordingRequestId += 1
-  recordingPending.value = false
   exportRecordingOnStop = false
   clearRecordingTimer()
   clearRecordingTrackEndListeners()
   if (recorder && recorder.state !== 'inactive') recorder.stop()
-  stopOwnedRecordingTracks()
-  restoreViewerMuteIfNeeded()
 })
 
 function formatDelay() {
@@ -444,51 +330,6 @@ onMounted(start)
 
     <p v-if="mediaStatus" class="media-status" role="status" aria-live="polite">{{ mediaStatus }}</p>
 
-    <section class="recording-panel" aria-label="Diagnostic stream recording">
-      <div class="recording-copy">
-        <div class="meta-label">Diagnostic recording</div>
-        <div v-if="status.test_tone" class="recording-description">
-          Test tone active · {{ status.test_tone.frequency_hz }} Hz at {{ status.test_tone.level_dbfs }} dBFS ·
-          {{ status.test_tone.on_ms / 1_000 }}s on with green marker / {{ (status.test_tone.cycle_ms - status.test_tone.on_ms) / 1_000 }}s silent · 30s maximum
-        </div>
-        <div v-else class="recording-description">
-          Enable the host test pattern and diagnostic tone for a controlled audio/video sample.
-        </div>
-        <div class="recording-hint">
-          “Received stream” isolates WebRTC/decoder output. “Browser tab/window” records the rendered page; the viewer is unmuted automatically, then select this tab/window and enable Share audio.
-        </div>
-        <div class="recording-status" :class="{ error: recordingError }" aria-live="polite">{{ recordingStatus }}</div>
-      </div>
-      <div class="recording-actions">
-        <button
-          v-if="recording"
-          class="recording-button"
-          type="button"
-          @click="stopDiagnosticRecording"
-        >
-          Stop & export
-        </button>
-        <template v-else>
-          <button
-            class="recording-button"
-            type="button"
-            :disabled="recordingPending || !recordingReady"
-            @click="startReceivedStreamRecording"
-          >
-            Record received stream
-          </button>
-          <button
-            class="recording-button"
-            type="button"
-            :disabled="recordingPending || !recordingReady || !browserCaptureSupported"
-            @click="startBrowserRecording"
-          >
-            Record browser tab/window
-          </button>
-        </template>
-      </div>
-    </section>
-
     <section class="data-grid" aria-label="Live stream metrics">
       <div class="data-cell">
         <div class="meta-label" title="Quality selected by the host for this viewer">Assigned target</div>
@@ -509,12 +350,35 @@ onMounted(start)
       </div>
     </section>
 
-    <details class="diagnostics">
+    <details v-if="status.diagnostics_enabled !== false" class="diagnostics">
       <summary>
         <span>Diagnostics</span>
         <span class="diagnostics-summary">Playback, decoder, group, and synchronization details</span>
       </summary>
       <div class="diagnostics-content">
+        <section class="recording-panel" aria-label="Diagnostic stream recording">
+          <div class="recording-actions">
+            <button
+              v-if="recording"
+              class="recording-button"
+              type="button"
+              @click="stopDiagnosticRecording"
+            >
+              Stop & export
+            </button>
+            <button
+              v-else
+              class="recording-button"
+              type="button"
+              :disabled="!recordingReady"
+              @click="startReceivedStreamRecording"
+            >
+              Record received stream
+            </button>
+          </div>
+          <div v-if="recording || recordingError" class="recording-status" :class="{ error: recordingError }" aria-live="polite">{{ recordingStatus }}</div>
+        </section>
+
         <section class="data-grid diagnostics-grid" aria-label="Detailed stream diagnostics">
           <div class="data-cell">
             <div class="meta-label">Group</div>

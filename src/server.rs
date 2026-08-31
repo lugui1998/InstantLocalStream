@@ -71,11 +71,15 @@ pub enum ServerCommand {
     FinalizeStop,
     Update(CaptureSettings),
     UpdateMaxViewers(usize),
+    UpdateDiagnosticsEnabled(bool),
     UpdateMediaCandidateHost(String),
     PreviewSnapshot {
         result: std::sync::mpsc::SyncSender<Option<CapturePreviewSnapshot>>,
     },
-    ResetToken(String),
+    ResetToken {
+        token: String,
+        case_sensitive: bool,
+    },
     RecoverStream {
         pending: Arc<AtomicBool>,
     },
@@ -239,7 +243,9 @@ struct WebAssets;
 #[derive(Clone)]
 pub struct ServerState {
     pub config: Arc<AppConfig>,
-    active_token: Arc<StdMutex<String>>,
+    pub encoding_devices: Arc<Vec<crate::encoder::EncodingDevice>>,
+    pub automatic_group_budget: usize,
+    active_token: Arc<StdMutex<ActiveToken>>,
     settings_revision: Arc<AtomicU64>,
     media_session_revision: Arc<AtomicU64>,
     stop_request_revision: Arc<AtomicU64>,
@@ -247,6 +253,7 @@ pub struct ServerState {
     stream_enabled: Arc<AtomicBool>,
     stream_resetting: Arc<AtomicBool>,
     max_viewers: Arc<AtomicUsize>,
+    diagnostics_enabled: Arc<AtomicBool>,
     settings: Arc<StdMutex<CaptureSettings>>,
     viewer_metrics: Arc<StdMutex<HashMap<String, ViewerMetrics>>>,
     groups: Arc<TranscodeGroups>,
@@ -271,17 +278,29 @@ pub struct ServerState {
     stream_failure_callback: Option<StreamFailureCallback>,
 }
 
+struct ActiveToken {
+    value: String,
+    case_sensitive: bool,
+}
+
 impl ServerState {
     fn token_matches(&self, token: &str) -> bool {
         self.active_token
             .lock()
-            .map(|active_token| active_token.as_str() == token)
+            .map(|active_token| {
+                if active_token.case_sensitive {
+                    active_token.value == token
+                } else {
+                    active_token.value.eq_ignore_ascii_case(token)
+                }
+            })
             .unwrap_or(false)
     }
 
-    fn reset_token(&self, token: String) {
+    fn reset_token_with_policy(&self, token: String, case_sensitive: bool) {
         if let Ok(mut active_token) = self.active_token.lock() {
-            *active_token = token;
+            active_token.value = token;
+            active_token.case_sensitive = case_sensitive;
         }
         self.session_generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -468,6 +487,7 @@ struct GroupFactory {
     capture_slot: Arc<CaptureSlot>,
     codec_policy: String,
     host_codecs: Arc<HashSet<String>>,
+    encoding_devices: Arc<Vec<crate::encoder::EncodingDevice>>,
     stream_enabled: Arc<AtomicBool>,
     tasks: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
     pipelines: Arc<StdMutex<Vec<Weak<MediaPipeline>>>>,
@@ -502,8 +522,20 @@ impl GroupFactory {
         let source_fps = shared_capture.source_fps();
         let (codec, h264_level, h265_level) =
             codec_for_capture_profile(codec, source_dimensions, source_fps, &settings)?;
-        let media = Arc::new(MediaPipeline::with_codec_profile(
-            codec, h264_level, h265_level,
+        let encoder = crate::encoder::resolve_video_encoder(
+            &settings.encoder_device,
+            codec,
+            &self.encoding_devices,
+        );
+        if settings.encoder_device.starts_with("gpu:") && encoder.is_none() {
+            anyhow::bail!(
+                "selected encoding device '{}' does not provide a compatible {} encoder in this FFmpeg build",
+                settings.encoder_device,
+                codec
+            );
+        }
+        let media = Arc::new(MediaPipeline::with_codec_profile_and_encoder(
+            codec, h264_level, h265_level, encoder,
         )?);
         if let Ok(mut pipelines) = self.pipelines.lock() {
             pipelines.retain(|pipeline| pipeline.strong_count() > 0);
@@ -816,6 +848,7 @@ impl TranscodeGroups {
                 adaptive_quality_ceiling: "720p".to_owned(),
                 adaptive_fps_ceiling: "30".to_owned(),
                 max_quality_groups: "1".to_owned(),
+                encoder_device: "software".to_owned(),
                 latency_preference: "low".to_owned(),
                 audio_mode: "off".to_owned(),
                 excluded_audio_processes: Vec::new(),
@@ -861,16 +894,18 @@ impl TranscodeGroups {
             .as_ref()
             .map(|factory| factory.codec_policy.as_str())
             .unwrap_or_default();
-        let requested_budget = configured_transcode_group_count(
-            &settings.quality_mode,
-            &settings.max_quality_groups,
-            codec_policy,
-        )
-        .min(self.groups.len().max(1));
         let factory = self
             .factory
             .as_ref()
             .context("dynamic transcode group factory is unavailable")?;
+        let requested_budget = configured_transcode_group_count(
+            &settings.quality_mode,
+            &settings.max_quality_groups,
+            codec_policy,
+            &settings.encoder_device,
+            &factory.encoding_devices,
+        )
+        .min(self.groups.len().max(1));
         let mut replacements = Vec::new();
         for group in self.groups.iter().filter(|group| {
             group.id < requested_budget && group.lifecycle().is_visible() && group.media().is_some()
@@ -921,6 +956,11 @@ impl TranscodeGroups {
             &settings.quality_mode,
             &settings.max_quality_groups,
             codec_policy,
+            &settings.encoder_device,
+            self.factory
+                .as_ref()
+                .map(|factory| factory.encoding_devices.as_slice())
+                .unwrap_or_default(),
         )
         .min(self.groups.len().max(1));
         let previous_budget = self.capacity();
@@ -1730,23 +1770,41 @@ impl TranscodeGroups {
 }
 
 fn configured_group_count(value: &str) -> usize {
-    value.parse::<usize>().unwrap_or(2).clamp(1, 4)
+    value
+        .parse::<usize>()
+        .unwrap_or(2)
+        .clamp(1, crate::config::MAX_QUALITY_GROUPS)
 }
 
 fn configured_transcode_group_count(
     quality_mode: &str,
     max_quality_groups: &str,
     codec_policy: &str,
+    encoder_device: &str,
+    encoding_devices: &[crate::encoder::EncodingDevice],
 ) -> usize {
     let quality_groups = if quality_mode == "adaptive" {
-        configured_group_count(max_quality_groups)
+        if max_quality_groups.eq_ignore_ascii_case("auto") {
+            crate::encoder::automatic_quality_group_budget(encoder_device, encoding_devices)
+        } else {
+            configured_group_count(max_quality_groups)
+        }
     } else {
         1
     };
+    let detected_budget = crate::encoder::automatic_quality_group_budget_for_codec(
+        encoder_device,
+        codec_policy,
+        encoding_devices,
+    );
     if codec_policy.eq_ignore_ascii_case("auto") {
         // Keep lightweight slots available for HEVC, the warm H.264 baseline,
         // and a legacy fallback. Encoders are still started only on demand.
-        quality_groups.max(3)
+        if quality_mode == "adaptive" && max_quality_groups.eq_ignore_ascii_case("auto") {
+            quality_groups.min(detected_budget)
+        } else {
+            quality_groups.max(3)
+        }
     } else {
         quality_groups
     }
@@ -2246,6 +2304,12 @@ pub async fn run_with_control_readiness(
         );
     }
     let ffmpeg = crate::packaging::prepare_ffmpeg()?;
+    let encoding_devices = crate::encoder::discover_encoding_devices(&ffmpeg.command);
+    tracing::info!(
+        devices = ?encoding_devices.iter().map(|device| &device.name).collect::<Vec<_>>(),
+        selected = %config.encoder_device,
+        "detected encoding devices"
+    );
     let initial_settings = CaptureSettings::from_config(&config);
     let settings_slot = Arc::new(StdMutex::new(initial_settings.clone()));
     let capture_slot = Arc::new(CaptureSlot::default());
@@ -2253,20 +2317,30 @@ pub async fn run_with_control_readiness(
         &config.quality_mode,
         &config.max_quality_groups,
         &config.codec,
+        &config.encoder_device,
+        &encoding_devices,
     );
     let group_factory = Arc::new(GroupFactory {
         ffmpeg: ffmpeg.command.clone(),
         capture_slot: Arc::clone(&capture_slot),
         codec_policy: config.codec.clone(),
         host_codecs: Arc::new(discover_host_codecs(&ffmpeg.command, initial_codec)),
+        encoding_devices: Arc::new(encoding_devices),
         stream_enabled: Arc::clone(&stream_enabled),
         tasks: Arc::new(StdMutex::new(Vec::new())),
         pipelines: Arc::new(StdMutex::new(Vec::new())),
     });
-    // Always allocate the four lightweight group slots.  The configured group
-    // count is a live budget, not a startup-only topology decision.
-    let mut groups = Vec::with_capacity(4);
-    for group_id in 0..4 {
+    // Allocate enough lightweight group slots for the largest detected
+    // device. The configured group count is a live budget, not a startup-only
+    // topology decision.
+    let group_slots = crate::encoder::maximum_quality_group_budget_for_codec(
+        &config.codec,
+        &group_factory.encoding_devices,
+    )
+    .max(group_budget)
+    .max(4);
+    let mut groups = Vec::with_capacity(group_slots);
+    for group_id in 0..group_slots {
         let settings = group_settings(&initial_settings, group_id);
         groups.push(TranscodeGroup::stopped(group_id, settings, initial_codec));
     }
@@ -2278,7 +2352,16 @@ pub async fn run_with_control_readiness(
     let viewer_metrics = Arc::new(StdMutex::new(HashMap::new()));
     let state = ServerState {
         config: Arc::new(config.clone()),
-        active_token: Arc::new(StdMutex::new(config.token.clone())),
+        encoding_devices: Arc::clone(&group_factory.encoding_devices),
+        automatic_group_budget: crate::encoder::automatic_quality_group_budget_for_codec(
+            &config.encoder_device,
+            &config.codec,
+            &group_factory.encoding_devices,
+        ),
+        active_token: Arc::new(StdMutex::new(ActiveToken {
+            value: config.token.clone(),
+            case_sensitive: config.token_case_sensitive,
+        })),
         settings_revision: Arc::new(AtomicU64::new(0)),
         media_session_revision: Arc::new(AtomicU64::new(0)),
         stop_request_revision: Arc::new(AtomicU64::new(0)),
@@ -2286,6 +2369,7 @@ pub async fn run_with_control_readiness(
         stream_enabled: Arc::clone(&stream_enabled),
         stream_resetting: Arc::new(AtomicBool::new(false)),
         max_viewers: Arc::new(AtomicUsize::new(config.max_viewers.max(1))),
+        diagnostics_enabled: Arc::new(AtomicBool::new(config.diagnostics_enabled)),
         settings: Arc::clone(&settings_slot),
         viewer_metrics: Arc::clone(&viewer_metrics),
         groups: Arc::clone(&groups),
@@ -2457,6 +2541,12 @@ pub async fn run_with_control_readiness(
                         .store(max_viewers.max(1), Ordering::Release);
                     broadcast_status(&control_state);
                 }
+                ServerCommand::UpdateDiagnosticsEnabled(enabled) => {
+                    control_state
+                        .diagnostics_enabled
+                        .store(enabled, Ordering::Release);
+                    broadcast_status(&control_state);
+                }
                 ServerCommand::UpdateMediaCandidateHost(host) => {
                     match update_media_candidate(&control_state, &host).await {
                         Ok(candidate_addr) => {
@@ -2483,8 +2573,11 @@ pub async fn run_with_control_readiness(
                         .map(|(settings, frame)| CapturePreviewSnapshot { settings, frame });
                     let _ = result.try_send(snapshot);
                 }
-                ServerCommand::ResetToken(token) => {
-                    reset_token_and_revoke(&control_state, token).await;
+                ServerCommand::ResetToken {
+                    token,
+                    case_sensitive,
+                } => {
+                    reset_token_and_revoke(&control_state, token, case_sensitive).await;
                 }
                 ServerCommand::RecoverStream { pending } => {
                     let _pending_guard = RecoveryPendingGuard(pending);
@@ -3383,6 +3476,7 @@ fn encoder_profile_changed(previous: &CaptureSettings, next: &CaptureSettings) -
         || previous.adaptive_quality_ceiling != next.adaptive_quality_ceiling
         || previous.adaptive_fps_ceiling != next.adaptive_fps_ceiling
         || previous.max_quality_groups != next.max_quality_groups
+        || previous.encoder_device != next.encoder_device
 }
 
 fn uses_group_adaptation(settings: &CaptureSettings) -> bool {
@@ -3751,6 +3845,16 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         .map(|connected| connected.len())
         .unwrap_or_default();
     let settings = state.settings.lock().ok().map(|settings| settings.clone());
+    let automatic_group_budget = settings
+        .as_ref()
+        .map(|settings| {
+            crate::encoder::automatic_quality_group_budget_for_codec(
+                &settings.encoder_device,
+                &state.config.codec,
+                &state.encoding_devices,
+            )
+        })
+        .unwrap_or(state.automatic_group_budget);
     let audio_enabled = settings.as_ref().is_some_and(audio_enabled);
     let primary_media = state.groups.media_by_id(state.groups.primary_group_id());
     let capture = state.shared_capture.current();
@@ -3807,8 +3911,15 @@ fn status_snapshot(state: &ServerState) -> serde_json::Value {
         "fps": settings.as_ref().and_then(|settings| settings.output_fps).map(|fps| fps.to_string()).unwrap_or_else(|| "Source".to_owned()),
         "bitrate_bps": settings.as_ref().map(|settings| settings.bitrate),
         "max_viewers": state.max_viewers.load(Ordering::Acquire),
+        "diagnostics_enabled": state.diagnostics_enabled.load(Ordering::Acquire),
         "active_group_count": state.groups.count(),
         "max_group_count": state.groups.capacity(),
+        "encoder_device": settings
+            .as_ref()
+            .map(|settings| settings.encoder_device.as_str())
+            .unwrap_or("auto"),
+        "encoding_devices": state.encoding_devices.as_ref(),
+        "automatic_group_budget": automatic_group_budget,
         "groups": state.groups.groups_json(),
         "latency_mode": "latest-frame",
         "sync_mode": "latest-frame",
@@ -4373,10 +4484,10 @@ async fn close_client_connection(state: &ServerState, client_id: &str) {
 /// Revokes every stateful capability associated with the previous sharing
 /// token. In-flight offers observe `session_generation` and clean their own
 /// reservations before they can commit.
-async fn reset_token_and_revoke(state: &ServerState, token: String) {
+async fn reset_token_and_revoke(state: &ServerState, token: String, case_sensitive: bool) {
     let _session_guard = Arc::clone(&state.session_gate).write_owned().await;
     send_session_goodbye_locked(state, SessionGoodbyeReason::TokenChanged).await;
-    state.reset_token(token);
+    state.reset_token_with_policy(token, case_sensitive);
     revoke_all_sessions_locked(state).await;
 }
 
@@ -4917,7 +5028,11 @@ mod tests {
 
     fn test_state() -> ServerState {
         let config = AppConfig::default();
-        let active_token = Arc::new(StdMutex::new(config.token.clone()));
+        let diagnostics_enabled = config.diagnostics_enabled;
+        let active_token = Arc::new(StdMutex::new(ActiveToken {
+            value: config.token.clone(),
+            case_sensitive: config.token_case_sensitive,
+        }));
         let settings = CaptureSettings::from_config(&config);
         let groups = Arc::new(TranscodeGroups::new(vec![TranscodeGroup::stopped(
             0,
@@ -4931,6 +5046,8 @@ mod tests {
         .unwrap();
         ServerState {
             config: Arc::new(config),
+            encoding_devices: Arc::new(vec![crate::encoder::software_device()]),
+            automatic_group_budget: 2,
             active_token,
             settings_revision: Arc::new(AtomicU64::new(0)),
             media_session_revision: Arc::new(AtomicU64::new(0)),
@@ -4939,6 +5056,7 @@ mod tests {
             stream_enabled: Arc::new(AtomicBool::new(false)),
             stream_resetting: Arc::new(AtomicBool::new(false)),
             max_viewers: Arc::new(AtomicUsize::new(8)),
+            diagnostics_enabled: Arc::new(AtomicBool::new(diagnostics_enabled)),
             settings: Arc::new(StdMutex::new(settings)),
             viewer_metrics: Arc::new(StdMutex::new(HashMap::new())),
             groups,
@@ -4987,6 +5105,10 @@ mod tests {
         assert_eq!(status["settings_revision"], 7);
         assert_eq!(status["media_session_revision"], 3);
         assert_eq!(status["group"]["bitrate_bps"], status["bitrate_bps"]);
+        assert_eq!(status["diagnostics_enabled"], true);
+
+        state.diagnostics_enabled.store(false, Ordering::Release);
+        assert_eq!(status_snapshot(&state)["diagnostics_enabled"], false);
     }
 
     #[tokio::test]
@@ -5024,7 +5146,7 @@ mod tests {
             .insert(connection_id);
         state.pending_connections.lock().unwrap().insert(pending_id);
 
-        reset_token_and_revoke(&state, "replacement-token".to_owned()).await;
+        reset_token_and_revoke(&state, "replacement-token".to_owned(), true).await;
 
         assert!(state.token_matches("replacement-token"));
         assert!(!state.token_matches("test-token"));
@@ -5032,6 +5154,20 @@ mod tests {
         assert!(state.connected_connections.lock().unwrap().is_empty());
         assert!(state.pending_connections.lock().unwrap().is_empty());
         assert_eq!(state.session_generation.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn case_insensitive_tokens_accept_any_casing() {
+        let state = test_state();
+
+        reset_token_and_revoke(&state, "AbCd1234".to_owned(), false).await;
+
+        assert!(state.token_matches("abcd1234"));
+        assert!(state.token_matches("ABCD1234"));
+
+        state.reset_token_with_policy("AbCd1234".to_owned(), true);
+        assert!(!state.token_matches("abcd1234"));
+        assert!(state.token_matches("AbCd1234"));
     }
 
     #[test]
@@ -5503,10 +5639,22 @@ mod tests {
 
     #[test]
     fn automatic_codec_policy_reserves_lazy_fallback_slots() {
-        assert_eq!(configured_transcode_group_count("manual", "1", "auto"), 3);
-        assert_eq!(configured_transcode_group_count("adaptive", "2", "auto"), 3);
-        assert_eq!(configured_transcode_group_count("adaptive", "4", "auto"), 4);
-        assert_eq!(configured_transcode_group_count("manual", "1", "h265"), 1);
+        assert_eq!(
+            configured_transcode_group_count("manual", "1", "auto", "auto", &[]),
+            3
+        );
+        assert_eq!(
+            configured_transcode_group_count("adaptive", "2", "auto", "auto", &[]),
+            3
+        );
+        assert_eq!(
+            configured_transcode_group_count("adaptive", "4", "auto", "auto", &[]),
+            4
+        );
+        assert_eq!(
+            configured_transcode_group_count("manual", "1", "h265", "auto", &[]),
+            1
+        );
     }
 
     #[test]
