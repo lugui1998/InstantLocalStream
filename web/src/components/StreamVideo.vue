@@ -5,7 +5,6 @@ import type { RenderedFrameTiming } from '@/types'
 import { playbackRateFor } from '@/viewerUtils'
 
 const emit = defineEmits<{
-  unmute: []
   'live-edge': [video: HTMLVideoElement]
   'frame-rendered': [timing?: RenderedFrameTiming]
   'video-element': [video: HTMLVideoElement | null]
@@ -15,32 +14,11 @@ const video = ref<HTMLVideoElement | null>(null)
 
 const props = defineProps<{
   stream: MediaStream | null
-  audioEnabled: boolean
   catchUpDelayMs: number | null
   bootstrapProgress: BootstrapProgress | null
 }>()
 let frameCallback = 0
 let renderedVideoSize = ''
-const hasLiveAudio = ref(false)
-let observedStream: MediaStream | null = null
-
-function refreshLiveAudio() {
-  hasLiveAudio.value = props.audioEnabled
-    && observedStream?.getAudioTracks().some(track => track.readyState === 'live') === true
-}
-
-function observeStream(stream: MediaStream | null) {
-  if (observedStream === stream) {
-    refreshLiveAudio()
-    return
-  }
-  observedStream?.removeEventListener('addtrack', refreshLiveAudio)
-  observedStream?.removeEventListener('removetrack', refreshLiveAudio)
-  observedStream = stream
-  observedStream?.addEventListener('addtrack', refreshLiveAudio)
-  observedStream?.addEventListener('removetrack', refreshLiveAudio)
-  refreshLiveAudio()
-}
 
 function refreshVideoDimensions() {
   const element = video.value
@@ -65,10 +43,6 @@ function applyCatchUpRate() {
     element.preservesPitch = true
     element.playbackRate = nextRate
   }
-}
-
-function requestUnmute() {
-  if (hasLiveAudio.value) emit('unmute')
 }
 
 function reportPlayFailure() {
@@ -110,12 +84,15 @@ function followLiveEdge(_now: number, metadata: WebRtcFrameMetadata) {
 }
 
 watch([video, () => props.stream], ([element, stream]) => {
-  observeStream(stream)
   if (element) {
     // A rebuilt peer may now carry audio.  Stay muted at attachment time so
     // autoplay remains reliable, but do not disable native controls: once an
     // audio track arrives the browser enables its volume UI for the viewer.
-    element.muted = true
+    // Preserve an explicit user unmute if a later track replaces only the
+    // wrapper MediaStream (for example, audio-first delivery followed by video).
+    const hasLiveAudio = stream?.getAudioTracks().some(track => track.readyState === 'live') === true
+    const preserveUserUnmute = !element.muted && hasLiveAudio
+    element.muted = !preserveUserUnmute
     element.srcObject = stream
     renderedVideoSize = ''
     if (stream) refreshVideoDimensions()
@@ -135,11 +112,9 @@ watch([video, () => props.stream], ([element, stream]) => {
   }
 }, { immediate: true })
 
-watch(() => props.audioEnabled, refreshLiveAudio)
 watch(() => props.catchUpDelayMs, applyCatchUpRate, { immediate: true })
 
 onBeforeUnmount(() => {
-  observeStream(null)
   if (video.value && frameCallback && 'cancelVideoFrameCallback' in video.value) {
     video.value.cancelVideoFrameCallback(frameCallback)
   }
@@ -163,14 +138,10 @@ onMounted(() => emit('video-element', video.value))
       muted
       playsinline
       controls
-      @click="requestUnmute"
       @error="reportPlayFailure"
       @loadeddata="emit('frame-rendered')"
       @loadedmetadata="refreshVideoDimensions(); video && emit('live-edge', video)"
       @resize="refreshVideoDimensions"
     />
-    <button v-if="hasLiveAudio" class="audio-enable" type="button" @click="requestUnmute">
-      Enable audio
-    </button>
   </section>
 </template>

@@ -1021,7 +1021,11 @@ export function useViewer() {
       current.addEventListener('track', ({ track }) => {
         if (peer !== current || stream.getTracks().some(({ id }) => id === track.id)) return
         stream.addTrack(track)
-        videoStream.value = stream
+        // Audio normally arrives after video. Replacing the wrapper stream
+        // makes that topology change observable to Vue; assigning the same
+        // MediaStream again leaves StreamVideo unaware of the new audio track
+        // so the native media controls see the complete track set.
+        videoStream.value = new MediaStream(stream.getTracks())
         bootstrapProgress.value = null
         connection.value = 'Receiving'
         reconnectAttempt = 0
@@ -1073,20 +1077,6 @@ export function useViewer() {
       } else if (resumeAfterStreamReset && streamIsRunning()) {
         resumeAfterStreamReset = false
         scheduleReconnect('Stream restarting', true)
-      }
-    }
-  }
-
-  async function unmute() {
-    const element = videoElement
-    if (element && status.value.audio_enabled && videoStream.value?.getAudioTracks().length) {
-      element.muted = false
-      try {
-        await element.play()
-        mediaStatus.value = null
-      } catch {
-        element.muted = true
-        mediaStatus.value = 'Audio playback was blocked. Select “Enable audio” and allow playback in your browser.'
       }
     }
   }
@@ -1150,5 +1140,5 @@ export function useViewer() {
   }
 
   onBeforeUnmount(stop)
-  return { videoStream, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, unmute, setVideoElement, reportPlaybackError, seekToLiveEdge, noteVideoFrameRendered, ping }
+  return { videoStream, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, setVideoElement, reportPlaybackError, seekToLiveEdge, noteVideoFrameRendered, ping }
 }

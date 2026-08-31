@@ -33,7 +33,6 @@ const {
   viewers,
   quality,
   start,
-  unmute,
   setVideoElement,
   reportPlaybackError,
   seekToLiveEdge,
@@ -135,7 +134,7 @@ onMounted(start)
 
 <template>
   <main>
-    <StreamVideo :stream="videoStream" :audio-enabled="status.audio_enabled === true" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @unmute="unmute" @video-element="setVideoElement" @playback-error="reportPlaybackError" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
+    <StreamVideo :stream="videoStream" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @video-element="setVideoElement" @playback-error="reportPlaybackError" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
 
     <p v-if="mediaStatus" class="media-status" role="status" aria-live="polite">{{ mediaStatus }}</p>
 

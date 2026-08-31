@@ -27,6 +27,7 @@ pub const OPUS_PAYLOAD_TYPE: u8 = 111;
 const OPUS_FRAME_SAMPLES: usize = 960;
 const STEREO_SAMPLES_PER_FRAME: usize = OPUS_FRAME_SAMPLES * 2;
 const AUDIO_TICK: Duration = Duration::from_millis(20);
+const AUDIO_PTS_TOLERANCE: Duration = Duration::from_millis(10);
 const RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
@@ -373,13 +374,35 @@ impl ClockMixer {
         let tick_ns = AUDIO_TICK.as_nanos() as i64;
         target_pts_ns = target_pts_ns.saturating_add(tick_ns.saturating_mul(missed_ticks));
 
+        let tolerance_ns = AUDIO_PTS_TOLERANCE.as_nanos() as i64;
+        let latest_pts_ns = target_pts_ns.saturating_add(tolerance_ns);
+        // The native producer may deliver a short burst before the first send
+        // tick, overflowing this deliberately tiny low-latency queue. If every
+        // remaining chunk is now ahead of the output clock, keeping the old
+        // target creates permanent silence: capture and output both advance by
+        // 20 ms and the gap never closes. Jump to the oldest retained chunk.
+        if let Some(oldest_available_pts_ns) = self
+            .pending
+            .iter()
+            .filter_map(|queue| queue.front().map(|(pts_ns, _)| *pts_ns))
+            .min()
+            && oldest_available_pts_ns > latest_pts_ns
+        {
+            target_pts_ns = oldest_available_pts_ns;
+        }
+        let earliest_pts_ns = target_pts_ns.saturating_sub(tolerance_ns);
+        let latest_pts_ns = target_pts_ns.saturating_add(tolerance_ns);
         let mut mixed = vec![0.0_f32; STEREO_SAMPLES_PER_FRAME];
         for queue in &mut self.pending {
-            while matches!(queue.front(), Some((pts_ns, _)) if *pts_ns < target_pts_ns) {
+            // Native callback timestamps contain small scheduling jitter. Keep
+            // chunks from either side of the ideal tick; the old one-sided
+            // comparison discarded every slightly-early chunk as stale and
+            // could encode a continuous run of silence.
+            while matches!(queue.front(), Some((pts_ns, _)) if *pts_ns < earliest_pts_ns) {
                 queue.pop_front();
             }
             if let Some((pts_ns, data)) = queue.front()
-                && *pts_ns <= target_pts_ns + AUDIO_TICK.as_nanos() as i64 / 2
+                && *pts_ns <= latest_pts_ns
             {
                 for (destination, sample) in mixed.iter_mut().zip(data.iter()) {
                     *destination = (*destination + *sample).clamp(-1.0, 1.0);
@@ -450,7 +473,22 @@ fn open_streams(settings: &CaptureSettings) -> Result<Vec<Stream>> {
             excluded_pids.insert(pid);
         }
     }
-    let excluded_pid = resolve_excluded_pid(&settings.excluded_audio_processes, excluded_pids)?;
+    #[cfg(windows)]
+    let excluded_pid = match resolve_running_excluded_pid(&settings.excluded_audio_processes)? {
+        Some(pid) => Some(pid),
+        None => resolve_excluded_pid(excluded_pids)?,
+    };
+    #[cfg(not(windows))]
+    let excluded_pid = resolve_excluded_pid(excluded_pids)?;
+
+    // Exclusions are fail-closed. The pipeline's retry loop will reopen this
+    // source after the requested process becomes discoverable; falling back to
+    // raw system capture could leak its audio if it starts later.
+    let Some(excluded_pid) = excluded_pid else {
+        anyhow::bail!(
+            "cannot enforce audio exclusion: none of the requested processes are currently discoverable"
+        )
+    };
     flexaudio::open(FlexAudioConfig {
         // flexaudio exposes a native system-minus-one-process primitive.  It
         // cannot represent multiple independent exclusions in one stream, and
@@ -465,17 +503,103 @@ fn open_streams(settings: &CaptureSettings) -> Result<Vec<Stream>> {
     .map_err(|error| anyhow::anyhow!(error))
 }
 
-fn resolve_excluded_pid(requested_names: &[String], excluded_pids: HashSet<u32>) -> Result<u32> {
-    let result: Result<u32> = match excluded_pids.len() {
-        1 => Ok(*excluded_pids.iter().next().expect("length checked")),
-        0 => anyhow::bail!(
-            "cannot enforce audio exclusion: none of the requested processes are currently discoverable"
-        ),
+fn resolve_excluded_pid(excluded_pids: HashSet<u32>) -> Result<Option<u32>> {
+    match excluded_pids.len() {
+        1 => Ok(excluded_pids.iter().next().copied()),
+        0 => Ok(None),
         _ => anyhow::bail!(
-            "cannot enforce audio exclusion for multiple processes with the current audio backend"
+            "cannot enforce audio exclusion for multiple independent process trees with the current audio backend"
         ),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunningProcess {
+    pid: u32,
+    parent_pid: u32,
+    name: String,
+}
+
+#[cfg(windows)]
+fn resolve_running_excluded_pid(requested_names: &[String]) -> Result<Option<u32>> {
+    let processes = windows_process_snapshot().context("enumerate running audio processes")?;
+    resolve_process_tree_root(requested_names, &processes)
+        .with_context(|| format!("requested exclusions: {}", requested_names.join(", ")))
+}
+
+fn resolve_process_tree_root(
+    requested_names: &[String],
+    processes: &[RunningProcess],
+) -> Result<Option<u32>> {
+    let requested = requested_names
+        .iter()
+        .map(|name| normalize_process_name(name))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let matching = processes
+        .iter()
+        .filter(|process| {
+            let actual = normalize_process_name(&process.name);
+            requested
+                .iter()
+                .any(|requested| actual == *requested || actual.contains(requested))
+        })
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    let matching_pids = matching
+        .iter()
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    let roots = matching
+        .iter()
+        .filter(|process| !matching_pids.contains(&process.parent_pid))
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    resolve_excluded_pid(roots)
+}
+
+fn normalize_process_name(name: &str) -> String {
+    let lowercase = name.trim().to_ascii_lowercase();
+    lowercase
+        .strip_suffix(".exe")
+        .unwrap_or(&lowercase)
+        .to_owned()
+}
+
+#[cfg(windows)]
+fn windows_process_snapshot() -> Result<Vec<RunningProcess>> {
+    use std::mem::size_of;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
     };
-    result.with_context(|| format!("requested exclusions: {}", requested_names.join(", ")))
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut processes = Vec::new();
+    let mut next = unsafe { Process32FirstW(snapshot, &mut entry) };
+    while next.is_ok() {
+        let name_length = entry
+            .szExeFile
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.szExeFile.len());
+        processes.push(RunningProcess {
+            pid: entry.th32ProcessID,
+            parent_pid: entry.th32ParentProcessID,
+            name: String::from_utf16_lossy(&entry.szExeFile[..name_length]),
+        });
+        next = unsafe { Process32NextW(snapshot, &mut entry) };
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    Ok(processes)
 }
 
 fn selected_window_pid(settings: &CaptureSettings) -> Result<u32> {
@@ -659,6 +783,51 @@ mod tests {
     }
 
     #[test]
+    fn clock_mixer_keeps_slightly_early_native_chunks_audible() {
+        let start = Instant::now();
+        let mut mixer = ClockMixer::new(1);
+        mixer.push(0, 1_000_000, vec![0.25; STEREO_SAMPLES_PER_FRAME]);
+        assert!(mixer.mix_due(start).is_none());
+        assert!(mixer.mix_due(start + AUDIO_TICK).is_some());
+
+        // Callback clocks commonly land a fraction before the ideal 20 ms
+        // boundary. This frame used to be dropped solely because 20.5 ms is
+        // earlier than the ideal 21 ms target.
+        mixer.push(0, 20_500_000, vec![0.5; STEREO_SAMPLES_PER_FRAME]);
+        let mixed = mixer.mix_due(start + AUDIO_TICK * 2).expect("second tick");
+        assert!(
+            mixed
+                .iter()
+                .all(|sample| (*sample - 0.5).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn clock_mixer_reanchors_after_capture_queue_overrun() {
+        let start = Instant::now();
+        let mut mixer = ClockMixer::new(1);
+        for tick in 0..5 {
+            mixer.push(
+                0,
+                tick * AUDIO_TICK.as_nanos() as i64,
+                vec![tick as f32 / 10.0; STEREO_SAMPLES_PER_FRAME],
+            );
+        }
+
+        // Only ticks 2, 3, and 4 remain in the bounded queue. The mixer must
+        // jump to tick 2 instead of emitting silence forever from tick 0.
+        assert!(mixer.mix_due(start).is_none());
+        let mixed = mixer
+            .mix_due(start + AUDIO_TICK)
+            .expect("first output tick");
+        assert!(
+            mixed
+                .iter()
+                .all(|sample| (*sample - 0.2).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
     fn clock_mixer_reanchors_media_time_after_scheduler_stall() {
         let mut mixer = ClockMixer::new(1);
         let started_at = Instant::now();
@@ -682,11 +851,42 @@ mod tests {
 
     #[test]
     fn process_exclusion_requires_exactly_one_resolved_process() {
-        assert!(resolve_excluded_pid(&["browser".to_owned()], HashSet::new()).is_err());
+        assert_eq!(resolve_excluded_pid(HashSet::new()).unwrap(), None);
+        assert_eq!(resolve_excluded_pid(HashSet::from([42])).unwrap(), Some(42));
+        assert!(resolve_excluded_pid(HashSet::from([42, 43])).is_err());
+    }
+
+    #[test]
+    fn process_exclusion_finds_the_root_of_a_minimized_application_tree() {
+        let processes = vec![
+            RunningProcess {
+                pid: 10,
+                parent_pid: 1,
+                name: "Discord.exe".to_owned(),
+            },
+            RunningProcess {
+                pid: 11,
+                parent_pid: 10,
+                name: "Discord.exe".to_owned(),
+            },
+            RunningProcess {
+                pid: 12,
+                parent_pid: 10,
+                name: "Discord.exe".to_owned(),
+            },
+            RunningProcess {
+                pid: 20,
+                parent_pid: 1,
+                name: "browser.exe".to_owned(),
+            },
+        ];
         assert_eq!(
-            resolve_excluded_pid(&["browser".to_owned()], HashSet::from([42])).unwrap(),
-            42
+            resolve_process_tree_root(&["Discord".to_owned()], &processes).unwrap(),
+            Some(10)
         );
-        assert!(resolve_excluded_pid(&["browser".to_owned()], HashSet::from([42, 43])).is_err());
+        assert_eq!(
+            resolve_process_tree_root(&["not-running".to_owned()], &processes).unwrap(),
+            None
+        );
     }
 }
