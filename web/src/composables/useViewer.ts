@@ -1,7 +1,7 @@
 import { computed, onBeforeUnmount, ref } from 'vue'
 import { io, type Socket } from 'socket.io-client'
-import type { AuthoritativeStreamSettings, FrameTimingAcknowledgement, GroupAssignment, PingAcknowledgement, PlaybackMetricPoint, RenderedFrameTiming, SessionReady, StreamStatus, ViewerBootstrap, ViewerStats, ViewerVideoCapability, WebRtcAnswer } from '@/types'
-import { retryDelayFor } from '@/viewerUtils'
+import type { AuthoritativeStreamSettings, FrameTimingAcknowledgement, GroupAssignment, PingAcknowledgement, PlaybackMetricPoint, RenderedFrameTiming, SessionGoodbye, SessionReady, StreamStatus, ViewerBootstrap, ViewerStats, ViewerVideoCapability, WebRtcAnswer } from '@/types'
+import { isTerminalSocketDisconnect, retryDelayFor, sessionGoodbyeMessage } from '@/viewerUtils'
 
 const bootstrapProbeTimeoutMs = 5_000
 const bootstrapProbeMaxBytes = 1_024 * 1_024
@@ -149,7 +149,9 @@ export function useViewer() {
   let restartRequested = false
   let resumeAfterStreamReset = false
   let negotiationAbortController: AbortController | null = null
+  let bootstrapAbortController: AbortController | null = null
   let stopping = false
+  let terminalSessionEnded = false
   let lastBytes: number | null = null
   let lastPackets: number | null = null
   let lastLost: number | null = null
@@ -221,6 +223,7 @@ export function useViewer() {
   }
 
   function mergeStatus(next: StreamStatus) {
+    if (terminalSessionEnded) return false
     const wasStopped = statusIndicatesStopped(status.value)
     const wasResetting = statusIndicatesResetting(status.value)
     if (typeof next.settings_revision === 'number') {
@@ -252,6 +255,7 @@ export function useViewer() {
   }
 
   function setInactiveStreamMessage() {
+    if (terminalSessionEnded) return
     const message = statusIndicatesResetting(status.value)
       ? 'Stream reset in progress'
       : signalState.value === 'Connected'
@@ -317,6 +321,7 @@ export function useViewer() {
   }
 
   function applyAuthoritativeSettings(update: AuthoritativeStreamSettings) {
+    if (terminalSessionEnded) return
     if (!Number.isFinite(update.revision) || update.revision < authoritativeSettingsRevision) return
     mergeStatus({ ...update.status, settings_revision: update.revision })
   }
@@ -338,6 +343,7 @@ export function useViewer() {
   }
 
   function applyGroupAssignment(assignment: GroupAssignment) {
+    if (terminalSessionEnded) return
     if (typeof assignment.settings_revision === 'number') {
       if (assignment.settings_revision < authoritativeSettingsRevision) return
       authoritativeSettingsRevision = Math.max(authoritativeSettingsRevision, assignment.settings_revision)
@@ -371,6 +377,7 @@ export function useViewer() {
   async function probeBootstrap(): Promise<ViewerBootstrap> {
     const startedAt = performance.now()
     const controller = new AbortController()
+    bootstrapAbortController = controller
     let timedOut = false
     let firstByteAt: number | null = null
     const timeout = window.setTimeout(() => {
@@ -417,6 +424,7 @@ export function useViewer() {
       // A failed probe is still reported so the server can use its fallback assignment.
     } finally {
       window.clearTimeout(timeout)
+      if (bootstrapAbortController === controller) bootstrapAbortController = null
     }
     const elapsedMs = Math.max(1, performance.now() - startedAt)
     return {
@@ -429,7 +437,7 @@ export function useViewer() {
 
   async function bootstrapInitialWebRtc() {
     if (bootstrapPromise) return bootstrapPromise
-    if (!initialSessionReady) return
+    if (!initialSessionReady || stopping) return
     bootstrapPromise = (async () => {
       if (!streamIsRunning()) {
         setInactiveStreamMessage()
@@ -438,6 +446,10 @@ export function useViewer() {
       }
       connection.value = 'Measuring connection'
       const metrics = await probeBootstrap()
+      if (stopping) {
+        bootstrapPromise = null
+        return
+      }
       if (!streamIsRunning()) {
         bootstrapProgress.value = null
         setInactiveStreamMessage()
@@ -464,6 +476,10 @@ export function useViewer() {
           if (bootstrapAssignmentReceived) finish()
         })
       }
+      if (stopping) {
+        bootstrapPromise = null
+        return
+      }
       if (!streamIsRunning()) {
         bootstrapProgress.value = null
         setInactiveStreamMessage()
@@ -486,6 +502,36 @@ export function useViewer() {
     void startWebRtc().catch(handleWebRtcFailure)
   }
 
+  function endTerminalSession(detail: string) {
+    if (terminalSessionEnded) return
+
+    terminalSessionEnded = true
+    stopping = true
+    resumeAfterStreamReset = false
+    restartRequested = false
+    awaitingCodecFallback = false
+    window.removeEventListener('online', reconnect)
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+    if (pingTimer !== null) window.clearInterval(pingTimer)
+    if (codecFallbackTimer !== null) window.clearTimeout(codecFallbackTimer)
+    reconnectTimer = null
+    pingTimer = null
+    codecFallbackTimer = null
+    finishBootstrapAssignmentWait?.()
+    finishBootstrapAssignmentWait = null
+    bootstrapAbortController?.abort()
+    bootstrapAbortController = null
+    clearPeer()
+    socket?.io.reconnection(false)
+    socket?.disconnect()
+    socket = null
+
+    signalState.value = 'Ended'
+    connection.value = 'Stream ended'
+    mediaStatus.value = detail
+    bootstrapProgress.value = { title: 'Stream ended', detail }
+  }
+
   function connectSignal() {
     socket = io({
       path: '/ws',
@@ -497,20 +543,28 @@ export function useViewer() {
       reconnectionDelayMax: 30_000,
     })
     socket.on('connect', () => {
+      if (stopping) return
       signalState.value = 'Connected'
       bootstrapProgress.value = { title: 'Connecting to stream', detail: '' }
       requestStatus()
       ping()
     })
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+      if (stopping) return
+      if (isTerminalSocketDisconnect(reason)) {
+        endTerminalSession('The host ended this viewing session.')
+        return
+      }
       signalState.value = 'Reconnecting'
       if (!videoStream.value) setInactiveStreamMessage()
     })
     socket.on('connect_error', () => {
+      if (stopping) return
       signalState.value = 'Reconnecting'
       if (!videoStream.value) setInactiveStreamMessage()
     })
     socket.on('session.ready', (ready: SessionReady) => {
+      if (stopping) return
       const resumedSignalingSession = initialSessionReady
       // This snapshot begins a new authoritative signaling session. The host
       // process may have restarted while this page stayed open, in which case
@@ -535,6 +589,10 @@ export function useViewer() {
     socket.on('stream.settings', applyAuthoritativeSettings)
     socket.on('group.bootstrap', applyGroupAssignment)
     socket.on('group.assignment', applyGroupAssignment)
+    socket.on('session.goodbye', (goodbye: SessionGoodbye, acknowledge?: (receipt: { received: true }) => void) => {
+      acknowledge?.({ received: true })
+      endTerminalSession(sessionGoodbyeMessage(goodbye?.reason))
+    })
   }
 
   function requestStatus() {
@@ -551,6 +609,7 @@ export function useViewer() {
     const sentAt = performance.now()
     const sentEpochMs = Date.now()
     socket?.timeout(5_000).emit('control.ping', { sentAt }, (error: Error | null, ack: PingAcknowledgement) => {
+      if (stopping) return
       if (error || ack?.sentAt !== sentAt) return
       const roundTripMs = Math.max(0, performance.now() - sentAt)
       rttMs.value = roundTripMs
@@ -970,6 +1029,7 @@ export function useViewer() {
 
   function handleWebRtcFailure(error: unknown) {
     clearPeer()
+    if (stopping) return
     if (!streamIsRunning()) {
       setInactiveStreamMessage()
       return
@@ -979,6 +1039,7 @@ export function useViewer() {
   }
 
   function restartWebRtcSession(reason = 'Group assignment restarting') {
+    if (stopping) return
     reconnectAttempt = 0
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
     reconnectTimer = null
@@ -1087,10 +1148,12 @@ export function useViewer() {
   }
 
   function reportPlaybackError() {
+    if (terminalSessionEnded) return
     mediaStatus.value = playbackBlockedMessage
   }
 
   function reportPlaybackStarted() {
+    if (terminalSessionEnded) return
     if (mediaStatus.value === playbackBlockedMessage) mediaStatus.value = null
   }
 
@@ -1115,6 +1178,7 @@ export function useViewer() {
   }
 
   function reconnect() {
+    if (stopping) return
     reconnectAttempt = 0
     requestStatus()
     if (!streamIsRunning()) {
@@ -1136,6 +1200,8 @@ export function useViewer() {
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
     if (pingTimer !== null) window.clearInterval(pingTimer)
     if (codecFallbackTimer !== null) window.clearTimeout(codecFallbackTimer)
+    bootstrapAbortController?.abort()
+    bootstrapAbortController = null
     pingTimer = null
     codecFallbackTimer = null
     clearPeer()

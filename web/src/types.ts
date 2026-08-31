@@ -54,6 +54,13 @@ export interface SessionReady {
   status: StreamStatus
 }
 
+export type SessionGoodbyeReason = 'host_shutdown' | 'token_changed'
+
+export interface SessionGoodbye {
+  reason: SessionGoodbyeReason
+  reconnect: false
+}
+
 export interface AuthoritativeStreamSettings {
   revision: number
   status: StreamStatus

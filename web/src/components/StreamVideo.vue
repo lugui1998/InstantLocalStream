@@ -39,7 +39,8 @@ function refreshVideoDimensions() {
 function applyCatchUpRate() {
   const element = video.value
   if (!element) return
-  const nextRate = playbackRateFor(props.catchUpDelayMs)
+  const hasLiveAudio = props.stream?.getAudioTracks().some(track => track.readyState === 'live') === true
+  const nextRate = playbackRateFor(props.catchUpDelayMs, hasLiveAudio)
   if (element.playbackRate !== nextRate) {
     element.preservesPitch = true
     element.playbackRate = nextRate
@@ -95,6 +96,7 @@ watch([video, () => props.stream], ([element, stream]) => {
     const preserveUserUnmute = !element.muted && hasLiveAudio
     element.muted = !preserveUserUnmute
     element.srcObject = stream
+    applyCatchUpRate()
     renderedVideoSize = ''
     if (stream) refreshVideoDimensions()
     if (stream) void element.play().catch(reportPlayFailure)

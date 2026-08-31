@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,10 +24,12 @@ use crate::capture;
 use crate::media::CaptureSettings;
 
 pub const OPUS_PAYLOAD_TYPE: u8 = 111;
+pub const OPUS_FMTP_LINE: &str = "minptime=10;stereo=1;sprop-stereo=1;maxaveragebitrate=256000";
 const OPUS_FRAME_SAMPLES: usize = 960;
 const STEREO_SAMPLES_PER_FRAME: usize = OPUS_FRAME_SAMPLES * 2;
-const AUDIO_TICK: Duration = Duration::from_millis(20);
-const AUDIO_PTS_TOLERANCE: Duration = Duration::from_millis(10);
+const OPUS_BITRATE_BPS: i32 = 256_000;
+const OPUS_COMPLEXITY: i32 = 10;
+const AUDIO_QUEUE_CAPACITY: usize = 10;
 const RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
@@ -41,6 +43,7 @@ pub struct AudioTrack {
 struct AudioSample {
     data: Bytes,
     duration: Duration,
+    prev_dropped_packets: u16,
 }
 
 struct AudioQueue {
@@ -88,7 +91,7 @@ impl AudioPipeline {
                     mime_type: MIME_TYPE_OPUS.to_owned(),
                     clock_rate: 48_000,
                     channels: 2,
-                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+                    sdp_fmtp_line: OPUS_FMTP_LINE.to_owned(),
                     rtcp_feedback: vec![],
                 },
                 ..Default::default()
@@ -98,7 +101,9 @@ impl AudioPipeline {
             track: Arc::new(track),
             ssrc,
             queue: Arc::new(AudioQueue {
-                samples: Mutex::new(std::collections::VecDeque::with_capacity(3)),
+                samples: Mutex::new(std::collections::VecDeque::with_capacity(
+                    AUDIO_QUEUE_CAPACITY,
+                )),
                 notify: Notify::new(),
                 closed: AtomicBool::new(false),
             }),
@@ -202,11 +207,8 @@ impl AudioPipeline {
     }
 
     fn run(&self) -> Result<()> {
-        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        encoder.bitrate_bps = 96_000;
-        encoder.complexity = 5;
-        encoder.use_cbr = true;
+        let _audio_priority = prioritize_audio_thread();
+        let mut encoder = high_quality_opus_encoder()?;
         let mut encoded = vec![0_u8; 1_500];
 
         let mut retry_attempt = 0;
@@ -229,8 +231,8 @@ impl AudioPipeline {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            let mut streams = match open_streams(&settings) {
-                Ok(streams) => streams,
+            let mut stream = match open_stream(&settings) {
+                Ok(stream) => stream,
                 Err(error) => {
                     self.record_failure(error.to_string());
                     self.wait_for_retry(revision, retry_attempt);
@@ -238,18 +240,9 @@ impl AudioPipeline {
                     continue;
                 }
             };
-            let mut start_failure = None;
-            for stream in &mut streams {
-                if let Err(error) = stream.start() {
-                    start_failure = Some(error.to_string());
-                    break;
-                }
-            }
-            if let Some(error) = start_failure {
-                for stream in &mut streams {
-                    stream.stop();
-                }
-                self.record_failure(error);
+            if let Err(error) = stream.start() {
+                stream.stop();
+                self.record_failure(error.to_string());
                 self.wait_for_retry(revision, retry_attempt);
                 retry_attempt = retry_attempt.saturating_add(1);
                 continue;
@@ -258,29 +251,51 @@ impl AudioPipeline {
             if let Ok(mut failure) = self.failure.lock() {
                 *failure = None;
             }
+            let mut previous_capture_drops = 0;
+            let mut pending_dropped_packets = 0_u32;
 
-            let mut mixer = ClockMixer::new(streams.len());
             while !self.stop.load(Ordering::Acquire)
                 && self.revision.load(Ordering::Acquire) == revision
             {
-                for (stream_index, stream) in streams.iter_mut().enumerate() {
-                    while let Some(chunk) = stream.poll_chunk() {
-                        mixer.push(stream_index, chunk.pts_ns, chunk.data);
+                let mut encoded_any = false;
+                while let Some(chunk) = stream.poll_chunk() {
+                    encoded_any = true;
+                    let newly_dropped =
+                        cumulative_drop_delta(&mut previous_capture_drops, chunk.dropped_before);
+                    if !self.active.load(Ordering::Acquire) {
+                        // Starting playback establishes a fresh RTP timeline;
+                        // capture loss while nobody is listening is irrelevant.
+                        pending_dropped_packets = 0;
+                        continue;
                     }
-                }
-                if let Some(mixed) = mixer.mix_due(Instant::now())
-                    && self.active.load(Ordering::Acquire)
-                {
+                    pending_dropped_packets = pending_dropped_packets.saturating_add(newly_dropped);
+                    if chunk.frames != OPUS_FRAME_SAMPLES
+                        || chunk.data.len() != STEREO_SAMPLES_PER_FRAME
+                    {
+                        tracing::warn!(
+                            frames = chunk.frames,
+                            samples = chunk.data.len(),
+                            "discarding malformed normalized audio chunk"
+                        );
+                        pending_dropped_packets = pending_dropped_packets.saturating_add(1);
+                        continue;
+                    }
                     let size = encoder
-                        .encode(&mixed, OPUS_FRAME_SAMPLES, &mut encoded)
+                        .encode(&chunk.data, OPUS_FRAME_SAMPLES, &mut encoded)
                         .map_err(|error| anyhow::anyhow!(error))?;
-                    self.broadcast(Bytes::copy_from_slice(&encoded[..size]));
+                    let rtp_gap = pending_dropped_packets.min(u16::MAX as u32) as u16;
+                    pending_dropped_packets = 0;
+                    self.broadcast(Bytes::copy_from_slice(&encoded[..size]), rtp_gap);
                 }
-                thread::sleep(Duration::from_millis(2));
+                if !encoded_any {
+                    // flexaudio already produces normalized 20 ms chunks. Do
+                    // not re-clock them against another wall timer: that used
+                    // to discard PCM or insert hard silence after scheduling
+                    // jitter, which was directly audible as crackle.
+                    thread::sleep(Duration::from_millis(2));
+                }
             }
-            for stream in &mut streams {
-                stream.stop();
-            }
+            stream.stop();
         }
         Ok(())
     }
@@ -302,7 +317,7 @@ impl AudioPipeline {
         }
     }
 
-    fn broadcast(&self, data: Bytes) {
+    fn broadcast(&self, data: Bytes, prev_dropped_packets: u16) {
         let subscribers = self
             .subscribers
             .lock()
@@ -312,111 +327,74 @@ impl AudioPipeline {
             subscriber.enqueue(AudioSample {
                 data: data.clone(),
                 duration: Duration::from_millis(20),
+                prev_dropped_packets,
             });
         }
     }
 }
 
-/// Aligns independently delivered flexaudio chunks to one 20 ms output clock.
-/// Chunks are timestamped by flexaudio's normalized monotonic clock, but callback
-/// scheduling can be skewed between per-process capture streams.  The mixer only
-/// emits once per tick and substitutes silence for a late stream, so a burst from
-/// one callback can never advance RTP time ahead of the other streams.
-struct ClockMixer {
-    pending: Vec<VecDeque<(i64, Vec<f32>)>>,
-    next_pts_ns: Option<i64>,
-    next_deadline: Option<Instant>,
+fn high_quality_opus_encoder() -> Result<OpusEncoder> {
+    let mut encoder =
+        OpusEncoder::new(48_000, 2, Application::Audio).map_err(|error| anyhow::anyhow!(error))?;
+    // Audio is a tiny fraction of the video budget, so keep Opus in its
+    // high-quality stereo profile at all times. VBR gives transients the
+    // bytes they need instead of forcing every packet to the same size.
+    encoder.bitrate_bps = OPUS_BITRATE_BPS;
+    encoder.complexity = OPUS_COMPLEXITY;
+    encoder.use_cbr = false;
+    Ok(encoder)
 }
 
-impl ClockMixer {
-    fn new(stream_count: usize) -> Self {
-        Self {
-            pending: (0..stream_count)
-                .map(|_| VecDeque::with_capacity(3))
-                .collect(),
-            next_pts_ns: None,
-            next_deadline: None,
-        }
-    }
+fn cumulative_drop_delta(previous: &mut u32, current: u32) -> u32 {
+    // flexaudio stores the stream's cumulative native-ring drop total on
+    // every chunk. Only the increase since the preceding chunk belongs to
+    // this RTP sample. Treat a counter reset as a fresh cumulative value.
+    let delta = current.checked_sub(*previous).unwrap_or(current);
+    *previous = current;
+    delta
+}
 
-    fn push(&mut self, stream_index: usize, pts_ns: i64, data: Vec<f32>) {
-        let Some(queue) = self.pending.get_mut(stream_index) else {
-            return;
-        };
-        if queue.len() >= 3 {
-            queue.pop_front();
-        }
-        queue.push_back((pts_ns, data));
-        // Before the clock starts, anchor it to the earliest first chunk. Once
-        // output has started, a late callback must not move the media clock
-        // backwards.
-        if self.next_deadline.is_none() {
-            self.next_pts_ns = Some(
-                self.next_pts_ns
-                    .map_or(pts_ns, |current| current.min(pts_ns)),
-            );
-        }
-    }
+#[cfg(windows)]
+struct AudioThreadPriority(windows::Win32::Foundation::HANDLE);
 
-    fn mix_due(&mut self, now: Instant) -> Option<Vec<f32>> {
-        let mut target_pts_ns = self.next_pts_ns?;
-        let deadline = self.next_deadline.get_or_insert_with(|| now + AUDIO_TICK);
-        if now < *deadline {
-            return None;
+#[cfg(windows)]
+impl Drop for AudioThreadPriority {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0);
         }
-
-        // If the mixer task was descheduled for several ticks, advance both
-        // clocks together. Emitting a catch-up burst would increase latency,
-        // while advancing only the wall clock would leave every subsequent
-        // capture chunk permanently ahead of the media clock.
-        let missed_ticks = now.duration_since(*deadline).as_nanos() / AUDIO_TICK.as_nanos();
-        let missed_ticks = i64::try_from(missed_ticks).unwrap_or(i64::MAX);
-        let tick_ns = AUDIO_TICK.as_nanos() as i64;
-        target_pts_ns = target_pts_ns.saturating_add(tick_ns.saturating_mul(missed_ticks));
-
-        let tolerance_ns = AUDIO_PTS_TOLERANCE.as_nanos() as i64;
-        let latest_pts_ns = target_pts_ns.saturating_add(tolerance_ns);
-        // The native producer may deliver a short burst before the first send
-        // tick, overflowing this deliberately tiny low-latency queue. If every
-        // remaining chunk is now ahead of the output clock, keeping the old
-        // target creates permanent silence: capture and output both advance by
-        // 20 ms and the gap never closes. Jump to the oldest retained chunk.
-        if let Some(oldest_available_pts_ns) = self
-            .pending
-            .iter()
-            .filter_map(|queue| queue.front().map(|(pts_ns, _)| *pts_ns))
-            .min()
-            && oldest_available_pts_ns > latest_pts_ns
-        {
-            target_pts_ns = oldest_available_pts_ns;
-        }
-        let earliest_pts_ns = target_pts_ns.saturating_sub(tolerance_ns);
-        let latest_pts_ns = target_pts_ns.saturating_add(tolerance_ns);
-        let mut mixed = vec![0.0_f32; STEREO_SAMPLES_PER_FRAME];
-        for queue in &mut self.pending {
-            // Native callback timestamps contain small scheduling jitter. Keep
-            // chunks from either side of the ideal tick; the old one-sided
-            // comparison discarded every slightly-early chunk as stale and
-            // could encode a continuous run of silence.
-            while matches!(queue.front(), Some((pts_ns, _)) if *pts_ns < earliest_pts_ns) {
-                queue.pop_front();
-            }
-            if let Some((pts_ns, data)) = queue.front()
-                && *pts_ns <= latest_pts_ns
-            {
-                for (destination, sample) in mixed.iter_mut().zip(data.iter()) {
-                    *destination = (*destination + *sample).clamp(-1.0, 1.0);
-                }
-                queue.pop_front();
-            }
-        }
-        self.next_pts_ns = Some(target_pts_ns.saturating_add(tick_ns));
-        // Do not "catch up" after scheduling stalls: doing so would emit a
-        // burst of RTP frames even though the capture callbacks were skewed.
-        *deadline = now + AUDIO_TICK;
-        Some(mixed)
     }
 }
+
+#[cfg(windows)]
+fn prioritize_audio_thread() -> Option<AudioThreadPriority> {
+    use windows::{
+        Win32::System::Threading::{
+            AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+        },
+        core::w,
+    };
+
+    let mut task_index = 0;
+    if let Ok(handle) = unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) } {
+        unsafe {
+            let _ = AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH);
+        }
+        return Some(AudioThreadPriority(handle));
+    }
+
+    // MMCSS can be unavailable on stripped-down Windows installations. A
+    // per-thread priority bump is a narrower fallback than raising the whole
+    // process and lasts only until this audio worker exits.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn prioritize_audio_thread() {}
 
 fn retry_delay(attempt: u32) -> Duration {
     RETRY_INITIAL_DELAY
@@ -437,10 +415,10 @@ fn audio_input_changed(previous: &CaptureSettings, next: &CaptureSettings) -> bo
                 }))
 }
 
-fn open_streams(settings: &CaptureSettings) -> Result<Vec<Stream>> {
+fn open_stream(settings: &CaptureSettings) -> Result<Stream> {
     if settings.audio_mode == "window" {
         let pid = selected_window_pid(settings)?;
-        return open_process_streams([pid]);
+        return open_process_stream(pid);
     }
     if settings.audio_mode != "system" {
         anyhow::bail!("audio capture was not enabled")
@@ -456,7 +434,7 @@ fn open_streams(settings: &CaptureSettings) -> Result<Vec<Stream>> {
             ..Default::default()
         })
         .map_err(|error| anyhow::anyhow!(error))?;
-        return Ok(vec![stream]);
+        return Ok(stream);
     }
 
     let excluded = settings
@@ -499,7 +477,6 @@ fn open_streams(settings: &CaptureSettings) -> Result<Vec<Stream>> {
         output,
         ..Default::default()
     })
-    .map(|stream| vec![stream])
     .map_err(|error| anyhow::anyhow!(error))
 }
 
@@ -615,22 +592,18 @@ fn selected_window_pid(settings: &CaptureSettings) -> Result<u32> {
         .context("selected window has no process id for audio capture")
 }
 
-fn open_process_streams(pids: impl IntoIterator<Item = u32>) -> Result<Vec<Stream>> {
-    pids.into_iter()
-        .map(|pid| {
-            flexaudio::open(FlexAudioConfig {
-                kind: SourceKind::ProcessLoopback,
-                target_pid: Some(pid),
-                mode: ProcessMode::Include,
-                output: OutputFormat {
-                    sample_rate: 48_000,
-                    channels: 2,
-                },
-                ..Default::default()
-            })
-            .map_err(|error| anyhow::anyhow!(error))
-        })
-        .collect()
+fn open_process_stream(pid: u32) -> Result<Stream> {
+    flexaudio::open(FlexAudioConfig {
+        kind: SourceKind::ProcessLoopback,
+        target_pid: Some(pid),
+        mode: ProcessMode::Include,
+        output: OutputFormat {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        ..Default::default()
+    })
+    .map_err(|error| anyhow::anyhow!(error))
 }
 
 impl AudioTrack {
@@ -643,10 +616,7 @@ impl AudioTrack {
             return;
         }
         if let Ok(mut samples) = self.queue.samples.lock() {
-            if samples.len() >= 3 {
-                samples.pop_front();
-            }
-            samples.push_back(sample);
+            enqueue_bounded_audio_sample(&mut samples, sample);
         }
         self.queue.notify.notify_one();
     }
@@ -678,6 +648,7 @@ impl AudioTrack {
                 .write_sample(&Sample {
                     data: sample.data,
                     duration: sample.duration,
+                    prev_dropped_packets: sample.prev_dropped_packets,
                     ..Default::default()
                 })
                 .await
@@ -687,6 +658,23 @@ impl AudioTrack {
             }
         }
     }
+}
+
+fn enqueue_bounded_audio_sample(
+    samples: &mut std::collections::VecDeque<AudioSample>,
+    mut sample: AudioSample,
+) {
+    if samples.len() >= AUDIO_QUEUE_CAPACITY
+        && let Some(dropped) = samples.pop_front()
+    {
+        let skipped = dropped.prev_dropped_packets.saturating_add(1);
+        if let Some(next) = samples.front_mut() {
+            next.prev_dropped_packets = next.prev_dropped_packets.saturating_add(skipped);
+        } else {
+            sample.prev_dropped_packets = sample.prev_dropped_packets.saturating_add(skipped);
+        }
+    }
+    samples.push_back(sample);
 }
 
 #[cfg(test)]
@@ -724,6 +712,36 @@ mod tests {
     }
 
     #[test]
+    fn opus_encoder_always_uses_the_high_quality_stereo_profile() {
+        let mut encoder = high_quality_opus_encoder().unwrap();
+        assert_eq!(encoder.bitrate_bps, 256_000);
+        assert_eq!(encoder.complexity, 10);
+        assert!(!encoder.use_cbr);
+        assert!(OPUS_FMTP_LINE.contains("stereo=1"));
+        assert!(OPUS_FMTP_LINE.contains("maxaveragebitrate=256000"));
+
+        let pcm = (0..STEREO_SAMPLES_PER_FRAME)
+            .map(|sample| ((sample as f32 * 0.071).sin() * 0.5).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let mut packet = vec![0_u8; 1_500];
+        let encoded = encoder
+            .encode(&pcm, OPUS_FRAME_SAMPLES, &mut packet)
+            .unwrap();
+        assert!(encoded > 0 && encoded <= packet.len());
+    }
+
+    #[test]
+    fn cumulative_capture_drop_counts_become_per_sample_rtp_gaps() {
+        let mut previous = 0;
+        let deltas = [0, 1, 1, 2].map(|current| cumulative_drop_delta(&mut previous, current));
+        assert_eq!(deltas, [0, 1, 0, 1]);
+
+        // A native stream may reset its counter without manufacturing a
+        // huge wrapping delta.
+        assert_eq!(cumulative_drop_delta(&mut previous, 0), 0);
+    }
+
+    #[test]
     fn deactivate_advances_revision_once_to_close_native_streams() {
         let audio = AudioPipeline::new();
         let initial = audio.revision.load(Ordering::Acquire);
@@ -752,101 +770,35 @@ mod tests {
     }
 
     #[test]
-    fn clock_mixer_emits_one_frame_per_tick_despite_skewed_callbacks() {
-        let start = Instant::now();
-        let mut mixer = ClockMixer::new(2);
-        mixer.push(0, 1_000, vec![0.2; STEREO_SAMPLES_PER_FRAME]);
-        mixer.push(1, 1_000, vec![0.3; STEREO_SAMPLES_PER_FRAME]);
-
-        assert!(mixer.mix_due(start).is_none());
-        let first = mixer.mix_due(start + AUDIO_TICK).expect("first tick");
-        assert_eq!(first, vec![0.5; STEREO_SAMPLES_PER_FRAME]);
-
-        // A fast callback from just one process must wait for the next output
-        // tick, and the missing stream contributes silence instead of advancing
-        // RTP time a second time in the same tick.
-        mixer.push(
-            0,
-            1_000 + AUDIO_TICK.as_nanos() as i64,
-            vec![0.4; STEREO_SAMPLES_PER_FRAME],
-        );
-        assert!(mixer.mix_due(start + AUDIO_TICK).is_none());
-        let second = mixer.mix_due(start + AUDIO_TICK * 2).expect("second tick");
-        assert_eq!(second, vec![0.4; STEREO_SAMPLES_PER_FRAME]);
-
-        // A late chunk from an earlier tick is discarded; it cannot rewind
-        // the output clock or produce another frame for an old timestamp.
-        mixer.push(1, 1_000, vec![0.9; STEREO_SAMPLES_PER_FRAME]);
-        assert!(mixer.mix_due(start + AUDIO_TICK * 2).is_none());
-        let third = mixer.mix_due(start + AUDIO_TICK * 3).expect("third tick");
-        assert_eq!(third, vec![0.0; STEREO_SAMPLES_PER_FRAME]);
-    }
-
-    #[test]
-    fn clock_mixer_keeps_slightly_early_native_chunks_audible() {
-        let start = Instant::now();
-        let mut mixer = ClockMixer::new(1);
-        mixer.push(0, 1_000_000, vec![0.25; STEREO_SAMPLES_PER_FRAME]);
-        assert!(mixer.mix_due(start).is_none());
-        assert!(mixer.mix_due(start + AUDIO_TICK).is_some());
-
-        // Callback clocks commonly land a fraction before the ideal 20 ms
-        // boundary. This frame used to be dropped solely because 20.5 ms is
-        // earlier than the ideal 21 ms target.
-        mixer.push(0, 20_500_000, vec![0.5; STEREO_SAMPLES_PER_FRAME]);
-        let mixed = mixer.mix_due(start + AUDIO_TICK * 2).expect("second tick");
-        assert!(
-            mixed
-                .iter()
-                .all(|sample| (*sample - 0.5).abs() < f32::EPSILON)
-        );
-    }
-
-    #[test]
-    fn clock_mixer_reanchors_after_capture_queue_overrun() {
-        let start = Instant::now();
-        let mut mixer = ClockMixer::new(1);
-        for tick in 0..5 {
-            mixer.push(
-                0,
-                tick * AUDIO_TICK.as_nanos() as i64,
-                vec![tick as f32 / 10.0; STEREO_SAMPLES_PER_FRAME],
+    fn bounded_writer_queue_preserves_the_rtp_gap_when_it_drops_audio() {
+        let mut samples = std::collections::VecDeque::new();
+        for value in 0..=AUDIO_QUEUE_CAPACITY {
+            enqueue_bounded_audio_sample(
+                &mut samples,
+                AudioSample {
+                    data: Bytes::from(vec![value as u8]),
+                    duration: Duration::from_millis(20),
+                    prev_dropped_packets: 0,
+                },
             );
         }
 
-        // Only ticks 2, 3, and 4 remain in the bounded queue. The mixer must
-        // jump to tick 2 instead of emitting silence forever from tick 0.
-        assert!(mixer.mix_due(start).is_none());
-        let mixed = mixer
-            .mix_due(start + AUDIO_TICK)
-            .expect("first output tick");
-        assert!(
-            mixed
-                .iter()
-                .all(|sample| (*sample - 0.2).abs() < f32::EPSILON)
-        );
-    }
+        assert_eq!(samples.len(), AUDIO_QUEUE_CAPACITY);
+        let first_retained = samples.pop_front().unwrap();
+        assert_eq!(first_retained.data[0], 1);
+        assert_eq!(first_retained.prev_dropped_packets, 1);
 
-    #[test]
-    fn clock_mixer_reanchors_media_time_after_scheduler_stall() {
-        let mut mixer = ClockMixer::new(1);
-        let started_at = Instant::now();
-        mixer.push(0, 0, vec![0.25; STEREO_SAMPLES_PER_FRAME]);
-        assert!(mixer.mix_due(started_at).is_none());
-        assert!(mixer.mix_due(started_at + AUDIO_TICK).is_some());
-
-        let stalled_until = started_at + AUDIO_TICK * 6;
-        mixer.push(
-            0,
-            (AUDIO_TICK.as_nanos() as i64) * 5,
-            vec![0.5; STEREO_SAMPLES_PER_FRAME],
-        );
-        let mixed = mixer.mix_due(stalled_until).expect("stalled tick is due");
-        assert!(
-            mixed
-                .iter()
-                .all(|sample| (*sample - 0.5).abs() < f32::EPSILON)
-        );
+        for value in 0..AUDIO_QUEUE_CAPACITY {
+            enqueue_bounded_audio_sample(
+                &mut samples,
+                AudioSample {
+                    data: Bytes::from(vec![value as u8]),
+                    duration: Duration::from_millis(20),
+                    prev_dropped_packets: 0,
+                },
+            );
+        }
+        assert!(samples.front().unwrap().prev_dropped_packets > 0);
     }
 
     #[test]

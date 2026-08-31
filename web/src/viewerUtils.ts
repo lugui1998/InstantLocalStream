@@ -5,7 +5,21 @@ export function retryDelayFor(attempt: number) {
   return retryDelays[index]
 }
 
-export function playbackRateFor(delayMs: number | null) {
+export function sessionGoodbyeMessage(reason: string) {
+  if (reason === 'token_changed') return 'The host created a new viewer link.'
+  if (reason === 'host_shutdown') return 'The host application closed.'
+  return 'The host ended this viewing session.'
+}
+
+export function isTerminalSocketDisconnect(reason: string) {
+  return reason === 'io server disconnect'
+}
+
+export function playbackRateFor(delayMs: number | null, hasLiveAudio = false) {
+  // The media element carries both tracks. Speeding it up to recover video
+  // latency also invokes the browser's audio time-stretcher, which can produce
+  // audible warble/crackle. Prefer stable audio and let WebRTC drop late video.
+  if (hasLiveAudio) return 1
   if (delayMs === null || delayMs < 100) return 1
   if (delayMs >= 1_000) return 1.2
   if (delayMs >= 500) return 1.12

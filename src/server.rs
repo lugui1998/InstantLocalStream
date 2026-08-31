@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
+use futures_util::future::join_all;
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::Registry;
 use rtc::peer_connection::configuration::{
@@ -27,7 +28,7 @@ use rtc::peer_connection::configuration::{
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use socketioxide::{
     SocketIo,
@@ -89,11 +90,9 @@ pub enum ServerCommand {
 #[cfg(windows)]
 const WINDOW_RESIZE_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(windows)]
+const WINDOW_RESIZE_WATCHER_SYNC_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(windows)]
 const WINDOW_RESIZE_SAFETY_SETTLE_TIME: Duration = Duration::from_millis(200);
-#[cfg(windows)]
-const WINDOW_RESIZE_EVENT_QUIET_TIME: Duration = Duration::from_millis(120);
-#[cfg(windows)]
-const WINDOW_RESIZE_FRAME_GRACE: Duration = Duration::from_millis(40);
 #[cfg(windows)]
 const WINDOW_RESIZE_RESTART_ATTEMPTS: usize = 3;
 #[cfg(windows)]
@@ -116,6 +115,34 @@ impl Drop for RecoveryPendingGuard {
 struct WindowSourceIdentity {
     index: usize,
     native_id: Option<u64>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowResizeEventAction {
+    BeginInteractive,
+    Ignore,
+    Observe,
+    ObserveSettled,
+}
+
+#[cfg(windows)]
+fn window_resize_event_action(
+    interactive_resize: &mut bool,
+    event: WindowResizeEvent,
+) -> WindowResizeEventAction {
+    match event {
+        WindowResizeEvent::MoveSizeStart => {
+            *interactive_resize = true;
+            WindowResizeEventAction::BeginInteractive
+        }
+        WindowResizeEvent::LocationChange if *interactive_resize => WindowResizeEventAction::Ignore,
+        WindowResizeEvent::LocationChange => WindowResizeEventAction::Observe,
+        WindowResizeEvent::MoveSizeEnd => {
+            *interactive_resize = false;
+            WindowResizeEventAction::ObserveSettled
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1837,6 +1864,29 @@ struct SocketAuth {
     client_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionGoodbyeReason {
+    HostShutdown,
+    TokenChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionGoodbye {
+    reason: SessionGoodbyeReason,
+    reconnect: bool,
+}
+
+impl SessionGoodbye {
+    fn terminal(reason: SessionGoodbyeReason) -> Self {
+        Self {
+            reason,
+            reconnect: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClientIdentity {
     client_id: String,
@@ -2487,9 +2537,12 @@ pub async fn run_with_control_readiness(
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
+    let shutdown_state = state.clone();
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = (&mut shutdown).await;
+            let _session_guard = Arc::clone(&shutdown_state.session_gate).write_owned().await;
+            send_session_goodbye_locked(&shutdown_state, SessionGoodbyeReason::HostShutdown).await;
             info!("viewer server shutting down");
         })
         .await;
@@ -2598,41 +2651,73 @@ async fn window_resize_monitor(
     let mut watched_source: Option<WindowSourceIdentity> = None;
     let mut safety_interval = tokio::time::interval(WINDOW_RESIZE_SAFETY_POLL_INTERVAL);
     safety_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut watcher_sync_interval = tokio::time::interval(WINDOW_RESIZE_WATCHER_SYNC_INTERVAL);
+    watcher_sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut debouncer = WindowResizeDebouncer::default();
+    let mut interactive_resize = false;
+    sync_window_resize_watcher(&state, &mut event_watcher, &mut watched_source, &event_tx);
     loop {
         tokio::select! {
             signal = event_rx.recv() => {
                 let Some(signal) = signal else { break };
-                let mut quiet_time = match signal {
-                    WindowResizeEvent::LocationChange => WINDOW_RESIZE_EVENT_QUIET_TIME,
-                    WindowResizeEvent::MoveSizeEnd => WINDOW_RESIZE_FRAME_GRACE,
-                };
-                // Location-change events arrive repeatedly during an
-                // interactive resize. Wait for the event stream to go quiet,
-                // while treating the native move/size-end event as the
-                // stronger completion signal.
-                loop {
-                    match tokio::time::timeout(quiet_time, event_rx.recv()).await {
-                        Ok(Some(next)) => {
-                            quiet_time = match next {
-                                WindowResizeEvent::LocationChange => {
-                                    WINDOW_RESIZE_EVENT_QUIET_TIME
-                                }
-                                WindowResizeEvent::MoveSizeEnd => WINDOW_RESIZE_FRAME_GRACE,
-                            };
+                let mut observe_settled = None;
+                for signal in std::iter::once(signal)
+                    .chain(std::iter::from_fn(|| event_rx.try_recv().ok()))
+                {
+                    if signal == WindowResizeEvent::LocationChange
+                        && !interactive_resize
+                        && watched_source.is_some_and(|source| {
+                            crate::window_capture::window_is_in_move_size(
+                                source.index,
+                                source.native_id,
+                            ) == Some(true)
+                        })
+                    {
+                        // The watcher may have attached after MOVESIZESTART.
+                        // Recover the authoritative state from the target UI
+                        // thread before classifying its location event.
+                        interactive_resize = true;
+                        debouncer.reset();
+                    }
+                    match window_resize_event_action(&mut interactive_resize, signal) {
+                        WindowResizeEventAction::BeginInteractive => {
+                            // Never rebuild capture while the source owns
+                            // Windows' modal move/size loop. A new WGC session
+                            // can race the changing dimensions, fail startup,
+                            // and churn the complete media graph while the
+                            // target is still changing size.
+                            observe_settled = None;
+                            debouncer.reset();
                         }
-                        Ok(None) => return,
-                        Err(_) => break,
+                        WindowResizeEventAction::Observe => {
+                            // Programmatic resizes do not necessarily have a
+                            // move/size pair. Keep their ordinary stability
+                            // debounce and safety-poll recovery.
+                            if observe_settled != Some(true) {
+                                observe_settled = Some(false);
+                            }
+                        }
+                        WindowResizeEventAction::Ignore => {}
+                        WindowResizeEventAction::ObserveSettled => {
+                            observe_settled = Some(true);
+                        }
                     }
                 }
-                sync_window_resize_watcher(
+                let Some(event_settled) = observe_settled else {
+                    continue;
+                };
+                if sync_window_resize_watcher(
                     &state,
                     &mut event_watcher,
                     &mut watched_source,
                     &event_tx,
-                );
+                ) {
+                    interactive_resize = false;
+                    debouncer.reset();
+                    continue;
+                }
                 if let Some((source, dimensions)) =
-                    observe_window_resize(&state, &mut debouncer, true)
+                    observe_window_resize(&state, &mut debouncer, event_settled)
                     && control_tx
                         .send(ServerCommand::RefreshWindowCapture {
                             source_index: source.index,
@@ -2644,15 +2729,62 @@ async fn window_resize_monitor(
                     break;
                 }
             }
-            _ = safety_interval.tick() => {
-                sync_window_resize_watcher(
+            _ = watcher_sync_interval.tick() => {
+                if sync_window_resize_watcher(
                     &state,
                     &mut event_watcher,
                     &mut watched_source,
                     &event_tx,
-                );
-                if let Some((source, dimensions)) =
-                    observe_window_resize(&state, &mut debouncer, false)
+                ) {
+                    interactive_resize = false;
+                    debouncer.reset();
+                }
+                if watched_source.is_some_and(|source| {
+                    crate::window_capture::window_is_in_move_size(
+                        source.index,
+                        source.native_id,
+                    ) == Some(true)
+                }) {
+                    if !interactive_resize {
+                        debouncer.reset();
+                    }
+                    interactive_resize = true;
+                }
+            }
+            _ = safety_interval.tick() => {
+                if sync_window_resize_watcher(
+                    &state,
+                    &mut event_watcher,
+                    &mut watched_source,
+                    &event_tx,
+                ) {
+                    interactive_resize = false;
+                    debouncer.reset();
+                }
+                let authoritative_move_size = watched_source.and_then(|source| {
+                        crate::window_capture::window_is_in_move_size(
+                            source.index,
+                            source.native_id,
+                        )
+                    });
+                if authoritative_move_size == Some(true) {
+                    if !interactive_resize {
+                        debouncer.reset();
+                    }
+                    interactive_resize = true;
+                    continue;
+                }
+                let recovered_move_size_end =
+                    interactive_resize && authoritative_move_size == Some(false);
+                if recovered_move_size_end {
+                    interactive_resize = false;
+                }
+                if !interactive_resize
+                    && let Some((source, dimensions)) = observe_window_resize(
+                        &state,
+                        &mut debouncer,
+                        recovered_move_size_end,
+                    )
                     && control_tx
                         .send(ServerCommand::RefreshWindowCapture {
                             source_index: source.index,
@@ -2674,16 +2806,18 @@ fn sync_window_resize_watcher(
     event_watcher: &mut Option<WindowResizeWatcher>,
     watched_source: &mut Option<WindowSourceIdentity>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<WindowResizeEvent>,
-) {
+) -> bool {
     let Some(settings) = state.settings.lock().ok().map(|settings| settings.clone()) else {
+        let changed = watched_source.is_some() || event_watcher.is_some();
         event_watcher.take();
         *watched_source = None;
-        return;
+        return changed;
     };
     if settings.source_kind != "window" {
+        let changed = watched_source.is_some() || event_watcher.is_some();
         event_watcher.take();
         *watched_source = None;
-        return;
+        return changed;
     }
     let source = WindowSourceIdentity {
         index: settings.source_index,
@@ -2694,7 +2828,9 @@ fn sync_window_resize_watcher(
         *event_watcher =
             WindowResizeWatcher::start(source.index, source.native_id, event_tx.clone());
         *watched_source = Some(source);
+        return true;
     }
+    false
 }
 
 #[cfg(windows)]
@@ -3785,7 +3921,7 @@ async fn offer(
                     mime_type: MIME_TYPE_OPUS.to_owned(),
                     clock_rate: 48_000,
                     channels: 2,
-                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+                    sdp_fmtp_line: crate::audio::OPUS_FMTP_LINE.to_owned(),
                     rtcp_feedback: vec![],
                 },
                 payload_type: crate::audio::OPUS_PAYLOAD_TYPE,
@@ -3977,8 +4113,39 @@ async fn close_client_connection(state: &ServerState, client_id: &str) {
 /// reservations before they can commit.
 async fn reset_token_and_revoke(state: &ServerState, token: String) {
     let _session_guard = Arc::clone(&state.session_gate).write_owned().await;
+    send_session_goodbye_locked(state, SessionGoodbyeReason::TokenChanged).await;
     state.reset_token(token);
     revoke_all_sessions_locked(state).await;
+}
+
+/// Delivers a terminal session event while new session registration is held
+/// behind `session_gate`. Acknowledgements make it safe to disconnect the
+/// namespace immediately afterwards without relying on transport timing. Dead
+/// viewers only delay shutdown or token rotation by this small bounded window.
+async fn send_session_goodbye_locked(state: &ServerState, reason: SessionGoodbyeReason) {
+    const GOODBYE_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+
+    let sockets = state
+        .client_sockets
+        .lock()
+        .map(|sockets| sockets.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let goodbye = SessionGoodbye::terminal(reason);
+    let acknowledgements = sockets.into_iter().filter_map(|socket| {
+        match socket
+            .timeout(GOODBYE_ACK_TIMEOUT)
+            .emit_with_ack::<_, serde_json::Value>("session.goodbye", &goodbye)
+        {
+            Ok(acknowledgement) => Some(async move {
+                let _ = acknowledgement.await;
+            }),
+            Err(error) => {
+                warn!(%error, "could not queue session goodbye");
+                None
+            }
+        }
+    });
+    join_all(acknowledgements).await;
 }
 
 async fn revoke_all_sessions_locked(state: &ServerState) {
@@ -4604,6 +4771,20 @@ mod tests {
         assert_eq!(state.session_generation.load(Ordering::Acquire), 1);
     }
 
+    #[test]
+    fn session_goodbye_is_explicitly_terminal() {
+        assert_eq!(
+            serde_json::to_value(SessionGoodbye::terminal(SessionGoodbyeReason::HostShutdown))
+                .unwrap(),
+            json!({ "reason": "host_shutdown", "reconnect": false })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionGoodbye::terminal(SessionGoodbyeReason::TokenChanged))
+                .unwrap(),
+            json!({ "reason": "token_changed", "reconnect": false })
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_offers_for_one_client_share_a_gate() {
         let state = test_state();
@@ -5151,6 +5332,27 @@ mod tests {
             window_resize_retry_delay(WINDOW_RESIZE_RESTART_ATTEMPTS + 100),
             WINDOW_RESIZE_RECOVERY_RETRY_DELAY
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_resize_waits_for_move_size_end() {
+        let mut interactive = false;
+        assert_eq!(
+            window_resize_event_action(&mut interactive, WindowResizeEvent::MoveSizeStart),
+            WindowResizeEventAction::BeginInteractive
+        );
+        assert!(interactive);
+        assert_eq!(
+            window_resize_event_action(&mut interactive, WindowResizeEvent::LocationChange),
+            WindowResizeEventAction::Ignore
+        );
+        assert!(interactive);
+        assert_eq!(
+            window_resize_event_action(&mut interactive, WindowResizeEvent::MoveSizeEnd),
+            WindowResizeEventAction::ObserveSettled
+        );
+        assert!(!interactive);
     }
 
     #[cfg(windows)]

@@ -24,8 +24,6 @@ const STARTUP_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const READER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const WGC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(750);
-#[cfg(windows)]
-type CapturedWindowPixels = (Arc<[u8]>, (u32, u32));
 
 /// Pixel representation of a frame published to encoder variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -679,7 +677,7 @@ fn spawn_window_reader(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let frame_duration = Duration::from_secs_f64(1.0 / format.fps.max(1) as f64);
-        let mut wgc_capture = match crate::window_capture::WindowCapture::start(
+        let wgc_capture = match crate::window_capture::WindowCapture::start(
             source_index,
             source_native_id,
             capture_cursor,
@@ -692,18 +690,16 @@ fn spawn_window_reader(
                     expected_height = format.height,
                     actual_width = capture.dimensions().0,
                     actual_height = capture.dimensions().1,
-                    "WGC dimensions differ from the selected window; using XCap fallback"
+                    "WGC dimensions differ from the selected window; rejecting this capture generation"
                 );
                 capture.stop();
                 None
             }
             Err(error) => {
-                tracing::warn!(%error, "WGC startup failed; using XCap fallback");
+                tracing::warn!(%error, "WGC startup failed");
                 None
             }
         };
-        let fallback_window = crate::capture::selected_window(source_index, source_native_id).ok();
-
         if let Some(capture) = wgc_capture.as_ref() {
             let first_frame_deadline = Instant::now() + WGC_FIRST_FRAME_TIMEOUT;
             let mut latest_frame: Option<CapturedWindowFrame> = None;
@@ -749,7 +745,7 @@ fn spawn_window_reader(
                             expected_height = format.height,
                             actual_width = frame.width,
                             actual_height = frame.height,
-                            "WGC frame dimensions changed; using XCap fallback"
+                            "WGC frame dimensions changed during startup"
                         );
                         break;
                     }
@@ -768,7 +764,7 @@ fn spawn_window_reader(
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "WGC did not deliver its first frame; using XCap fallback");
+                        tracing::warn!(%error, "WGC did not deliver its first frame");
                         break;
                     }
                 }
@@ -932,142 +928,19 @@ fn spawn_window_reader(
                 return;
             }
             capture.stop();
-            wgc_capture = None;
         }
         drop(wgc_capture);
-
-        tracing::warn!("using XCap/PrintWindow fallback for window frames");
-        if let Ok(mut backend) = inner.backend.lock() {
-            *backend = "xcap-printwindow";
-        }
-        let mut fallback_window = fallback_window;
-        let mut latest_frame: Option<CapturedWindowFrame> = None;
-        let mut fallback_errors = 0_u32;
-        loop {
-            if inner.stopped.load(Ordering::Acquire)
-                || inner.generation.load(Ordering::Acquire) != generation
-            {
-                break;
-            }
-            let frame_started = Instant::now();
-            let minimized = source_native_id
-                .is_some_and(crate::capture::native_window_is_minimized)
-                || fallback_window
-                    .as_ref()
-                    .is_some_and(|window| window.is_minimized().unwrap_or(false));
-            if minimized {
-                if let Some(frame) = latest_frame.as_ref() {
-                    frame.publish_repeat(&inner, format, generation);
-                }
-                let elapsed = frame_started.elapsed();
-                if elapsed < frame_duration {
-                    thread::sleep(frame_duration - elapsed);
-                }
-                continue;
-            }
-            let capture_result = fallback_window.as_ref().map(|window| {
-                capture_xcap_frame(
-                    window,
-                    format,
-                    capture_cursor,
-                    source_index,
-                    source_native_id,
-                )
-            });
-            match capture_result {
-                Some(Ok((data, source_dimensions))) => {
-                    let minimized_after_capture = source_native_id
-                        .is_some_and(crate::capture::native_window_is_minimized)
-                        || fallback_window
-                            .as_ref()
-                            .is_some_and(|window| window.is_minimized().unwrap_or(false));
-                    if minimized_after_capture {
-                        if let Some(frame) = latest_frame.as_ref() {
-                            frame.publish_repeat(&inner, format, generation);
-                        }
-                    } else {
-                        fallback_errors = 0;
-                        record_observed_source_dimensions(&inner, generation, source_dimensions);
-                        let frame = CapturedWindowFrame::new(data);
-                        frame.publish(&inner, format, generation);
-                        latest_frame = Some(frame);
-                    }
-                }
-                Some(Err(error)) => {
-                    fallback_errors = fallback_errors.saturating_add(1);
-                    let was_minimized = fallback_window
-                        .as_ref()
-                        .is_some_and(|window| window.is_minimized().unwrap_or(false));
-                    fallback_window =
-                        crate::capture::selected_window(source_index, source_native_id).ok();
-                    if fallback_errors == 1 || fallback_errors.is_multiple_of(30) {
-                        tracing::warn!(
-                            %error,
-                            retries = fallback_errors,
-                            "XCap window readback failed; retrying"
-                        );
-                    }
-                    if was_minimized && let Some(frame) = latest_frame.as_ref() {
-                        // Some applications cannot service PrintWindow while
-                        // minimized. Preserve stream cadence and the last valid
-                        // content until the target can render again.
-                        frame.publish_repeat(&inner, format, generation);
-                    }
-                }
-                None => {
-                    fallback_errors = fallback_errors.saturating_add(1);
-                    fallback_window =
-                        crate::capture::selected_window(source_index, source_native_id).ok();
-                    if fallback_errors == 1 || fallback_errors.is_multiple_of(30) {
-                        tracing::warn!(
-                            retries = fallback_errors,
-                            "selected window is not currently available for XCap readback; retrying"
-                        );
-                    }
-                }
-            }
-            let elapsed = frame_started.elapsed();
-            if elapsed < frame_duration {
-                thread::sleep(frame_duration - elapsed);
-            }
-        }
+        // XCap's Windows backend uses synchronous PrintWindow calls. If this
+        // thread enters that fallback while the target is still in its modal
+        // move/size loop, the target can block before it releases global mouse
+        // capture. Report the WGC startup failure instead; resize recovery will
+        // retry a fresh compositor session without calling into the target UI.
+        finish_reader_for_generation(
+            &inner,
+            generation,
+            Some("Windows Graphics Capture did not become ready".to_owned()),
+        );
     })
-}
-
-#[cfg(windows)]
-fn capture_xcap_frame(
-    window: &xcap::Window,
-    format: CaptureFormat,
-    capture_cursor: bool,
-    source_index: usize,
-    source_native_id: Option<u64>,
-) -> Result<CapturedWindowPixels> {
-    let frame = window.capture_image()?;
-    let source_width = frame.width();
-    let source_height = frame.height();
-    let mut pixels = frame.into_raw();
-    if capture_cursor
-        && let Some((x, y)) =
-            crate::window_capture::cursor_position_for(source_index, source_native_id)
-    {
-        draw_fallback_cursor(&mut pixels, source_width, source_height, x, y);
-    }
-    if source_width != format.width || source_height != format.height {
-        pixels = resize_rgba(
-            &pixels,
-            source_width,
-            source_height,
-            format.width,
-            format.height,
-        )
-        .context("resize XCap fallback frame to the stream canvas")?;
-    }
-    if format.pixel_format == SourcePixelFormat::Bgra {
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-    }
-    Ok((Arc::from(pixels), (source_width, source_height)))
 }
 
 #[cfg(windows)]
@@ -1113,35 +986,6 @@ fn resize_rgba(
         }
     }
     Some(output)
-}
-
-#[cfg(windows)]
-fn draw_fallback_cursor(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32) {
-    fn set_pixel(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 4]) {
-        if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-            return;
-        }
-        let offset = (y as usize * width as usize + x as usize) * 4;
-        if let Some(pixel) = rgba.get_mut(offset..offset + 4) {
-            pixel.copy_from_slice(&color);
-        }
-    }
-
-    // Compact arrow with the tip at the OS cursor position. This fallback is
-    // used only when WGC fails to deliver frames; hit-testing still guarantees
-    // that the pointer is hidden while another window owns it.
-    for dy in 0..16_i32 {
-        let row_width = (dy / 2 + 1).min(8);
-        for dx in 0..row_width {
-            set_pixel(rgba, width, height, x + dx, y + dy, [0, 0, 0, 255]);
-        }
-    }
-    for dy in 2..13_i32 {
-        let row_width = (dy / 2).min(6);
-        for dx in 1..row_width {
-            set_pixel(rgba, width, height, x + dx, y + dy, [255, 255, 255, 255]);
-        }
-    }
 }
 
 fn capture_timestamp() -> u64 {

@@ -43,10 +43,11 @@ mod imp {
             },
             UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             UI::WindowsAndMessaging::{
-                CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
-                GetAncestor, GetCursorPos, GetMessageW, GetWindowRect, IsIconic, IsWindow, MSG,
-                OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WINEVENT_OUTOFCONTEXT,
-                WM_QUIT, WindowFromPoint,
+                CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_MOVESIZEEND,
+                EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, GUI_INMOVESIZE, GUITHREADINFO, GetAncestor,
+                GetCursorPos, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, IsIconic,
+                IsWindow, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+                WINEVENT_OUTOFCONTEXT, WM_QUIT, WindowFromPoint,
             },
         },
         core::{Error as WindowsError, IInspectable, Interface, Ref, factory},
@@ -75,6 +76,7 @@ mod imp {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum WindowResizeEvent {
         LocationChange,
+        MoveSizeStart,
         MoveSizeEnd,
     }
 
@@ -131,7 +133,7 @@ mod imp {
                 }
                 let move_size_hook = unsafe {
                     SetWinEventHook(
-                        EVENT_SYSTEM_MOVESIZEEND,
+                        EVENT_SYSTEM_MOVESIZESTART,
                         EVENT_SYSTEM_MOVESIZEEND,
                         None,
                         Some(window_resize_event_proc),
@@ -225,6 +227,8 @@ mod imp {
             && id_child == CHILDID_SELF as i32
         {
             WindowResizeEvent::LocationChange
+        } else if event == EVENT_SYSTEM_MOVESIZESTART {
+            WindowResizeEvent::MoveSizeStart
         } else if event == EVENT_SYSTEM_MOVESIZEEND {
             WindowResizeEvent::MoveSizeEnd
         } else {
@@ -770,21 +774,24 @@ mod imp {
         capture_cursor && pointer_over_target
     }
 
-    pub fn cursor_position_for(index: usize, native_id: Option<u64>) -> Option<(i32, i32)> {
+    /// Queries the target UI thread's authoritative modal move/size state.
+    /// This closes the small race where the watcher is attached after Windows
+    /// has already emitted `EVENT_SYSTEM_MOVESIZESTART`, and also recovers if
+    /// the corresponding end event is lost.
+    pub fn window_is_in_move_size(index: usize, native_id: Option<u64>) -> Option<bool> {
         let hwnd = selected_hwnd(index, native_id).ok()?;
-        let target_root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        let target_root = if !target_root.0.is_null() {
-            target_root
-        } else {
-            hwnd
-        };
-        let point = cursor_point_for_target(target_root.0 as usize)?;
-        if let Ok(window) = crate::capture::selected_window(index, native_id) {
-            return Some((point.x - window.x().ok()?, point.y - window.y().ok()?));
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let target = if root.0.is_null() { hwnd } else { root };
+        let thread_id = unsafe { GetWindowThreadProcessId(target, None) };
+        if thread_id == 0 {
+            return None;
         }
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        unsafe { GetWindowRect(hwnd, &mut rect).ok()? };
-        Some((point.x - rect.left, point.y - rect.top))
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe { GetGUIThreadInfo(thread_id, &mut info).ok()? };
+        Some(info.flags.contains(GUI_INMOVESIZE))
     }
 
     fn selected_hwnd(index: usize, native_id: Option<u64>) -> Result<HWND> {
@@ -1215,7 +1222,7 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     WindowCapture, WindowCaptureUpdate, WindowResizeEvent, WindowResizeWatcher,
-    capture_monitor_preview_frame, capture_preview_frame, cursor_position_for,
+    capture_monitor_preview_frame, capture_preview_frame, window_is_in_move_size,
 };
 
 #[cfg(not(windows))]

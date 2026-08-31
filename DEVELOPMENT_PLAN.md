@@ -109,7 +109,7 @@ WebRTC does not define a signaling transport, so the application uses a same-ori
 | Viewer client | Vue 3, TypeScript, and Vite | Componentized UI, composable connection/media state, production static bundle, and local/offline packaging | Petite Vue for a deliberately no-build client |
 | Browser media | `webrtc-rs` 0.20.x, pinned to an exact release | Rust WebRTC endpoint and media-track APIs | `str0m` or the WebRTC.rs SFU stack after a focused evaluation |
 | Encoder integration | FFmpeg child process | Easy packaging boundary and access to software or hardware encoders | `ffmpeg-next` or a native media pipeline after profiling |
-| Windows capture | `gdigrab` for monitors; WGC with XCap/PrintWindow fallback for windows | WGC isolates a selected window from occlusion; stable HWND identity survives enumeration reorder | `ddagrab` and native WGC picker |
+| Windows capture | `gdigrab` for monitors; WGC for windows | WGC isolates a selected window from occlusion without synchronously calling into its UI thread; stable HWND identity survives enumeration reorder | `ddagrab` and native WGC picker |
 | Linux capture | FFmpeg `x11grab` with XCap discovery | Direct X11 path with no raw frame copy in Rust | Direct XDG Desktop Portal plus PipeWire backend for Wayland |
 | Desktop UI | `egui` and `eframe` | Rust-native, cross-platform, no webview runtime, suitable for a control panel | Slint for a more declarative and polished UI |
 | Linux artifact | AppImage | One downloadable executable file with bundled user-space dependencies | Plain ELF release for controlled distributions |
@@ -296,7 +296,7 @@ The project should document the supported desktop environments instead of promis
 
 ## Audio capture and process exclusions (follow-up)
 
-Implementation status: audio configuration, default exclusions, flexaudio-backed native capture, Opus encoding, WebRTC negotiation, browser playback, and audio status reporting are implemented. Full process exclusion validation and live audio reconfiguration remain follow-up validation work.
+Implementation status: audio configuration, default exclusions, flexaudio-backed native capture, high-quality stereo Opus encoding, WebRTC negotiation, browser playback, and audio status reporting are implemented. Flexaudio's normalized 20 ms chunks are encoded in sample order without a second wall-clock filter, and cumulative capture-drop counters plus writer drops advance RTP time explicitly. The browser keeps a combined audio/video element at 1.0× whenever live audio is present, preferring late video drops over audio time-stretch artifacts. Full process exclusion validation and live audio reconfiguration remain follow-up validation work.
 
 Audio is enabled by default for monitor sources. The native UI should expose source-specific controls:
 
@@ -492,13 +492,14 @@ The signaling protocol should carry:
 The server should route messages and validate their size and session membership. It does not need to implement a second media protocol. The current control event names are:
 
 - `session.ready`: protocol version, media capabilities, and the initial status snapshot.
+- `session.goodbye`: an acknowledged terminal event sent before normal host shutdown or token rotation; its reason tells the viewer to stop signaling and WebRTC retries permanently for that page.
 - `status.snapshot`: a complete current status response, also used after reconnect or an explicit `status.request`.
 - `status.changed`: a pushed status update for stream state, viewer count, settings, or media errors.
 - `status.request`: a client request acknowledged with a current snapshot.
 - `control.ping`: an application-level RTT probe acknowledged by the server; the Socket.IO transport heartbeat remains independent.
 - `viewer.stats`: bounded browser WebRTC metrics associated with the stable viewer identifier.
 
-The browser must keep a stable `clientId` across control reconnects. The host must keep the control socket identity separate from the WebRTC peer identity so a stale disconnect cannot tear down a newer session. Per-client data belongs in a session registry keyed by `clientId`, with bounded/coalesced status delivery and cleanup on disconnect.
+The browser must keep a stable `clientId` across control reconnects. Ordinary transport failures remain retryable, but `session.goodbye` is terminal: the browser acknowledges it, disables Socket.IO reconnection, cancels pending WebRTC work, and explains whether the host closed or replaced the viewer link. The host must keep the control socket identity separate from the WebRTC peer identity so a stale disconnect cannot tear down a newer session. Per-client data belongs in a session registry keyed by `clientId`, with bounded/coalesced status delivery and cleanup on disconnect.
 
 The checked-in `web/` project is built with `npm ci` and `npm run build`; `scripts/build-web.ps1` and `scripts/build-web.sh` provide the reproducible frontend build used by portable packaging. The Rust server embeds `web/dist` and serves hashed assets with long-lived cache headers. No CDN or Node runtime is required by the packaged application.
 
@@ -540,7 +541,7 @@ The viewer measures a control-path round-trip time through an acknowledged contr
 
 ### Live-edge policy
 
-Low latency takes priority over smooth playback of stale frames. Every host-side viewer queue has capacity one and is overwritten by the newest encoded sample before write, so server-side backpressure drops obsolete access units. The viewer sets `RTCRtpReceiver.playoutDelayHint` to zero when the browser supports it and seeks to a browser-exposed live edge when one exists. When recent jitter-buffer delay exceeds the browser-reported minimum by a small threshold, the player temporarily raises `playbackRate` from 1.0× up to 1.2× and resets it as soon as the excess clears. A normal WebRTC `MediaStream` is usually not seekable, so a true client-side jump is not universally available; the server queue policy, bounded catch-up rate, browser jitter-buffer hint, and measured capture-to-display delay are the portable controls for keeping the viewer near live.
+Low latency takes priority over smooth playback of stale frames. Every host-side viewer queue has capacity one and is overwritten by the newest encoded sample before write, so server-side backpressure drops obsolete access units. The viewer sets `RTCRtpReceiver.playoutDelayHint` to zero when the browser supports it and seeks to a browser-exposed live edge when one exists. For video-only streams, recent excess jitter-buffer delay can temporarily raise `playbackRate` from 1.0× up to 1.2×. When audio is present, playback remains at 1.0× so Chromium's time-stretcher cannot degrade audio; WebRTC may drop late video instead. A normal WebRTC `MediaStream` is usually not seekable, so a true client-side jump is not universally available; the server queue policy, video-only catch-up rate, browser jitter-buffer hint, and measured capture-to-display delay are the portable controls for keeping the viewer near live.
 
 The viewer must display its assigned quality group, effective profile, group state, assignment reason, and synchronization mode. The control events are `group.assignment` for a targeted reassignment and the existing status snapshots for the available group list.
 
