@@ -9,6 +9,7 @@ const emit = defineEmits<{
   'frame-rendered': [timing?: RenderedFrameTiming]
   'video-element': [video: HTMLVideoElement | null]
   'playback-error': []
+  'playback-started': []
 }>()
 const video = ref<HTMLVideoElement | null>(null)
 
@@ -139,6 +140,7 @@ onMounted(() => emit('video-element', video.value))
       playsinline
       controls
       @error="reportPlayFailure"
+      @playing="emit('playback-started')"
       @loadeddata="emit('frame-rendered')"
       @loadedmetadata="refreshVideoDimensions(); video && emit('live-edge', video)"
       @resize="refreshVideoDimensions"

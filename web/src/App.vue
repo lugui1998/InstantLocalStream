@@ -35,6 +35,7 @@ const {
   start,
   setVideoElement,
   reportPlaybackError,
+  reportPlaybackStarted,
   seekToLiveEdge,
   noteVideoFrameRendered,
 } = useViewer()
@@ -134,7 +135,7 @@ onMounted(start)
 
 <template>
   <main>
-    <StreamVideo :stream="videoStream" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @video-element="setVideoElement" @playback-error="reportPlaybackError" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
+    <StreamVideo :stream="videoStream" :catch-up-delay-ms="catchUpDelayMs" :bootstrap-progress="bootstrapProgress" @video-element="setVideoElement" @playback-error="reportPlaybackError" @playback-started="reportPlaybackStarted" @live-edge="seekToLiveEdge" @frame-rendered="noteVideoFrameRendered" />
 
     <p v-if="mediaStatus" class="media-status" role="status" aria-live="polite">{{ mediaStatus }}</p>
 

@@ -9,6 +9,7 @@ const bootstrapAssignmentTimeoutMs = 1_500
 const decodeStartupTimeoutMs = 3_000
 const codecFallbackTimeoutMs = 3_000
 const playbackMetricWindowMs = 15_000
+const playbackBlockedMessage = 'Video playback was blocked by the browser. Select the stream controls to start playback.'
 
 export interface BootstrapProgress {
   title: string
@@ -1086,7 +1087,11 @@ export function useViewer() {
   }
 
   function reportPlaybackError() {
-    mediaStatus.value = 'Video playback was blocked by the browser. Select the stream controls to start playback.'
+    mediaStatus.value = playbackBlockedMessage
+  }
+
+  function reportPlaybackStarted() {
+    if (mediaStatus.value === playbackBlockedMessage) mediaStatus.value = null
   }
 
   function seekToLiveEdge(video: HTMLVideoElement) {
@@ -1140,5 +1145,5 @@ export function useViewer() {
   }
 
   onBeforeUnmount(stop)
-  return { videoStream, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, setVideoElement, reportPlaybackError, seekToLiveEdge, noteVideoFrameRendered, ping }
+  return { videoStream, status, connection, mediaStatus, rttMs, jitterMs, bitrateBps, lossRate, availableIncomingBitrateBps, framesDropped, freezeCount, droppedFrameSamples, jitterBufferDelayMs, catchUpDelayMs, playoutDelayMs, captureToDisplayDelayMs, captureToReceiveDelayMs, receiveToDisplayDelayMs, frameProcessingDelayMs, frameDelayMode, frameTimingUncertaintyMs, encoderDelayMs, decodeTimeMs, group, activeCodec, bootstrapProgress, synchronizationMode, viewers, quality, start, stop, setVideoElement, reportPlaybackError, reportPlaybackStarted, seekToLiveEdge, noteVideoFrameRendered, ping }
 }
