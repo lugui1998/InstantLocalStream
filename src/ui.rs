@@ -68,7 +68,8 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([DEFAULT_WINDOW_WIDTH, 650.0])
-            .with_min_inner_size([760.0, 620.0]),
+            .with_min_inner_size([760.0, 620.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -87,6 +88,46 @@ fn run_internal(mut config: AppConfig, load_preferences: bool) -> Result<()> {
         }),
     )
     .map_err(|error| anyhow::anyhow!("UI failed: {error}"))
+}
+
+/// The Windows executable resource is used by Explorer, but winit/egui also
+/// needs an icon for the live window (and therefore the taskbar and Alt-Tab).
+/// Keep this small raster version in code so the runtime icon cannot drift
+/// from the vector artwork used by the Linux package and viewer favicon.
+fn app_icon() -> egui::IconData {
+    const SIZE: usize = 256;
+    const BACKGROUND: [u8; 4] = [13, 16, 20, 255];
+    const ACCENT: [u8; 4] = [201, 243, 107, 255];
+
+    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let border = ((42..54).contains(&x) || (202..214).contains(&x))
+                && (58..198).contains(&y)
+                || ((58..70).contains(&y) || (186..198).contains(&y)) && (42..214).contains(&x);
+            let triangle = (96..=160).contains(&y) && {
+                let half_width = if y <= 128 {
+                    (y - 96) * 2
+                } else {
+                    (160 - y) * 2
+                };
+                (104..=104 + half_width).contains(&x)
+            };
+            let color = if border || triangle {
+                ACCENT
+            } else {
+                BACKGROUND
+            };
+            let offset = (y * SIZE + x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&color);
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
 }
 
 fn viewer_visuals() -> egui::Visuals {

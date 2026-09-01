@@ -3988,8 +3988,19 @@ async fn session(
     Json(json!({ "ok": true, "message": "signaling session endpoint is ready" }))
 }
 
-async fn favicon() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn favicon() -> Response {
+    let mut response = Response::new(Body::from(
+        include_bytes!("../packaging/windows/Instant-Local-Stream.ico").as_slice(),
+    ));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("image/x-icon"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    response
 }
 
 fn sdp_fmtp_line_for_payload(sdp: &str, payload_type: u8) -> Option<&str> {
